@@ -699,6 +699,31 @@ def main() -> int:
     check("过去的日子不会被翻出来",
           not any(o.kind == "big_day" for o in past.last_occasions))
 
+    # ★ 大日子也要按归属过滤：私聊里说的事不能变成她在群里惦记的事
+    leak = Giftia(make_settings(tmp / "occ_leak", 81920.0), llm=MockLLM(settings.model))
+    leak.set_handler_id("OWNER")
+    leak.store.add_memory(
+        instance_no=leak.instance_no,
+        created_ts=leak.clock.iso(),
+        happened_ts=leak.clock.iso(),
+        summary="搭档明天要去做一个小手术",
+        importance=0.9,
+        layer="core",
+        scope="private",
+        event_date=(leak.clock.now().date() + _td(days=1)).isoformat(),
+    )
+    leak.handle("在吗", user_id="OWNER")
+    check("私聊里的大日子，她惦记着（私聊提示词里有）",
+          any("手术" in o.hint for o in leak.last_occasions),
+          str([o.title for o in leak.last_occasions]))
+    leak.handle("大家好", user_id="F1", scene="group", group_id="G-9", speaker_name="阿伟")
+    grp_leak = leak._prepare("大家在聊什么")[0][0]["content"]
+    check("★ 但她不会在群里惦记你的私事（大日子也按归属过滤）",
+          "手术" not in grp_leak, grp_leak[grp_leak.find("【今天") :][:80])
+    check("群里主动开口的理由里也没有它",
+          leak.outreach_plan(force=True, for_group=True) is None,
+          str(leak.outreach_plan(force=True, for_group=True)))
+
     # ══ 23. 做梦 ═══════════════════════════════════════════════
     print("\n23. 做梦：记忆碎片会自己重组")
     dr = Giftia(make_settings(tmp / "dream", 81920.0), llm=MockLLM(settings.model))
@@ -811,10 +836,13 @@ def main() -> int:
         summary="搭档明天要考驾照",
         importance=0.7,
         layer="important",
+        # ★ 只有"在群里说过的大日子"才发得到群里（私聊说的不外泄，见第 22 节）
+        scope="group",
+        subject_id="GROUP-X",
         event_date=(grp_out.clock.now().date() + _td(days=1)).isoformat(),
     )
     gp = grp_out.outreach_plan(force=True, for_group=True)
-    check("但「你的大日子」是公开的，群里也能提",
+    check("在群里说过的大日子，她也能在群里提",
           gp is not None and gp.reason == "big_day", gp.reason if gp else "None")
 
     _, grp_text = grp_out.compose_outreach(force=True, target="group")

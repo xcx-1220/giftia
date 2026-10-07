@@ -64,8 +64,13 @@ def find_occasions(
     instance_no: int,
     days_known: float,
     mark: bool = True,
+    view: list[tuple[str, str]] | None = None,
 ) -> list[Occasion]:
-    """今天有什么值得她记着的日子。mark=False 只查看、不记账（给预览用）。"""
+    """今天有什么值得她记着的日子。mark=False 只查看、不记账（给预览用）。
+
+    view 决定"能看到谁的大日子"——**和记忆检索用同一道闸门**。
+    否则你私聊里说的"下周三考试"会变成她在群里惦记的事，等于当众说出来。
+    """
     if not settings.occasions.enabled:
         return []
     found: list[Occasion] = []
@@ -102,7 +107,7 @@ def find_occasions(
         told: set[str] = set(json.loads(str(store.state_get(bkey, "") or "[]")))
     except ValueError:
         told = set()
-    for mem in store.active_memories(instance_no):
+    for mem in store.active_memories(instance_no, view=view):
         when = _parse_event_date(mem.get("event_date") or "")
         if when is None:
             continue

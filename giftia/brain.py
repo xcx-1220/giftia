@@ -413,6 +413,7 @@ class Giftia:
             instance_no=self.instance_no,
             days_known=self.current_bond(now).days_known,
             mark=mark,
+            view=self.memory_view,   # 大日子也按归属过滤，别把私事带进群里
         )
         self.last_dream = latest_untold(
             self.settings, self.store, self.clock, self.instance_no
@@ -559,6 +560,11 @@ class Giftia:
     ) -> OutreachPlan | None:
         now = self.clock.now()
         bond = self.current_bond(now)
+        if for_group:
+            # 发群里：只看这个群里公开的"大日子"，你的私事不外泄
+            view = [("group", self.last_group_id or "")]
+        else:
+            view = [("private", ""), ("person", self.handler_id or "handler"), ("group", "*")]
         occasions = find_occasions(
             self.settings,
             self.store,
@@ -566,6 +572,7 @@ class Giftia:
             instance_no=self.instance_no,
             days_known=bond.days_known,
             mark=False,
+            view=view,
         )
         return outreach_plan(
             self.settings,
