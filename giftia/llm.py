@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import date
 
 from .config import ModelConfig
 
@@ -34,6 +35,7 @@ class MemoryDraft:
     importance: float = 0.5
     layer: str = ""          # core | important | normal（空 = 由程序按重要性判定）
     preferred_name: str = ""  # 他明确要求改称呼时才填（例如"以后叫我小林"）
+    event_date: str = ""      # 他说过的"将来某一天"（YYYY-MM-DD），没有就留空
 
 
 LAYERS = ("core", "important", "normal")
@@ -47,7 +49,9 @@ CONSOLIDATE_SYSTEM = """你是 Giftia 的记忆整理模块（她本人看不到
 不要记寒暄、天气、以及没有信息量的闲聊。宁少勿多；确实没有值得记的，就返回空数组。
 
 严格输出 JSON，不要任何解释文字：
-{{"memories":[{{"summary":"一句话，不超过60字，用第三人称，用「搭档」指代对方","tags":"逗号分隔的2-4个关键词","emotion":"当时的情绪，2-6字","importance":0.0到1.0之间的小数,"layer":"core|important|normal","preferred_name":""}}]}}
+{{"memories":[{{"summary":"一句话，不超过60字，用第三人称，用「搭档」指代对方","tags":"逗号分隔的2-4个关键词","emotion":"当时的情绪，2-6字","importance":0.0到1.0之间的小数,"layer":"core|important|normal","preferred_name":"","event_date":""}}]}}
+
+今天是 {today}。
 
 importance 参考：0.9 以上=非常重要的约定或心事；0.5=日常但有意义；0.2 以下=可记可不记。
 layer 判定（很重要，决定这条记忆会不会随时间变模糊）：
@@ -59,7 +63,12 @@ layer 判定（很重要，决定这条记忆会不会随时间变模糊）：
 preferred_name 的判定（**只在下面两种情况填，其余一律留空**）：
 1. 他**明确要求你换个称呼**，例如"以后叫我小林""别叫我搭档了" → 填 "小林"；
 2. 他**自我介绍**，例如"我叫小林""我是小林" → 填 "小林"。
-闲聊里提到别人的名字、或那个名字不是指他自己时，**不要填**。绝大多数情况下这里是空字符串。"""
+闲聊里提到别人的名字、或那个名字不是指他自己时，**不要填**。绝大多数情况下这里是空字符串。
+
+event_date 的判定（**只在这一种情况下填**）：
+他说了一件**将来某一天**会具体发生的事——考试、面试、生日、约会、约定的期限，
+并且这个日期**能推算出确切的一天**（"下周三要考驾照"→ 按今天 {today} 推算）。
+填 YYYY-MM-DD。其余情况（"最近""以后""经常会"）一律留空；推算不确定也留空。"""
 
 REWRITE_SYSTEM = """你是记忆检索的查询改写模块。
 把搭档的这句话改写成 2～3 个**用于检索长期记忆**的短查询：补上同义词、上位词、可能的说法。
@@ -78,6 +87,17 @@ MEMOIR_SYSTEM = """你是「终端服务」的记录员。Giftia 的寿命已经
 - 总长度 200～350 字。不要标题，不要列表符号，不要用引号。
 - 结尾必须以这句收束：她的记忆将被清除，而你会记得。"""
 
+DREAM_SYSTEM = """你是 Giftia 的睡眠整理模块（她本人看不到这段指令）。
+下面是她记忆里的一些碎片——它们已经被时间磨得残缺不全。
+
+请把这些碎片揉成**一场梦**，用她的第一人称写，40～90 字。
+
+要求：
+- 梦是有裂缝的：场景可以突然换，人物可以模糊，但**情绪要连贯**。
+- 只使用给出的碎片，不要引入新的人、地点或事件。
+- 不要解释"这是梦"，不要提到记忆、遗忘、系统、数据库。
+- 不要写"我梦见"开头，直接进入场景。结尾可以停在半句话上。"""
+
 
 class BaseLLM:
     """所有实现都遵循这个接口，上层只认它。"""
@@ -90,7 +110,13 @@ class BaseLLM:
     ) -> str:
         raise NotImplementedError
 
-    def extract_memories(self, transcript: str, *, name: str = "Giftia") -> list[MemoryDraft]:
+    def extract_memories(
+        self, transcript: str, *, name: str = "Giftia", today: str = ""
+    ) -> list[MemoryDraft]:
+        raise NotImplementedError
+
+    def write_dream(self, fragments: list[str], *, name: str = "Giftia") -> str:
+        """把记忆碎片揉成一场梦。"""
         raise NotImplementedError
 
     def rewrite_query(self, text: str) -> list[str]:
@@ -169,10 +195,15 @@ class DeepSeekLLM(BaseLLM):
             raise LLMError("模型返回了空内容")
         return text
 
-    def extract_memories(self, transcript: str, *, name: str = "Giftia") -> list[MemoryDraft]:
+    def extract_memories(
+        self, transcript: str, *, name: str = "Giftia", today: str = ""
+    ) -> list[MemoryDraft]:
         raw = self.chat(
             [
-                {"role": "system", "content": CONSOLIDATE_SYSTEM.format(name=name)},
+                {
+                    "role": "system",
+                    "content": CONSOLIDATE_SYSTEM.format(name=name, today=today or "（未提供）"),
+                },
                 {"role": "user", "content": transcript},
             ],
             temperature=0.3,
@@ -205,6 +236,17 @@ class DeepSeekLLM(BaseLLM):
             max_tokens=900,
         )
 
+    def write_dream(self, fragments: list[str], *, name: str = "Giftia") -> str:
+        body = "\n".join(f"- {f}" for f in fragments if str(f).strip())
+        return self.chat(
+            [
+                {"role": "system", "content": DREAM_SYSTEM},
+                {"role": "user", "content": f"记忆碎片：\n{body}"},
+            ],
+            temperature=1.0,
+            max_tokens=300,
+        )
+
 
 def infer_layer(importance: float, emotion: str = "") -> str:
     """模型没给 layer 时的兜底判定。情感强烈的记忆至少在 important 层。"""
@@ -234,6 +276,12 @@ def parse_memory_drafts(raw: str) -> list[MemoryDraft]:
         layer = str(it.get("layer", "")).strip().lower()
         if layer not in LAYERS:
             layer = infer_layer(importance, emotion)
+        event_date = str(it.get("event_date", "") or "").strip()[:10]
+        if event_date:
+            try:
+                date.fromisoformat(event_date)
+            except ValueError:
+                event_date = ""   # 模型算错日期就当作没有，别让错的提醒冒出来
         drafts.append(
             MemoryDraft(
                 summary=str(it.get("summary", "")).strip(),
@@ -242,6 +290,7 @@ def parse_memory_drafts(raw: str) -> list[MemoryDraft]:
                 importance=importance,
                 layer=layer,
                 preferred_name=str(it.get("preferred_name", "") or "").strip()[:16],
+                event_date=event_date,
             )
         )
     return drafts
@@ -328,7 +377,9 @@ class MockLLM(BaseLLM):
         parts.append(self._rng.choice(["……", "你今天，还好吗？", "我在。"]))
         return "".join(parts)
 
-    def extract_memories(self, transcript: str, *, name: str = "Giftia") -> list[MemoryDraft]:
+    def extract_memories(
+        self, transcript: str, *, name: str = "Giftia", today: str = ""
+    ) -> list[MemoryDraft]:
         """启发式兜底：从搭档说过的话里挑两条最长的留下来（提问不算记忆）。"""
         lines = [ln for ln in transcript.splitlines() if ln.startswith("搭档：")]
         texts = sorted((ln[3:].strip() for ln in lines), key=len, reverse=True)
@@ -361,6 +412,16 @@ class MockLLM(BaseLLM):
         cleaned = re.sub(r"[的了呢吧啊呀嘛哦噢，。！？!?、；;：:\s]+", " ", text or "")
         parts = [p for p in cleaned.split(" ") if len(p) >= 2]
         return parts[:2]
+
+    def write_dream(self, fragments: list[str], *, name: str = "Giftia") -> str:
+        cleaned: list[str] = []
+        for frag in fragments[:3]:
+            text = re.sub(r"（[^）]*）", "", str(frag)).strip("。…，, ")
+            if text:
+                cleaned.append(text)
+        if not cleaned:
+            return ""
+        return "梦里有" + "，还有".join(cleaned) + "。\n中间好像断过一次，接不上了。"
 
     def write_memoir(self, context: str) -> str:
         entries = [ln.strip("- ").strip() for ln in context.splitlines() if ln.strip().startswith("-")]

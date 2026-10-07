@@ -434,7 +434,9 @@ def consolidate(
     drafts: list[MemoryDraft] = []
     try:
         drafts = llm.extract_memories(
-            build_transcript(pending, settings.persona.name), name=settings.persona.name
+            build_transcript(pending, settings.persona.name),
+            name=settings.persona.name,
+            today=now_iso[:10],
         )
     except Exception as exc:  # 网络/解析失败都不能丢记忆
         drafts = _fallback_drafts(pending, settings)
@@ -465,6 +467,7 @@ def consolidate(
             source_session=session_id,
             layer=layer,
             strength=initial_strength(d.importance, d.emotion),
+            event_date=d.event_date,
         )
         added += 1
         if on_draft is not None:

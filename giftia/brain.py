@@ -22,17 +22,24 @@ from datetime import datetime
 from .bond import Bond, BondTracker
 from .clock import Clock
 from .config import Settings, load_settings
+from .dream import Dream, dream_text, latest_untold, make_dream, should_dream
 from .lifespan import Lifespan, LifeStatus
 from .llm import BaseLLM, DeepSeekLLM, LLMError, MockLLM
 from .memory import (
     Recalled,
     consolidate,
+    is_cited,
     is_weak,
     mark_cited,
     recall,
     retention_of,
 )
 from .mood import Mood, MoodTracker, tone_of
+from .occasions import Occasion, days_together_text, find_occasions
+from .outreach import OutreachPlan, can_send, compose as compose_outreach_text
+from .outreach import history_text as outreach_history
+from .outreach import plan as outreach_plan
+from .outreach import record_sent
 from .persona import after_recycle_line, build_system_prompt
 from .recycle import RecycleReport, perform_recycle
 from .store import Store
@@ -74,6 +81,8 @@ class Giftia:
         self.last_bond: Bond | None = None
         self.last_mood: Mood | None = None
         self.last_scene = "c2c"
+        self.last_dream: Dream | None = None
+        self.last_occasions: list[Occasion] = []
 
     # ── 称呼与「认得的人」────────────────────────────────
     # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
@@ -280,10 +289,11 @@ class Giftia:
                 f"[关系] 你们的关系变成了「{self.last_bond.stage.label}」"
             )
 
-    def _prepare(self, text: str) -> tuple[list[dict], list[Recalled]]:
+    def _prepare(self, text: str, *, mark: bool = True) -> tuple[list[dict], list[Recalled]]:
         """组装这一轮真正会发给模型的消息。
 
         不落库、不请求模型——所以 /prompt 可以随时查看她被注入了什么。
+        mark=False 时只查看纪念日、不记"已经提过"（预览不该消耗掉今天这个日子）。
         """
         life = self.status()
         now = self.clock.now()
@@ -316,6 +326,19 @@ class Giftia:
                         f"{len(merged)} 条"
                     )
 
+        # 今天是不是特别的日子 / 有没有还没讲过的梦
+        self.last_occasions = find_occasions(
+            self.settings,
+            self.store,
+            now=now,
+            instance_no=self.instance_no,
+            days_known=self.current_bond(now).days_known,
+            mark=mark,
+        )
+        self.last_dream = latest_untold(
+            self.settings, self.store, self.clock, self.instance_no
+        )
+
         system = build_system_prompt(
             self.settings,
             life,
@@ -326,6 +349,8 @@ class Giftia:
             handler_name=self.handler_name,
             scene=self.last_scene,
             people=self._people_for_prompt(),
+            occasions=self.last_occasions,
+            dream=self.last_dream,
         )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))
@@ -334,7 +359,7 @@ class Giftia:
 
     def preview_prompt(self, text: str) -> str:
         """把「这一轮实际注入给她的一切」原样打印出来，用于核对人格与记忆。"""
-        messages, recalled = self._prepare(text or "（空）")
+        messages, recalled = self._prepare(text or "（空）", mark=False)
         self.last_recalled = recalled
         lines = [
             f"下面就是这一轮发给模型的完整请求（{len(messages)} 条消息）。",
@@ -356,6 +381,8 @@ class Giftia:
         # 只有真的说话才推进关系与心情（预览 /prompt 不会）
         self._tick_inner(text, now)
         messages, recalled = self._prepare(text)
+        # 做梦放在回复之后：这一场梦下次说话时再讲，免得"刚做完就讲"
+        self._maybe_dream(now)
         self.last_recalled = recalled
         if recalled:
             # 被塞进提示词 ≠ 被想起。这里只记账，强化要等她真的说出口。
@@ -383,7 +410,120 @@ class Giftia:
             self.notices.append(
                 f"[记忆强化] 说出口了 {len(self.last_cited)} 条记忆，它们会记得更久"
             )
+
+        # 她把梦讲出来了才算讲过（复用"被引用"的判定）
+        if self.last_dream is not None and is_cited(
+            reply, self.last_dream.content, self.settings.memory
+        ):
+            self.store.mark_dream_told(self.last_dream.id)
+            self.notices.append("[做梦] 她把那个梦讲给你听了")
         return reply
+
+    # ── 做梦 ──────────────────────────────────────────────
+    def _maybe_dream(self, now) -> None:
+        """闲置够了就做一场梦。这一场下次说话时才会讲出来。"""
+        if not should_dream(self.settings, self.store, self.clock, self.instance_no):
+            return
+        dream = make_dream(
+            self.settings, self.store, self.clock, self.llm, self.instance_no
+        )
+        if dream is not None:
+            self.notices.append("[做梦] 她睡着的时候做了一个梦（下次说话可能会讲）")
+
+    def dream_text(self) -> str:
+        return dream_text(self.store, self.instance_no)
+
+    def make_dream_now(self) -> str:
+        dream = make_dream(
+            self.settings, self.store, self.clock, self.llm, self.instance_no
+        )
+        if dream is None:
+            return ("她现在做不出梦——记忆太少（至少 "
+                    f"{self.settings.dream.min_memories} 条），或者刚做过没多久。")
+        return f"她做了一场梦：\n\n　{dream.content}"
+
+    # ── 纪念日 ────────────────────────────────────────────
+    def days_text(self) -> str:
+        bond = self.current_bond()
+        return days_together_text(
+            self.store, self.instance_no, bond.days_known, self.settings.occasions.milestones
+        )
+
+    # ── 主动联系 ──────────────────────────────────────────
+    def outreach_plan(self, *, force: bool = False) -> OutreachPlan | None:
+        now = self.clock.now()
+        bond = self.current_bond(now)
+        occasions = find_occasions(
+            self.settings,
+            self.store,
+            now=now,
+            instance_no=self.instance_no,
+            days_known=bond.days_known,
+            mark=False,
+        )
+        return outreach_plan(
+            self.settings,
+            self.store,
+            self.clock,
+            life=self.status(),
+            occasions=occasions,
+            dream=latest_untold(self.settings, self.store, self.clock, self.instance_no),
+            instance_no=self.instance_no,
+            force=force,
+        )
+
+    def compose_outreach(
+        self, *, record: bool = False, force: bool = False
+    ) -> tuple[OutreachPlan | None, str]:
+        """她想主动找你时说的一句。record=True 才真的记账（并写进会话）。"""
+        plan_ = self.outreach_plan(force=force)
+        if plan_ is None:
+            return None, ""
+        now = self.clock.now()
+        if record and not can_send(self.settings, self.store, now):
+            return plan_, ""
+        bond = self.current_bond(now)
+        occasions = find_occasions(
+            self.settings,
+            self.store,
+            now=now,
+            instance_no=self.instance_no,
+            days_known=bond.days_known,
+            mark=False,
+        )
+        dream = latest_untold(self.settings, self.store, self.clock, self.instance_no)
+        system = build_system_prompt(
+            self.settings,
+            self.status(),
+            [],
+            now=now,
+            bond=bond,
+            mood=self.current_mood(now),
+            handler_name=self.handler_name,
+            scene="c2c",
+            occasions=occasions,
+            dream=dream,
+        )
+        text = compose_outreach_text(self.settings, self.llm, plan_, system_prompt=system)
+        if text and record:
+            self.store.add_message(
+                self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
+            )
+            record_sent(self.store, now)
+            if dream is not None:
+                self.store.mark_dream_told(dream.id)
+        return plan_, text
+
+    def outreach_text(self) -> str:
+        return outreach_history(self.settings, self.store, self.clock)
+
+    def note_outreach_sent(self, text: str) -> None:
+        """适配器真的发出去之后调用：写进会话上下文 + 记账扣额度。"""
+        now = self.clock.now()
+        self.store.add_message(
+            self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
+        )
+        record_sent(self.store, now)
 
     def _rewrite_queries(self, text: str) -> list[str]:
         try:

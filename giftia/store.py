@@ -45,7 +45,19 @@ CREATE TABLE IF NOT EXISTS memories (
     strength       REAL    NOT NULL DEFAULT 1.0,
     recall_count   INTEGER NOT NULL DEFAULT 0,
     last_recalled_at TEXT,
-    injected_at      TEXT
+    injected_at      TEXT,
+    -- 「他的大日子」：他说过的将来某一天（考试/面试/生日/约定），到那天她会记得
+    event_date       TEXT
+);
+
+-- 她做过的梦。梦不是记忆：不进检索、不参与退化，只在第二天讲给你听。
+CREATE TABLE IF NOT EXISTS dreams (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_no INTEGER NOT NULL,
+    created_ts  TEXT    NOT NULL,
+    content     TEXT    NOT NULL,
+    source_ids  TEXT    NOT NULL DEFAULT '',
+    told        INTEGER NOT NULL DEFAULT 0
 );
 
 -- 日志：kind = handler（你的搭档日志）| terminal（终端服务通知）| memoir（回忆录）
@@ -78,6 +90,7 @@ class Store:
             "recall_count": "INTEGER NOT NULL DEFAULT 0",
             "last_recalled_at": "TEXT",
             "injected_at": "TEXT",
+            "event_date": "TEXT",
         }
     }
 
@@ -185,6 +198,17 @@ class Store:
             )
         return int(row["n"]) if row else 0
 
+    def last_message_ts(self, instance_no: int | None = None) -> str:
+        """最后一条消息的时间（判断"多久没说话了"用）。"""
+        if instance_no is None:
+            row = self._one("SELECT ts FROM messages ORDER BY id DESC LIMIT 1")
+        else:
+            row = self._one(
+                "SELECT ts FROM messages WHERE instance_no = ? ORDER BY id DESC LIMIT 1",
+                (instance_no,),
+            )
+        return str(row["ts"]) if row else ""
+
     def all_messages(
         self, instance_no: int | None = None, limit: int = 200
     ) -> list[dict[str, Any]]:
@@ -214,11 +238,12 @@ class Store:
         source_session: str = "",
         layer: str = "normal",
         strength: float = 1.0,
+        event_date: str = "",
     ) -> int:
         cur = self.conn.execute(
             "INSERT INTO memories(instance_no, created_ts, happened_ts, summary, tags, "
-            "emotion, importance, source_session, layer, strength) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "emotion, importance, source_session, layer, strength, event_date) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 instance_no,
                 created_ts,
@@ -230,10 +255,39 @@ class Store:
                 source_session,
                 layer,
                 float(strength),
+                event_date or None,
             ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    # ── dreams ────────────────────────────────────────────
+    def add_dream(
+        self, instance_no: int, created_ts: str, content: str, source_ids: list[int] | None = None
+    ) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO dreams(instance_no, created_ts, content, source_ids) "
+            "VALUES(?, ?, ?, ?)",
+            (
+                instance_no,
+                created_ts,
+                content,
+                ",".join(str(i) for i in (source_ids or [])),
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def recent_dreams(self, instance_no: int, limit: int = 5) -> list[dict[str, Any]]:
+        rows = self._rows(
+            "SELECT * FROM dreams WHERE instance_no = ? ORDER BY id DESC LIMIT ?",
+            (instance_no, limit),
+        )
+        return list(reversed(rows))
+
+    def mark_dream_told(self, dream_id: int) -> None:
+        self.conn.execute("UPDATE dreams SET told = 1 WHERE id = ?", (dream_id,))
+        self.conn.commit()
 
     def mark_injected(self, ids: list[int], ts: str) -> None:
         """被塞进提示词 ≠ 被想起。这里只记账，不强化。"""

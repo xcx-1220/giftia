@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from giftia import brain as brain_mod  # noqa: E402
 from giftia.brain import handle_message  # noqa: E402
 from giftia.config import load_env_file, load_settings  # noqa: E402
+from giftia.outreach import can_send  # noqa: E402
 from giftia.ws import WebSocket, WSClosed, WSTimeout  # noqa: E402
 
 # ── 常量（已对照官方文档）────────────────────────────────────────
@@ -142,6 +143,8 @@ class QQBot:
         self._seen: OrderedDict[str, float] = OrderedDict()
         self._seqs: dict[str, int] = {}
         self._stopping = False
+        # 主动联系多久查一次（她真要不要开口，由 outreach 那边决定）
+        self.outreach_interval = 600.0
 
     # ══ 退出 ═════════════════════════════════════════════════
     def request_stop(self, *_args: object) -> None:
@@ -390,6 +393,35 @@ class QQBot:
 
         return False  # 不认识的斜杠消息当作普通聊天，交给她
 
+    def _maybe_outreach(self) -> None:
+        """她主动来找你。
+
+        只在主线程里跑（Giftia 不是线程安全的），所以由 WebSocket 循环定时调用，
+        而不是另开一个后台线程。
+        """
+        if not self.settings.outreach.enabled:
+            return
+        target = self.owner_id()
+        if not target:
+            return  # 还没 /bind，不知道发给谁
+        hub = brain_mod.get_default(self.settings)
+        if not can_send(self.settings, hub.store, hub.clock.now()):
+            return
+        plan_, text = hub.compose_outreach(record=False)
+        if not plan_ or not text.strip():
+            return
+
+        body: dict = {"msg_type": 0, "content": text}
+        if self.settings.outreach.use_wakeup:
+            body["is_wakeup"] = True
+        try:
+            self._request("POST", f"/v2/users/{target}/messages", body)
+        except QQError as exc:
+            print(f"[主动发送失败] {exc}", file=sys.stderr)
+            return
+        hub.note_outreach_sent(text)  # 成功才记账
+        print(f"[主动·{plan_.reason_label}] {text}")
+
     # ══ WebSocket 会话 ═══════════════════════════════════════
     def identify(self, ws: WebSocket) -> None:
         ws.send_text(
@@ -440,9 +472,16 @@ class QQBot:
             self.identify(ws)
 
         next_beat = time.time() + interval
+        next_outreach = time.time() + self.outreach_interval
         try:
             while not self._stopping:
                 now = time.time()
+                if now >= next_outreach:
+                    try:
+                        self._maybe_outreach()
+                    except Exception as exc:  # 主动联系出问题不该拖垮连接
+                        print(f"[主动联系异常] {type(exc).__name__}: {exc}", file=sys.stderr)
+                    next_outreach = now + self.outreach_interval
                 if now >= next_beat:
                     ws.send_text(json.dumps({"op": OP_HEARTBEAT, "d": self.seq}))
                     next_beat = now + interval

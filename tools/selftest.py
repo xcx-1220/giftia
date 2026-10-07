@@ -52,7 +52,7 @@ class SynonymLLM(MockLLM):
 class NameLLM(MockLLM):
     """模拟模型在整理记忆时发现"他要求改口"。"""
 
-    def extract_memories(self, transcript: str, *, name: str = "Giftia"):
+    def extract_memories(self, transcript: str, *, name: str = "Giftia", today: str = ""):
         return [
             MemoryDraft(
                 summary="搭档要求以后叫他小林。",
@@ -630,6 +630,151 @@ def main() -> int:
     check("访客提示词里没有任何搭档的私事", "考驾照" not in guest_sys)
     check("访客提示词明确要求不提私事", "私事" in guest_sys)
     check("访客看到的是「什么都想不起来」", "什么都想不起来" in guest_sys)
+
+    # ══ 22. 纪念日与「他的大日子」══════════════════════════════
+    print("\n22. 纪念日与他的大日子")
+    oc = Giftia(make_settings(tmp / "occ", 81920.0), llm=MockLLM(settings.model))
+    oc.handle("你好")
+    oc.consolidate(force=True)
+    first = oc.days_text()
+    check("刚认识时还没有纪念日", "还没跨过纪念日" in first, first[:40])
+
+    oc.clock.advance(24 * 30)  # 第 30 天
+    preview = oc._prepare("在吗", mark=False)[0][0]["content"]
+    check("第 30 天她会自己想起来", "【今天不只是普通的一天】" in preview)
+    check("注入的是天数和顺口提一句的指引",
+          "别郑重其事" in preview or "顺口" in preview)
+    check("预览不会消耗掉这个日子（/prompt 随便看）",
+          "【今天不只是普通的一天】" in oc._prepare("在吗", mark=False)[0][0]["content"])
+    oc.handle("在吗")
+    check("真正说过一次之后，同一天不再重复",
+          "【今天不只是普通的一天】" not in oc._prepare("在吗")[0][0]["content"])
+
+    # 大日子：直接塞一条带日期的记忆
+    from datetime import timedelta as _td
+
+    today = oc.clock.now().date()
+    oc.store.add_memory(
+        instance_no=oc.instance_no,
+        created_ts=oc.clock.iso(),
+        happened_ts=oc.clock.iso(),
+        summary="搭档下周三要考驾照，有点紧张",
+        importance=0.7,
+        layer="important",
+        event_date=(today + _td(days=1)).isoformat(),
+    )
+    big_preview = oc._prepare("在吗", mark=False)[0][0]["content"]
+    check("明天的大日子会被惦记",
+          "【今天不只是普通的一天】" in big_preview and "考驾照" in big_preview,
+          big_preview[big_preview.find("【今天不只是普通的一天】") :][:80])
+    check("大日子的指引是别像闹钟", "别像闹钟" in big_preview)
+    oc.handle("在吗")
+    check("同一件大日子同一天只说一次",
+          "【今天不只是普通的一天】" not in oc._prepare("在吗")[0][0]["content"])
+    check("大日子进了时间线", "考驾照" in oc.days_text(), oc.days_text()[-60:])
+
+    past = Giftia(make_settings(tmp / "occ_past", 81920.0), llm=MockLLM(settings.model))
+    past.store.add_memory(
+        instance_no=past.instance_no,
+        created_ts=past.clock.iso(),
+        happened_ts=past.clock.iso(),
+        summary="已经过去的事",
+        event_date=(past.clock.now().date() - _td(days=3)).isoformat(),
+    )
+    past.handle("在吗")
+    check("过去的日子不会被翻出来",
+          not any(o.kind == "big_day" for o in past.last_occasions))
+
+    # ══ 23. 做梦 ═══════════════════════════════════════════════
+    print("\n23. 做梦：记忆碎片会自己重组")
+    dr = Giftia(make_settings(tmp / "dream", 81920.0), llm=MockLLM(settings.model))
+    for line in ("我叫小林", "我下周三要考驾照，有点紧张", "最近总是睡不好"):
+        dr.handle(line)
+    dr.consolidate(force=True)
+    check("记忆攒够之前不做梦",
+          dr.store.recent_dreams(dr.instance_no) == [], "不该有梦")
+
+    dr.store.add_memory(  # mock 一次只压出两条，补一条凑够做梦门槛
+        instance_no=dr.instance_no,
+        created_ts=dr.clock.iso(),
+        happened_ts=dr.clock.iso(),
+        summary="搭档不喜欢下雨天，觉得闷",
+        importance=0.5,
+    )
+    dr.handle("在吗")
+    check("攒够记忆后会做一场梦",
+          len(dr.store.recent_dreams(dr.instance_no)) == 1,
+          f"{len(dr.store.recent_dreams(dr.instance_no))} 场")
+    check("做过的梦会提示「下次再讲」", any("做梦" in n for n in dr.notices), str(dr.notices))
+
+    dreams = dr.store.recent_dreams(dr.instance_no)
+    check("梦被存了下来且带来源", bool(dreams) and bool(dreams[0]["source_ids"]))
+    dr.clock.advance(1)
+    dream_prompt = dr._prepare("在吗")[0][0]["content"]
+    check("下一次说话才会把梦讲出来", "【你昨晚做的梦】" in dream_prompt)
+    check("提示里说明了梦不作数", "不是记忆" in dream_prompt)
+    check("梦不进长期记忆（检索里没有它）",
+          all("梦里有" not in str(m.get("summary", ""))
+              for m in dr.store.active_memories(dr.instance_no)))
+    check("梦的文本确实成型了", bool(dreams) and len(str(dreams[0]["content"])) > 8,
+          str(dreams[0]["content"])[:40] if dreams else "")
+
+    dr.store.mark_dream_told(int(dreams[0]["id"]))
+    dr.handle("在吗")
+    check("讲过的梦不再重复注入",
+          "【你昨晚做的梦】" not in dr._prepare("在吗")[0][0]["content"])
+    check("梦簿能列出来", "她做过的梦" in dr.dream_text())
+
+    # ══ 24. 主动联系 ═══════════════════════════════════════════
+    print("\n24. 主动联系：稀缺资源，用完就没有")
+    from giftia.outreach import can_send, quota_state, record_sent
+
+    base = make_settings(tmp / "out", 81920.0)
+    out = Giftia(base, llm=MockLLM(settings.model))
+    out.handle("在吗")
+    check("默认关闭时她不会主动找你", out.outreach_plan() is None)
+
+    on = dataclasses.replace(base, outreach=dataclasses.replace(
+        base.outreach, enabled=True, idle_days=3))
+    out2 = Giftia(on, llm=MockLLM(settings.model))
+    out2.handle("在吗")
+    check("刚说过话时没有主动理由", out2.outreach_plan(force=True) is None)
+
+    out2.clock.advance(24 * 4)  # 4 天没说话
+    plan_ = out2.outreach_plan(force=True)
+    check("闲了 4 天 → 她想你了", plan_ is not None and plan_.reason == "missing_you",
+          plan_.reason if plan_ else "None")
+
+    used, left, _ = quota_state(on, out2.store, out2.clock.now())
+    check("额度是 4 条 / 30 天", on.outreach.max_per_30_days == 4 and used == 0 and left == 4)
+
+    _, text = out2.compose_outreach(record=True, force=True)
+    check("她写出了一句想说的话", bool(text.strip()), text[:40])
+    used2, left2, _ = quota_state(on, out2.store, out2.clock.now())
+    check("发出去会扣额度", used2 == 1 and left2 == 3, f"{used2}/{left2}")
+    check("刚发过就发不了第二条（间隔限制）",
+          not can_send(on, out2.store, out2.clock.now()))
+
+    for _ in range(4):
+        out2.clock.advance(24 * 8)
+        if can_send(on, out2.store, out2.clock.now()):
+            record_sent(out2.store, out2.clock.now())
+    used3, left3, _ = quota_state(on, out2.store, out2.clock.now())
+    check("用满 4 条之后额度耗尽", left3 == 0, f"used={used3} left={left3}")
+    check("额度耗尽后不再主动", not can_send(on, out2.store, out2.clock.now()))
+
+    # 快到终端服务时优先级最高（用独立目录，免得共用时钟）
+    near_base = make_settings(tmp / "near", 81920.0)
+    near_on = dataclasses.replace(near_base, outreach=dataclasses.replace(
+        near_base.outreach, enabled=True))
+    near = Giftia(near_on, llm=MockLLM(settings.model))
+    near.handle("在吗")
+    near.clock.advance(81920 - 10)  # 剩余 10 小时
+    near_plan = near.outreach_plan(force=True)
+    check("快到终端服务时，主动的理由变成不安",
+          near_plan is not None and near_plan.reason == "near_end",
+          near_plan.reason if near_plan else "None")
+    check("不安时不会说「回收」或道别", "不要提「回收」" in (near_plan.hint if near_plan else ""))
 
     brain.store.close()
     brain2.store.close()

@@ -115,6 +115,38 @@ DEFAULT_BOND_STAGES: tuple[BondStage, ...] = (
 DEFAULT_MOODS: dict[str, MoodDef] = {"calm": MoodDef("calm", "平静", "")}
 
 
+DEFAULT_MILESTONES = [1, 3, 7, 14, 30, 50, 100, 200, 365, 500, 730, 1000]
+
+
+@dataclass(frozen=True)
+class OccasionsConfig:
+    enabled: bool = True
+    milestones: list = field(default_factory=lambda: list(DEFAULT_MILESTONES))
+    big_day_lookahead_days: int = 1   # 今天 + 明天的大日子都会提醒
+
+
+@dataclass(frozen=True)
+class DreamConfig:
+    enabled: bool = True
+    min_hours_between: float = 12.0   # 两场梦之间至少隔多久
+    min_memories: int = 3             # 记忆太少就不做梦
+    fragments: int = 6                # 一场梦最多揉进几条记忆
+    blur: float = 0.6                 # 碎片模糊到什么程度
+    tell_within_hours: float = 36.0   # 超过这么久还没讲的梦就不再翻出来
+
+
+@dataclass(frozen=True)
+class OutreachConfig:
+    # 默认关闭：真要让她主动找你，得先配好平台凭据再打开
+    enabled: bool = False
+    idle_days: float = 3.0            # 多久没说话就算"想你了"
+    max_per_30_days: int = 4          # 对齐官方互动召回的额度
+    min_gap_hours: float = 6.0
+    # True = 用官方的「互动召回消息」（is_wakeup），额度更紧但更合规；
+    # False = 普通主动消息（有频控，没有 30 天 4 条的硬限制）
+    use_wakeup: bool = False
+
+
 @dataclass(frozen=True)
 class MemoryConfig:
     consolidate_every: int = 8
@@ -232,6 +264,9 @@ class Settings:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     relationship: RelationshipConfig = field(default_factory=RelationshipConfig)
     mood: MoodConfig = field(default_factory=MoodConfig)
+    occasions: OccasionsConfig = field(default_factory=OccasionsConfig)
+    dream: DreamConfig = field(default_factory=DreamConfig)
+    outreach: OutreachConfig = field(default_factory=OutreachConfig)
     persona: Persona = field(default_factory=Persona)
     stages: tuple[Stage, ...] = ()
     bond_stages: tuple[BondStage, ...] = DEFAULT_BOND_STAGES
@@ -364,6 +399,9 @@ def load_settings(
         runtime=_sub(RuntimeConfig, raw.get("runtime", {})),
         relationship=_sub(RelationshipConfig, raw.get("relationship", {})),
         mood=_sub(MoodConfig, raw.get("mood", {})),
+        occasions=_sub(OccasionsConfig, raw.get("occasions", {})),
+        dream=_sub(DreamConfig, raw.get("dream", {})),
+        outreach=_sub(OutreachConfig, raw.get("outreach", {})),
         persona=_sub(Persona, praw),
         stages=stages,
         bond_stages=bond_stages,

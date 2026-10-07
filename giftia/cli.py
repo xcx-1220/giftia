@@ -17,6 +17,9 @@ HELP = """\
   /people            看她认得群里哪些人
   /bond              关系阶段、亲密度进度、还差什么才能升级
   /mood [名字]        看她此刻的心情；带名字则手动指定（调试用）
+  /days              你们认识多久了、下一个纪念日、她记得的「大日子」
+  /dream [now]       看她的梦簿；带 now 就立刻让她做一场梦
+  /outreach          她此刻想不想主动找你、会说些什么（不会真的发出去）
   /prompt <一句话>    看她这一轮**实际被注入了什么**（人格 + 关系 + 心情 + 记忆 + 规则）
   /memories          她的长期记忆（你看到的原始版）
   /recall <文本>      演示检索：她拿到什么、被模糊成什么样
@@ -140,6 +143,25 @@ def _handle_command(brain: Giftia, text: str) -> bool:
 
     elif cmd == "/people":
         print(brain.people_text())
+
+    elif cmd == "/days":
+        print(brain.days_text())
+
+    elif cmd == "/dream":
+        print(brain.make_dream_now() if arg.strip().lower() in ("now", "1") else brain.dream_text())
+
+    elif cmd == "/outreach":
+        plan_, text = brain.compose_outreach(force=True)
+        print(brain.outreach_text())
+        print()
+        if plan_ is None:
+            print("她现在没有特别想主动找你的理由（那就先不打扰你）。")
+        else:
+            print(f"她此刻想找你的理由：{plan_.reason_label}（{plan_.title}）")
+            print("她大概会说：")
+            print(f"　{text or '（写不出话来）'}")
+            print()
+            print("（这只是预览，没有真的发出去。要真的启用：settings.toml 的 [outreach] enabled = true）")
 
     elif cmd == "/mood":
         if arg:

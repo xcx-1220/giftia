@@ -56,6 +56,8 @@ def build_system_prompt(
     handler_name: str = "",
     scene: str = "c2c",
     people: list[tuple[str, bool]] | None = None,
+    occasions=None,
+    dream=None,
 ) -> str:
     """一次请求的 system 消息：人格 → 称呼 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
 
@@ -91,6 +93,21 @@ def build_system_prompt(
         if mood.note:
             body += "\n" + mood.note
         blocks.append("【你今天的心情】\n" + body)
+
+    if occasions:
+        from .occasions import render_occasions
+
+        text = render_occasions(list(occasions))
+        if text:
+            blocks.append("【今天不只是普通的一天】\n" + text)
+
+    if dream is not None and getattr(dream, "content", ""):
+        blocks.append(
+            "【你昨晚做的梦】\n"
+            f"{dream.content}\n"
+            "（这是梦，不是记忆。你可以讲给他听，但你自己也知道那不作数——"
+            "别把它当成真发生过的事。）"
+        )
 
     if scene == "guest":
         guest_text = p.guest_text(name).strip()

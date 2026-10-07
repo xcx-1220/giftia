@@ -77,12 +77,17 @@ def main() -> int:
     layer_label = {"core": "内核", "important": "重要", "normal": "常规"}
     for m in mems:
         ret = retention_of(m, live.memory, brain.clock.now())
+        when = f"　大日子 {m['event_date']}" if m.get("event_date") else ""
         print(
             f"  #{m['id']}　[{layer_label.get(str(m['layer']), '?')}]　"
             f"重要性 {float(m['importance']):.2f}　保留率 {ret:.2f}　"
-            f"[{m['emotion']}]　标签 {m['tags']}"
+            f"[{m['emotion']}]　标签 {m['tags']}{when}"
         )
         print(f"      {m['summary']}")
+    if any(m.get("event_date") for m in mems):
+        print("\n  ✓ 模型把「下周三」这类相对时间算成了具体日期（大日子功能的基础）")
+    else:
+        print("\n  （这次没提取到大日子；只有出现'下周三'这类可推算的日期才会填）")
 
     print("\n── 2b. 查询改写（真实模型的 JSON 输出）─────────")
     started = time.time()
@@ -102,7 +107,24 @@ def main() -> int:
     if not hits:
         print("  [警告] 召不回——检查检索分词或阈值。")
 
-    print("\n── 4. 回收日与回忆录 ──────────────────────────")
+    print("\n── 4. 做梦（记忆碎片 → 一场梦）──────────────────")
+    started = time.time()
+    dream_text_ = brain.make_dream_now()
+    print(f"（用时 {time.time() - started:.1f}s）\n{dream_text_}")
+    brain.clock.advance(1)
+    dream_prompt = brain._prepare("在吗")[0][0]["content"]
+    print("\n  梦已进入提示词：" + ("是" if "【你昨晚做的梦】" in dream_prompt else "否"))
+
+    print("\n── 5. 主动联系（预览，不会真的发出去）─────────────")
+    plan_, said = brain.compose_outreach(force=True)
+    if plan_ is None:
+        print("她现在没有想主动找你的理由（那就先不打扰）。")
+    else:
+        print(f"理由：{plan_.reason_label}（{plan_.title}）")
+        print(f"她会说：{said}")
+    print("\n" + brain.outreach_text())
+
+    print("\n── 6. 回收日与回忆录 ──────────────────────────")
     started = time.time()
     scene = brain.run_recycle("连通性检查")
     print(f"（用时 {time.time() - started:.1f}s）\n")
