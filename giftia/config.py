@@ -205,6 +205,11 @@ class RuntimeConfig:
     show_memoir_after_recycle: bool = True
     # 群里被陌生人 @ 时：false = 装作没看见（默认，群聊不该刷屏），true = 以"客人"身份回一句
     group_stranger_reply: bool = False
+    # 自动认主（省掉 /bind）：
+    #   私聊里第一个说话的人 = 搭档；
+    #   群里只有**群主** @ 她时才算（陌生人做不到这一点）。
+    # 官方 openid 与 QQ 号不互通、无法预先填，所以只能靠"谁先跟她说话"来认人。
+    auto_bind: bool = True
 
 
 @dataclass(frozen=True)

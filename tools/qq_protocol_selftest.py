@@ -308,6 +308,74 @@ def main() -> int:
           isinstance(mems, int) and mems > 0, str(mems))
     check("退出后单例已释放", brain_mod.current() is None)
 
+    print("\n6. 自动认主：不写 /bind 也能认人")
+    brain_mod.reset_default()  # 前面的测试用过全局单例
+    auto_settings = dataclasses.replace(
+        load_settings(force_mock=True), root=Path(tempfile.mkdtemp(prefix="giftia-auto-"))
+    )
+    auto = adapter.QQBot("X", "Y", owner_openid="", settings=auto_settings)
+    auto_calls: list[tuple[str, str, str]] = []
+    auto.send = lambda kind, target, text, msg_id: auto_calls.append((kind, target, text))  # type: ignore[method-assign]
+
+    auto.handle_event(adapter.EVENT_C2C, {
+        "id": "AUTO-1", "author": {"user_openid": "ME"}, "content": "你好",
+    })
+    auto_hub = brain_mod.get_default(auto_settings)
+    check("私聊第一句话就自动成为搭档（不用 /bind）",
+          auto_hub.handler_id == "ME", repr(auto_hub.handler_id))
+    check("自动认主之后是正常回复，不是被挡回",
+          len(auto_calls) == 1 and "抱歉" not in auto_calls[0][2], str(auto_calls))
+
+    auto.handle_event(adapter.EVENT_C2C, {
+        "id": "AUTO-2", "author": {"user_openid": "OTHER"}, "content": "你好呀",
+    })
+    check("认主之后别人会被挡回",
+          len(auto_calls) == 2 and "抱歉" in auto_calls[1][2], str(auto_calls[-1:]))
+
+    brain_mod.reset_default()
+    group_settings = dataclasses.replace(
+        load_settings(force_mock=True), root=Path(tempfile.mkdtemp(prefix="giftia-auto-g-"))
+    )
+    grp_auto = adapter.QQBot("X", "Y", owner_openid="", settings=group_settings)
+    grp_calls: list[tuple[str, str, str]] = []
+    grp_auto.send = lambda kind, target, text, msg_id: grp_calls.append((kind, target, text))  # type: ignore[method-assign]
+    grp_auto.handle_event(adapter.EVENT_GROUP_AT, {
+        "id": "AUTO-3", "author": {"user_openid": "SOMEONE", "member_role": "member"},
+        "group_openid": "G", "content": "<@!1> 你好",
+    })
+    grp_hub = brain_mod.get_default(group_settings)
+    check("群里普通成员不会认主（防抢注）", grp_hub.handler_id == "", repr(grp_hub.handler_id))
+    check("群里的陌生人也保持安静（默认策略）", grp_calls == [], str(grp_calls))
+
+    grp_auto.handle_event(adapter.EVENT_GROUP_AT, {
+        "id": "AUTO-4", "author": {"user_openid": "OWNER-X", "member_role": "owner"},
+        "group_openid": "G", "content": "<@!1> 你好",
+    })
+    check("群主 @ 她会自动认主（陌生人冒充不了群主）",
+          grp_hub.handler_id == "OWNER-X", repr(grp_hub.handler_id))
+
+    # 关掉 auto_bind 之后回到显式 /bind 的老行为
+    brain_mod.reset_default()
+    strict_settings = dataclasses.replace(
+        load_settings(force_mock=True),
+        root=Path(tempfile.mkdtemp(prefix="giftia-auto-off-")),
+        runtime=dataclasses.replace(load_settings(force_mock=True).runtime, auto_bind=False),
+    )
+    strict = adapter.QQBot("X", "Y", owner_openid="", settings=strict_settings)
+    strict_calls: list[tuple[str, str, str]] = []
+    strict.send = lambda kind, target, text, msg_id: strict_calls.append((kind, target, text))  # type: ignore[method-assign]
+    strict.handle_event(adapter.EVENT_C2C, {
+        "id": "AUTO-5", "author": {"user_openid": "ME"}, "content": "你好",
+    })
+    strict_hub = brain_mod.get_default(strict_settings)
+    check("auto_bind = false 时不再自动认主", strict_hub.handler_id == "",
+          repr(strict_hub.handler_id))
+    check("关掉自动认主后仍然可以手动 /bind",
+          strict.handle_command("c2c", "ME", "/bind", "ME", "AUTO-6"))
+    check("手动 /bind 生效", strict_hub.handler_id == "ME", repr(strict_hub.handler_id))
+
+    brain_mod.reset_default()
+
     print("\n" + "═" * 52)
     print(f"通过 {PASS} 项，失败 {FAIL} 项")
     print("═" * 52)

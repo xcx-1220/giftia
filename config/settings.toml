@@ -79,6 +79,10 @@ user_id      = "handler"
 show_memoir_after_recycle = true
 # 群里被陌生人 @ 时：false = 装作没看见（默认，群聊不该刷屏），true = 以"客人"身份礼貌回一句
 group_stranger_reply = false
+# 自动认主（省掉 /bind）：私聊里第一个说话的人 = 搭档；
+# 群里只有**群主** @ 她时才算（陌生人冒充不了群主）。
+# 官方 openid 与 QQ 号不互通、无法预先填，所以只能靠"谁先跟她说话"来认人。
+auto_bind = true
 
 
 # ── 关系：亲密度按"天"增长，升级同时要求亲密度与认识天数 ──────────

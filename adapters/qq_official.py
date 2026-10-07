@@ -290,14 +290,30 @@ class QQBot:
         if self.handle_command(kind, target, content, user_id, msg_id):
             return
 
+        hub = brain_mod.get_default(self.settings)
         owner = self.owner_id()
-        if owner and user_id != owner:
-            # 一个"她"只服务一个搭档：别人说话不进你们的记忆，也不占她的寿命
-            hub = brain_mod.get_default(self.settings)
-            if kind != "group":
-                self.send(kind, target, DEFLECT, msg_id)
-                return
-            # 群里：先让她认人（这是她"认得群里的人"的唯一来源），再决定要不要出声
+        if not owner and self.settings.runtime.auto_bind:
+            # 自动认主：省掉 /bind（官方 openid 无法预先知道，只能这样认人）
+            role = str((payload.get("author") or {}).get("member_role") or "")
+            if kind == "c2c":
+                # 私聊：未认证时只有管理员/体验号能找她，第一个说话的当然是他
+                hub.set_handler_id(user_id)
+                owner = user_id
+                print(f"[自动认主·私聊] 搭档 = {user_id}（想换人：/unbind）")
+            elif role == "owner":
+                # 群聊：只有群主 @ 她时才认（陌生人冒充不了群主）
+                hub.set_handler_id(user_id)
+                owner = user_id
+                print(f"[自动认主·群主] 搭档 = {user_id}（想换人：/unbind）")
+
+        # 谁是搭档？
+        #   · 已绑定 → 就是绑定的人
+        #   · 未绑定 + 私聊 → 说话的就是他（本地 CLI 与"还没认人"时都是这样）
+        #   · 未绑定 + 群聊 → 不是他（群里必须靠群主自动认主或 /bind）
+        is_handler = (user_id == owner) if owner else (kind == "c2c")
+
+        if kind == "group" and not is_handler:
+            # 群里的其他人：先让她认人（这是她"认得群里的人"的唯一来源），再决定出不出声
             if hub.learn_name(content, user_id, owner=False):
                 print(f"[认得] 群里有人叫「{hub.known_people().get(user_id, '')}」")
             if not self.settings.runtime.group_stranger_reply:
@@ -309,6 +325,11 @@ class QQBot:
             )
             print(f"[{self.settings.persona.name}·客人] {guest_reply}")
             self.send(kind, target, guest_reply, msg_id)
+            return
+
+        if not is_handler:
+            # 私聊里的别人：戏内挡回去，不进记忆、不占她的寿命
+            self.send(kind, target, DEFLECT, msg_id)
             return
 
         # ★ 整个项目的接缝：平台消息 → 她
@@ -634,11 +655,14 @@ def main() -> int:
     bot = QQBot(app_id, secret, owner_openid=args.owner, api_base=args.api_base,
                 mock_llm=args.mock_llm)
     if not bot.owner_openid:
-        print(
-            "[提醒] 还没认人：在 QQ 里私聊她发一句 /bind，她就把你记成搭档了。\n"
-            "        （在那之前，任何人跟她说话都会共用同一份记忆和寿命。）",
-            file=sys.stderr,
-        )
+        if bot.settings.runtime.auto_bind:
+            print(
+                "[提示] 还没认人：在 QQ 里私聊她说第一句话，她就把你记成搭档了。\n"
+                "        （群里需要你是群主，或者手动发 /bind。想换人：/unbind）",
+                file=sys.stderr,
+            )
+        else:
+            print("[提示] 还没认人：在 QQ 里私聊她发一句 /bind。", file=sys.stderr)
     bot.run()
     return 0
 
