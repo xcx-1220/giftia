@@ -20,7 +20,7 @@ die() { printf '\n[错误] %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "请用 root 运行：sudo bash deploy/setup.sh"
 
 # ── 1. Python 版本（tomllib 需要 3.11+）────────────────────────
-say "1/5 检查 Python"
+say "1/6 检查 Python"
 command -v python3 >/dev/null 2>&1 || die "没有 python3，请先：apt-get update && apt-get install -y python3"
 python3 -c 'import sys, tomllib; sys.exit(0 if sys.version_info >= (3, 11) else 1)' || die \
 "python3 版本过低（$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')）。
@@ -31,7 +31,7 @@ python3 -c 'import sys, tomllib; sys.exit(0 if sys.version_info >= (3, 11) else 
 echo "Python $(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])') ✓　零第三方依赖，不需要 pip install"
 
 # ── 2. 系统用户 ────────────────────────────────────────────────
-say "2/5 创建系统用户"
+say "2/6 创建系统用户"
 if id -u "$APP_USER" >/dev/null 2>&1; then
   echo "用户 $APP_USER 已存在，跳过"
 else
@@ -40,7 +40,7 @@ else
 fi
 
 # ── 3. 安装代码 ────────────────────────────────────────────────
-say "3/5 安装到 $APP_DIR"
+say "3/6 安装到 $APP_DIR"
 mkdir -p "$APP_DIR"
 if [ "$SRC_DIR" != "$APP_DIR" ]; then
   tar -C "$SRC_DIR" \
@@ -57,27 +57,50 @@ fi
 mkdir -p "$APP_DIR/data"
 [ -f "$APP_DIR/.env" ] || die \
 "没有找到 $APP_DIR/.env。
-       请先把凭据填好再跑这个脚本，至少要有：
-         DEEPSEEK_API_KEY=...
-         QQ_BOT_APPID=...
-         QQ_BOT_SECRET=...
-         QQ_OWNER_OPENID=...   （建议填，一个她只服务一个搭档）"
+       请先把凭据填好再跑这个脚本（.env 在项目根目录，和本机那份一样）：
+         DEEPSEEK_API_KEY=sk-...
+         QQ_BOT_APPID=...      （还没申请可以先留空，见最后一步）
+         QQ_BOT_SECRET=..."
 chmod 600 "$APP_DIR/.env"
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 echo "代码就位；.env 权限已收成 600（仅 $APP_USER 可读）"
 
-# ── 4. systemd ────────────────────────────────────────────────
-say "4/5 安装 systemd 服务"
+# 提前看清凭据齐不齐 —— 缺 QQ 凭据就别启动，否则 systemd 会每 5 秒重启一次
+HAS_LLM=0; HAS_QQ=0
+grep -qE '^[[:space:]]*DEEPSEEK_API_KEY=[^[:space:]]' "$APP_DIR/.env" && HAS_LLM=1
+grep -qE '^[[:space:]]*QQ_BOT_APPID=[^[:space:]]' "$APP_DIR/.env" && \
+  grep -qE '^[[:space:]]*QQ_BOT_SECRET=[^[:space:]]' "$APP_DIR/.env" && HAS_QQ=1
+echo "DeepSeek key：$([ $HAS_LLM -eq 1 ] && echo 已配置 || echo '缺失')　QQ 凭据：$([ $HAS_QQ -eq 1 ] && echo 已配置 || echo '还没申请')"
+
+# ── 4. 环境自检（不需要联网、不需要 API key）───────────────────
+say "4/6 环境自检（跑一遍项目自带的 187 项测试）"
+if sudo -u "$APP_USER" python3 "$APP_DIR/tools/selftest.py" >/tmp/giftia-selftest.log 2>&1; then
+  tail -n 3 /tmp/giftia-selftest.log | sed 's/^/  /'
+  echo "自检通过 —— 这台机器上她能正常跑。"
+else
+  echo "!! 自检没通过，最后 15 行如下："
+  tail -n 15 /tmp/giftia-selftest.log | sed 's/^/  /'
+  die "环境自检失败。把上面这段发给我/贴到 issue 里就能定位。"
+fi
+
+# ── 5. systemd ────────────────────────────────────────────────
+say "5/6 安装 systemd 服务"
 install -m 644 "$SRC_DIR/deploy/${SERVICE}.service" "/etc/systemd/system/${SERVICE}.service"
 systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
 echo "已注册为开机自启"
 
-# ── 5. 启动 ────────────────────────────────────────────────────
-say "5/5 启动"
-systemctl restart "$SERVICE"
-sleep 3
-systemctl --no-pager --lines=20 status "$SERVICE" || true
+# ── 6. 启动 ────────────────────────────────────────────────────
+say "6/6 启动"
+if [ $HAS_QQ -eq 1 ]; then
+  systemctl restart "$SERVICE"
+  sleep 3
+  systemctl --no-pager --lines=20 status "$SERVICE" || true
+else
+  echo "QQ 凭据还没填 —— 先不启动（否则她会每 5 秒重启一次）。"
+  echo "等你拿到 AppID/AppSecret 填进 $APP_DIR/.env，再执行："
+  echo "    sudo systemctl start ${SERVICE}"
+fi
 
 cat <<EOF
 

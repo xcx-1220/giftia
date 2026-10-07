@@ -401,18 +401,39 @@ python adapters/qq_official.py             # 真正连上 QQ
 
 ### 部署
 
+**推荐顺序**：先去 [q.qq.com](https://q.qq.com) 提交机器人申请（认证/审核要等），
+同时把服务器环境装好——两边并行，不互相等。
+
 ```bash
-# 1. 在本机把项目传上去（Windows 自带 scp）
+# 1. 在本机把项目传上去（Windows 自带 scp；公网 IP 在控制台实例列表里）
 scp -r "D:\ai chatbot" root@你的服务器IP:/tmp/giftia
 # 2. 登录服务器
 ssh root@你的服务器IP
-# 3. 一键装好并启动
+# 3. 一键装好
 cd /tmp/giftia && sudo bash deploy/setup.sh
 ```
 
-`deploy/setup.sh` 会：检查 Python 版本 → 建系统用户 `giftia` → 装到 `/opt/giftia`
-（**不覆盖已有的 `data/`**）→ 把 `.env` 权限收成 600 → 装 systemd 服务并开机自启 → 启动并打印状态。
-可以重复运行。
+`deploy/setup.sh` 一共六步，可以重复运行：
+
+1. 检查 Python 版本（要 3.11+，不够会直接拦住并说明怎么换镜像）
+2. 建系统用户 `giftia`
+3. 装到 `/opt/giftia`（**不覆盖已有的 `data/`**），`.env` 权限收成 600
+4. **环境自检**：以 `giftia` 用户跑一遍项目自带的 187 项测试（不需要联网、不需要 API key）。
+   这一步过了，就说明这台机器上她能正常跑；没过会把最后 15 行日志打出来
+5. 装 systemd 服务并注册开机自启
+6. 启动——**但只在你已经填了 QQ 凭据时才启动**
+
+> 第 6 步这个判断很重要：没有 QQ 凭据时服务会立刻退出，而 `Restart=always` 会让她每 5 秒重启一次。
+> 所以脚本会装好、注册好，然后告诉你「等你拿到 AppID/AppSecret 填进 `/opt/giftia/.env`，
+> 再执行 `sudo systemctl start giftia-qq`」。
+
+拿到凭据之后：
+
+```bash
+sudo nano /opt/giftia/.env        # 填 QQ_BOT_APPID / QQ_BOT_SECRET
+sudo systemctl start giftia-qq
+journalctl -u giftia-qq -f        # 看到「[就绪] 机器人「xxx」已上线」就成了
+```
 
 注册的服务 `deploy/giftia-qq.service` 做了几件正经事：
 
