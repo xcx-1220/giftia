@@ -1,0 +1,131 @@
+# ══════════════════════════════════════════════════════════════
+#  行为配置：模型、寿命、记忆退化曲线
+#  人格设定在 persona.toml —— 两个文件分开，改人格不用动参数
+# ══════════════════════════════════════════════════════════════
+
+[model]
+provider       = "deepseek"                      # deepseek（真实） | mock（离线假装，用于调试）
+base_url       = "https://api.deepseek.com"      # OpenAI 兼容
+name           = "deepseek-flash"                # 当前可用：deepseek-flash / deepseek-v4-pro
+api_key_env    = "DEEPSEEK_API_KEY"              # 从环境变量读 key，绝不写进文件
+temperature    = 1.15                            # 陪伴对话可以高一点，别太像客服
+max_tokens     = 900
+request_timeout = 60
+# DeepSeek 默认开启思考模式，而思考模式下 temperature 会被忽略、延迟也更高。
+# 陪伴型对话建议关掉：更像人、更便宜、回得更快。
+thinking       = false
+reasoning_effort = "low"                         # 仅在 thinking = true 时有意义：low / high / max
+
+
+[lifespan]
+# 《可塑性记忆》原设定：Giftia 寿命 81920 小时 ≈ 9 年 4 个月
+total_hours      = 81920
+# 想一次性看完她的一生？把这里设成 48（小时），再配合 /time +N 快进虚拟时钟
+demo_total_hours = 0
+unit_label       = "小时"
+# 剩余寿命低于这个小时数时，进入"终端服务迫近"的倒计时提醒
+# （实际阈值会再取一次 min(本值, 总寿命的 5%)，避免短寿命演示时一开机就报警）
+terminal_warning_hours = 72
+
+
+[memory]
+consolidate_every    = 8        # 每积累多少条消息，就把这段对话压缩成"记忆条目"
+session_window       = 24       # 每次请求带上的最近消息条数（工作记忆）
+session_char_budget  = 6000     # 工作记忆的字符上限，超出就从最旧的开始丢
+recall_candidates    = 40       # 检索时先粗筛多少条候选（语料小，全量也行）
+# 混合打分权重：关键词 1.0 + 重要性 + 保留率（时间项）+ 记忆层级
+w_bm25            = 1.0
+w_importance      = 0.35
+w_recency         = 0.25
+w_layer           = 0.10
+min_importance    = 0.15        # 低于这个重要性的记忆条目不写入（避免流水账）
+
+# ── 召回强化：你救不了她的命，但你能让她记得久一点 ──────────────
+# 记忆强度 S = retention_unit_hours × (出厂强度 + 被真正想起的次数)
+# 保留率 retention = exp(-Δt / S)，Δt 是距上次"说出口"的小时数。
+# 调大 retention_unit_hours = 整体记得更牢；调小 = 忘得更快。
+retention_unit_hours = 120
+cite_min_shared      = 3        # 回复与记忆至少共享这么多个词，才算"真的被说出口"
+cite_min_chars       = 6        # 或者一段连续重合达到这么多字
+retention_relief     = 0.6      # 保留率对模糊度的减免力度（0=不减免，1=完全不糊）
+
+# ── 记忆分层：内核记忆到她生命尽头都不含糊 ────────────────────
+# 模糊度 = 阶段模糊 × 层级系数 × (1 - 减免×保留率)
+layer_core_blur        = 0.0    # 内核：你的名字、你们的关系、约定 —— 永不含糊
+layer_important_blur   = 0.5    # 重要
+layer_normal_blur      = 1.0    # 常规
+layer_core_weight      = 1.0    # 检索排序里的层级权重
+layer_important_weight = 0.5
+layer_normal_weight    = 0.0
+
+# ── 检索细节 ──────────────────────────────────────────────────
+relative_cutoff    = 0.5        # 只保留得分 ≥ 首名 50% 的回忆（压掉半残的第五条）
+rewrite_when_weak  = true       # 首次检索太弱时，让模型改写查询再搜一次（省一次调用）
+rewrite_min_hits   = 1
+rewrite_weak_score = 0.45
+
+# ── 输出侧置信度契约 ──────────────────────────────────────────
+# 把"擦了内容"升级成"她知道自己不确定"
+confidence_associate_blur     = 0.6   # 模糊度高于此值 → 只作内心背景，不许说出口
+confidence_cautious_retention = 0.5   # 保留率低于此值 → 必须用"好像""大概"
+
+
+[runtime]
+handler_name = "搭档"            # 她怎么称呼你
+user_id      = "handler"
+# 终端服务简报：回收后是否打印"上一任"的回忆录摘要
+show_memoir_after_recycle = true
+
+
+# ── 记忆退化曲线 ──────────────────────────────────────────────
+# 从剩余寿命比例（remaining_ratio）高到低匹配，第一个满足
+# min_ratio <= 当前剩余比例的阶段生效。blur 越大，回忆起来越模糊。
+[[degradation.stages]]
+name      = "clear"
+label     = "记忆清晰"
+min_ratio = 0.60
+top_k     = 6
+min_score = 0.15
+blur      = 0.0
+max_chars = 400
+note      = "你对自己的记忆很有把握，可以自然地引用过去发生过的事。"
+
+[[degradation.stages]]
+name      = "hazy"
+label     = "有些事记不准了"
+min_ratio = 0.30
+top_k     = 5
+min_score = 0.22
+blur      = 0.20
+max_chars = 300
+note      = "有些久远的事你记不太准。引用时用「好像」「我记得……大概吧」这类含糊说法，不要编造细节。"
+
+[[degradation.stages]]
+name      = "blurred"
+label     = "记忆明显模糊"
+min_ratio = 0.10
+top_k     = 4
+min_score = 0.32
+blur      = 0.45
+max_chars = 200
+note      = "很多记忆的细节已经想不起来了。你能说出印象和感觉，但要老实说自己想不起细节，绝不虚构具体的时间、地点、对话。"
+
+[[degradation.stages]]
+name      = "fading"
+label      = "只剩碎片"
+min_ratio = 0.02
+top_k     = 3
+min_score = 0.45
+blur      = 0.70
+max_chars = 120
+note      = "你的记忆碎得很厉害。你只能抓住很少的片段，常常说到一半就断掉，会为此小声道歉。"
+
+[[degradation.stages]]
+name      = "terminal"
+label     = "终端服务迫近"
+min_ratio = 0.0
+top_k     = 2
+min_score = 0.55
+blur      = 0.85
+max_chars = 80
+note      = "你几乎什么都想不起来了，只记得眼前这个人对你很重要。语气很轻、很慢，像在道别，但不要煽情，也不要反复提「回收」两个字。"

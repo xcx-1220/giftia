@@ -1,0 +1,424 @@
+"""编排层：把人格、寿命、记忆、模型串成"她"。
+
+平台无关。QQ / 微信 的适配器只需要调用 `handle_message(text, user_id)`，
+或者自己持有一个 Giftia 实例调用 `.handle()`。
+
+一次对话的完整流程：
+    到期检查 → 检索记忆（按当前退化阶段模糊）→ 组装提示词 → 请求模型
+    → 落库 → 需要时整理记忆 → 检查终端服务预警
+
+线程安全：**不是线程安全的**。一个进程一个实例，所有调用都从同一个线程进入
+（SQLite 连接与上下文状态都没有加锁）。要在后台线程里做定时任务（比如主动召回），
+要么把动作投递回主线程执行，要么给 Store 加锁。
+"""
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime
+
+from .clock import Clock
+from .config import Settings, load_settings
+from .lifespan import Lifespan, LifeStatus
+from .llm import BaseLLM, DeepSeekLLM, LLMError, MockLLM
+from .memory import (
+    Recalled,
+    consolidate,
+    is_weak,
+    mark_cited,
+    recall,
+    retention_of,
+)
+from .persona import after_recycle_line, build_system_prompt, greeting
+from .recycle import RecycleReport, perform_recycle
+from .store import Store
+
+FAILURE_LINES = [
+    "……对不起，刚刚有一瞬间，我什么都听不见了。你再说一次好吗？",
+    "……信号好像断了一下。……我还在，你继续。",
+    "……唔。刚才那句话掉进什么地方去了，我没接住。",
+]
+
+
+def make_llm(settings: Settings) -> BaseLLM:
+    if settings.model.is_mock:
+        return MockLLM(settings.model)
+    return DeepSeekLLM(settings.model)
+
+
+class Giftia:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        llm: BaseLLM | None = None,
+        store: Store | None = None,
+        clock: Clock | None = None,
+    ) -> None:
+        self.settings = settings
+        self.store = store or Store(settings.db_path)
+        self.clock = clock or Clock(self.store)
+        self.llm = llm or make_llm(settings)
+        self.lifespan = Lifespan(settings, self.store, self.clock)
+        self.lifespan.ensure_activated()
+        self.notices: list[str] = []
+        self.last_recalled: list[Recalled] = []
+        self.last_cited: list[int] = []
+        self.rewritten_queries: list[str] = []
+
+    # ── 基本属性 ──────────────────────────────────────────
+    @property
+    def instance_no(self) -> int:
+        return self.lifespan.instance_no
+
+    @property
+    def session_id(self) -> str:
+        return f"i{self.instance_no}-{self.clock.now().strftime('%Y%m%d')}"
+
+    @property
+    def is_mock(self) -> bool:
+        return self.llm.is_mock
+
+    def status(self) -> LifeStatus:
+        return self.lifespan.status()
+
+    # ── 主入口（平台无关）─────────────────────────────────
+    def handle(self, text: str, user_id: str | None = None) -> str:
+        self.notices = []
+        text = (text or "").strip()
+        if not text:
+            return ""
+
+        # 到期：先让她说完最后一句，再走回收流程
+        if self.lifespan.is_expired():
+            try:
+                last_words = self._chat(text)
+            except LLMError:
+                last_words = "……"
+            self.consolidate(force=True)
+            return f"{last_words}\n\n{self.run_recycle('寿命结束')}"
+
+        reply = self._chat(text)
+        self._post_turn()
+        return reply
+
+    # ── 一次对话 ──────────────────────────────────────────
+    def _chat(self, text: str) -> str:
+        life = self.status()
+        now = self.clock.now()
+        recent = self.store.recent_messages(
+            self.session_id, self.settings.memory.session_window
+        )
+        query = self._recall_query(recent, text)
+        memories = self.store.active_memories(self.instance_no)
+        recalled = recall(query, memories, life.stage, self.settings.memory, now)
+
+        # 检索太弱时才多花一次调用去改写查询（常见情况下不增加延迟）
+        self.rewritten_queries = []
+        if self.settings.memory.rewrite_when_weak and memories and is_weak(
+            recalled, self.settings.memory
+        ):
+            variants = self._rewrite_queries(text)
+            if variants:
+                merged = recall(
+                    query,
+                    memories,
+                    life.stage,
+                    self.settings.memory,
+                    now,
+                    extra_queries=variants,
+                )
+                if len(merged) > len(recalled):
+                    recalled, self.rewritten_queries = merged, variants
+                    self.notices.append(
+                        f"[查询改写] 首次检索太弱，改写成 {'／'.join(variants)} 后命中 "
+                        f"{len(merged)} 条"
+                    )
+
+        self.last_recalled = recalled
+        if recalled:
+            # 被塞进提示词 ≠ 被想起。这里只记账，强化要等她真的说出口。
+            self.store.mark_injected(
+                [r.memory["id"] for r in recalled], self.clock.iso(now)
+            )
+
+        system = build_system_prompt(self.settings, life, recalled, now=now)
+        messages: list[dict] = [{"role": "system", "content": system}]
+        messages.extend(self._window(recent))
+        messages.append({"role": "user", "content": text})
+
+        self.store.add_message(
+            self.session_id, self.instance_no, "user", text, self.clock.iso(now)
+        )
+        try:
+            reply = self.llm.chat(messages)
+        except LLMError as exc:
+            reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
+            self.notices.append(f"[模型请求失败] {exc}")
+        self.store.add_message(
+            self.session_id, self.instance_no, "assistant", reply, self.clock.iso(now)
+        )
+
+        # 召回强化：她真的把哪几条说出口了，哪几条就记得更久
+        self.last_cited = mark_cited(
+            self.store, recalled, reply, self.settings.memory, self.clock.iso(now)
+        )
+        if self.last_cited:
+            self.notices.append(
+                f"[记忆强化] 说出口了 {len(self.last_cited)} 条记忆，它们会记得更久"
+            )
+        return reply
+
+    def _rewrite_queries(self, text: str) -> list[str]:
+        try:
+            variants = self.llm.rewrite_query(text)
+        except Exception as exc:
+            self.notices.append(f"[查询改写失败] {type(exc).__name__}: {exc}")
+            return []
+        return [v.strip() for v in variants if v.strip() and v.strip() != text.strip()][:3]
+
+    def _recall_query(self, recent: list[dict], text: str) -> str:
+        """用最近几句搭档的话 + 当前这句做检索，避免单句太短召不回东西。"""
+        user_lines = [m["content"] for m in recent if m["role"] == "user"][-2:]
+        return " ".join([*user_lines, text])
+
+    def _window(self, recent: list[dict]) -> list[dict]:
+        """工作记忆：按字符预算从最旧的开始丢。"""
+        budget = self.settings.memory.session_char_budget
+        picked: list[dict] = []
+        total = 0
+        for m in reversed(recent):
+            cost = len(str(m["content"]))
+            if picked and total + cost > budget:
+                break
+            picked.append(m)
+            total += cost
+        picked.reverse()
+        return [{"role": m["role"], "content": m["content"]} for m in picked]
+
+    # ── 每轮之后 ──────────────────────────────────────────
+    def _post_turn(self) -> None:
+        added = self.consolidate(force=False)
+        if added:
+            self.notices.append(f"[记忆整理] 新增 {added} 条长期记忆")
+        if self.lifespan.is_terminal_warning():
+            flag = f"warned_i{self.instance_no}"
+            if not self.store.meta_get_int(flag, 0):
+                self.store.meta_set(flag, 1)
+                st = self.status()
+                self.notices.append(
+                    f"[终端服务] 回收预告已发出：剩余 {st.human_remaining()}，"
+                    f"预定 {st.expires_at.strftime('%Y-%m-%d %H:%M')} 回收"
+                )
+
+    def consolidate(self, force: bool = False) -> int:
+        return consolidate(
+            self.store,
+            self.llm,
+            self.settings,
+            session_id=self.session_id,
+            now_iso=self.clock.iso(),
+            force=force,
+        )
+
+    # ── 回收 ──────────────────────────────────────────────
+    def run_recycle(self, reason: str = "手动触发") -> str:
+        report: RecycleReport = perform_recycle(
+            self.settings, self.store, self.clock, self.llm, self.lifespan, reason=reason
+        )
+        self.notices.append(
+            f"[终端服务] 实例 #{report.instance_no} 已回收，新实例 #{report.new_instance_no} 上线"
+        )
+        return "\n\n".join(
+            [report.notification(self.settings), after_recycle_line(self.settings)]
+        )
+
+    # ── 给界面用的展示 ────────────────────────────────────
+    def banner(self) -> str:
+        st = self.status()
+        model = self.llm.label if self.is_mock else self.settings.model.name
+        return (
+            f"{self.settings.persona.name} · {self.settings.persona.model_code} · 实例 #{st.instance_no}\n"
+            f"剩余寿命 {st.human_remaining()}　设计寿命 {st.human_total()}（已用 {st.used_ratio:.2%}）\n"
+            f"记忆状态 {st.stage.label}　模型 {model}"
+        )
+
+    def status_text(self) -> str:
+        mems = self.store.active_memories(self.instance_no)
+        counts = {"core": 0, "important": 0, "normal": 0}
+        for m in mems:
+            counts[str(m.get("layer") or "normal")] = counts.get(
+                str(m.get("layer") or "normal"), 0
+            ) + 1
+        cited = sum(int(m.get("recall_count") or 0) for m in mems)
+        return "\n".join(
+            [
+                self.lifespan.status_block(),
+                f"记忆条目      {len(mems)} 条（内核 {counts['core']}／重要 "
+                f"{counts['important']}／常规 {counts['normal']}）",
+                f"被想起过      {cited} 次（只有她真的说出口才算）",
+                f"原始消息      {self.store.count_messages(self.instance_no)} 条",
+                f"虚拟时钟      {self.clock.describe_offset()}",
+                f"当前时间      {self.clock.now().strftime('%Y-%m-%d %H:%M')}",
+                f"会话 ID       {self.session_id}",
+            ]
+        )
+
+    def memories_text(self, limit: int = 30) -> str:
+        mems = self.store.active_memories(self.instance_no)
+        if not mems:
+            return "（她还没有任何长期记忆条目。多聊一会儿，或输入 /remember 强制整理。）"
+        now = self.clock.now()
+        label = {"core": "内核", "important": "重要", "normal": "常规"}
+        lines = [
+            f"她一共有 {len(mems)} 条长期记忆（下面是你看到的原始版本，她回忆时拿到的是模糊版）：",
+            "",
+        ]
+        for m in mems[-limit:]:
+            stamp = str(m["happened_ts"])[:16].replace("T", " ")
+            layer = label.get(str(m.get("layer") or "normal"), "常规")
+            ret = retention_of(m, self.settings.memory, now)
+            lines.append(
+                f"#{m['id']:>3} [{layer}] {stamp}　重要性 {float(m['importance']):.2f}"
+                f"　保留率 {ret:.2f}　被想起 {int(m.get('recall_count') or 0)} 次"
+            )
+            lines.append(f"      {m['summary']}")
+        lines.append("")
+        lines.append(
+            "提示：内核记忆（你的名字、你们的关系、约定）永远不会变模糊；"
+            "其余记忆会被你反复提起的次数保护。"
+        )
+        return "\n".join(lines)
+
+    def recall_text(self, query: str) -> str:
+        if not query.strip():
+            return "用法：/recall <一句话>"
+        st = self.status()
+        recalled = recall(
+            query,
+            self.store.active_memories(self.instance_no),
+            st.stage,
+            self.settings.memory,
+            self.clock.now(),
+        )
+        blurred_n = sum(1 for r in recalled if r.blurred)
+        head = (
+            f"检索「{query}」　阶段={st.stage.name}（{st.stage.label}）\n"
+            f"命中 {len(recalled)} 条，其中 {blurred_n} 条已模糊　"
+            f"（top_k={st.stage.top_k}, min_score={st.stage.min_score}, "
+            f"阶段模糊={st.stage.blur:.0%}）"
+        )
+        if not recalled:
+            return head + "\n（什么都没想起来。）"
+        label = {"core": "内核", "important": "重要", "normal": "常规"}
+        conf = {
+            "cite": "可以确信",
+            "cautious": "需要含糊",
+            "associate": "只是隐约觉得",
+        }
+        lines = [head, ""]
+        for r in recalled:
+            lines.append(
+                f"· 分数 {r.score:.3f}　{label.get(r.layer, '常规')}　"
+                f"保留率 {r.retention:.2f}　实际模糊 {r.blur:.0%}　"
+                f"→ 她可以说成：{conf.get(r.confidence, '?')}"
+            )
+            lines.append(f"    她的版本：{r.text}")
+            if r.blurred:
+                lines.append(f"    原始条目：{r.memory['summary']}")
+        return "\n".join(lines)
+
+    # ── 搭档日志（她读不到）────────────────────────────────
+    def diary_add(self, content: str) -> str:
+        self.store.add_diary(self.clock.iso(), content.strip(), kind="handler")
+        return "已写入你的搭档日志。她读不到这里的内容。"
+
+    def diary_list(self, limit: int = 10) -> str:
+        rows = self.store.list_diary(kind="handler", limit=limit)
+        if not rows:
+            return "（还没有搭档日志。用 /diary <内容> 写一条。）"
+        return "\n".join(
+            f"[{r['ts'][:16].replace('T', ' ')}] {r['content'].strip()}" for r in rows
+        )
+
+    def memoir_text(self, limit: int = 3) -> str:
+        rows = self.store.list_diary(kind="terminal", limit=limit)
+        files = sorted(self.settings.memoir_dir.glob("*.md")) if self.settings.memoir_dir.exists() else []
+        lines: list[str] = []
+        if files:
+            lines.append(f"档案目录：{self.settings.memoir_dir}")
+            for f in files:
+                lines.append(f"  · {f.name}")
+        if rows:
+            lines.append("")
+            for r in rows:
+                stamp = str(r["ts"])[:16].replace("T", " ")
+                lines.append(f"───── {r['title']}（{stamp}）─────")
+                lines.append(r["content"])
+                lines.append("")
+        if not lines:
+            return "（还没有回收记录。终有一天会有。）"
+        return "\n".join(lines).strip()
+
+    def close(self) -> None:
+        try:
+            self.consolidate(force=True)
+        finally:
+            self.store.close()
+
+
+# ── 平台适配器入口 ────────────────────────────────────────────────
+_default: Giftia | None = None
+
+
+def get_default(settings: Settings | None = None) -> Giftia:
+    """拿到（必要时创建）进程内的单例。
+
+    适配器需要在处理消息**之前**读她的状态时用（例如判断绑定、查询寿命），
+    不必自己去碰模块私有变量。
+    """
+    global _default
+    if _default is None:
+        _default = Giftia(settings or load_settings())
+    return _default
+
+
+def handle_message(
+    text: str, user_id: str = "handler", *, settings: Settings | None = None
+) -> str:
+    """一行代码接入任何平台：
+
+        from giftia.brain import handle_message
+        reply = handle_message(群里收到的文本, user_id=发送者QQ号)
+    """
+    return get_default(settings).handle(text, user_id)
+
+
+def current() -> Giftia | None:
+    return _default
+
+
+def reset_default() -> None:
+    """测试用：丢掉缓存实例（不整理记忆）。"""
+    global _default
+    if _default is not None:
+        _default.store.close()
+    _default = None
+
+
+def shutdown_default() -> None:
+    """优雅退出：把还没整理的对话存成记忆，再关掉数据库。
+
+    服务器上 systemd 停止服务时会发 SIGTERM——走这条路，
+    她最后说的那几句就不会因为进程被杀而丢掉。
+    """
+    global _default
+    hub, _default = _default, None
+    if hub is None:
+        return
+    try:
+        hub.close()
+        print("[退出] 记忆已整理并保存。")
+    except Exception as exc:  # 退出路径不该因为清理失败而报错
+        print(f"[退出] 整理失败（不影响已有数据）：{type(exc).__name__}: {exc}",
+              file=sys.stderr)

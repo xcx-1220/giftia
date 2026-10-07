@@ -1,0 +1,47 @@
+[Unit]
+Description=Giftia —— DeepSeek 陪伴机器人（QQ 官方机器人适配器）
+Documentation=file:/opt/giftia/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=giftia
+Group=giftia
+WorkingDirectory=/opt/giftia
+
+# 零第三方依赖，直接用系统 python3（需要 3.11+，setup.sh 会检查）
+# 如果你把 python 装在别处，改这一行即可
+ExecStart=/usr/bin/python3 /opt/giftia/adapters/qq_official.py
+
+# 退出与重启
+Restart=always
+RestartSec=5
+
+# 停止时先发 SIGTERM：她会借这段时间把还没整理的对话存成记忆，再关掉数据库
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# 日志交给 journald：journalctl -u giftia-qq -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=giftia-qq
+
+[Environment]
+PYTHONUNBUFFERED=1
+PYTHONIOENCODING=utf-8
+# 代码目录是只读的，别让 Python 试图写 .pyc
+PYTHONDONTWRITEBYTECODE=1
+
+# ── 加固：整个文件系统对她只读，只有 data/ 能写 ──────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/giftia/data
+
+[Install]
+WantedBy=multi-user.target

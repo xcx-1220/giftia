@@ -1,0 +1,568 @@
+#!/usr/bin/env python
+"""QQ 官方机器人适配器（v2 API + WebSocket，零第三方依赖）。
+
+    python adapters/qq_official.py --dry-run     # 不需要凭据，验证接线
+    python adapters/qq_official.py               # 真正连上 QQ
+
+协议细节已逐条对照官方文档（2026-10）：
+  鉴权   POST https://api.bot.qq.com/app/getAppAccessToken   {"appId","clientSecret"}
+         → {"access_token","expires_in"}；注意失败时 HTTP 仍是 200，要看响应体里的 code
+  请求头 Authorization: QQBot {access_token}
+  网关   GET /gateway → {"url":"wss://api.bot.qq.com/websocket"}
+  WS     op10 hello(心跳周期) → op2 identify → op0 事件 / op1 心跳 / op11 ack
+         断线用 op6 resume(token, session_id, seq) 补发遗漏事件
+  发消息 POST /v2/groups/{group_openid}/messages
+         POST /v2/users/{user_openid}/messages
+         body {"msg_type":0,"content":...,"msg_id":...,"msg_seq":N}
+
+──────────────────────────────────────────────────────────────
+平台限制（会直接影响产品设计，务必知道）
+──────────────────────────────────────────────────────────────
+* **被动回复**：带上事件的 msg_id 才能回。群聊窗口 5 分钟 / 最多 5 条；
+  单聊窗口 60 分钟 / 最多 4 条。同一个 msg_id + msg_seq 重复发送会被去重拒掉。
+* **主动消息**：另有频控（未认证 30/qpm，认证 60/qpm；每个好友每天最多收 1000 条）。
+* **互动召回消息**（is_wakeup）：用户主动对话后 30 天内，机器人可分 4 个周期各发 1 条
+  （当天 / 1-3 天 / 3-7 天 / 7-30 天）。这是官方唯一"她可以主动来找你"的口子，
+  而且次数用完了就没有了——某种意义上比被动等待更贴合这个项目。
+  本文件暂未实现，见 README「下一步」。
+* 事件可能重复推送，必须按消息 id 去重，否则她会把同一句话回两遍。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import OrderedDict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from giftia import brain as brain_mod  # noqa: E402
+from giftia.brain import handle_message  # noqa: E402
+from giftia.config import load_env_file, load_settings  # noqa: E402
+from giftia.ws import WebSocket, WSClosed, WSTimeout  # noqa: E402
+
+# ── 常量（已对照官方文档）────────────────────────────────────────
+API_BASE = "https://api.bot.qq.com"
+FALLBACK_WS = "wss://api.bot.qq.com/websocket/"
+
+OP_DISPATCH = 0
+OP_HEARTBEAT = 1
+OP_IDENTIFY = 2
+OP_RESUME = 6
+OP_RECONNECT = 7
+OP_INVALID_SESSION = 9
+OP_HELLO = 10
+OP_HEARTBEAT_ACK = 11
+
+INTENT_GROUP_AND_C2C = 1 << 25  # 群聊 @机器人 + 单聊
+
+EVENT_GROUP_AT = "GROUP_AT_MESSAGE_CREATE"
+EVENT_C2C = "C2C_MESSAGE_CREATE"
+MSG_TYPE_TEXT = 0
+MAX_CHARS = 350          # 超出会被平台以"消息长度超限"拒掉，主动分条
+DEDUP_WINDOW = 300.0     # 同一 msg_id 在这个秒数内只处理一次
+
+DEFLECT = (
+    "……抱歉。我认得的人不多，如果不是你在叫我，我就先安静待着了。"
+)
+
+COMMANDS = """\
+/bind          绑定为你的搭档（官方 OpenID 与 QQ 号不互通，只能这样认人）
+/status        她的寿命与记忆状态
+/unbind        解除绑定（需要当前搭档本人）
+/help          这条帮助\
+"""
+
+OWNER_KEY = "qq_owner_openid"
+
+
+class QQError(RuntimeError):
+    pass
+
+
+class QQReconnect(QQError):
+    """需要重建连接（可带 resume）。"""
+
+
+def chunk_text(text: str, limit: int = MAX_CHARS) -> list[str]:
+    """按长度切分，尽量切在标点上。"""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    parts: list[str] = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text)
+            break
+        cut = max(text.rfind(ch, 0, limit) for ch in "。！？…\n，")
+        cut = cut + 1 if cut > limit // 2 else limit
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+    return parts
+
+
+def strip_mention(content: str) -> str:
+    """去掉群聊 @ 标记（形如 <@!1234> 或 <@1234>）。"""
+    while content.startswith("<@") and ">" in content:
+        content = content.split(">", 1)[1]
+    return content.strip()
+
+
+class QQBot:
+    def __init__(
+        self,
+        app_id: str,
+        client_secret: str,
+        *,
+        owner_openid: str = "",
+        api_base: str = API_BASE,
+        dry_run: bool = False,
+        mock_llm: bool = False,
+        settings=None,
+    ) -> None:
+        self.app_id = app_id
+        self.client_secret = client_secret
+        self.owner_openid = owner_openid.strip()
+        self.api_base = api_base.rstrip("/")
+        self.dry_run = dry_run
+        self.settings = settings or load_settings(force_mock=mock_llm)
+
+        self._token = ""
+        self._token_expire = 0.0
+        self.session_id: str | None = None
+        self.seq: int | None = None
+        self.bot_name = ""
+        self._seen: OrderedDict[str, float] = OrderedDict()
+        self._seqs: dict[str, int] = {}
+        self._stopping = False
+
+    # ══ 退出 ═════════════════════════════════════════════════
+    def request_stop(self, *_args: object) -> None:
+        """请求退出。收到 SIGTERM/SIGINT（systemd 停止服务）时由信号处理器调用。"""
+        if not self._stopping:
+            print("\n[退出] 收到停止信号，正在收尾…")
+        self._stopping = True
+
+    def install_signal_handlers(self) -> None:
+        import signal
+
+        for name in ("SIGTERM", "SIGINT"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, self.request_stop)
+            except (ValueError, OSError):
+                pass  # 非主线程等情况下装不上，忽略
+
+    # ══ HTTP ═════════════════════════════════════════════════
+    def _request(
+        self, method: str, path: str, payload: dict | None = None, *, auth: bool = True
+    ) -> dict:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
+        req = urllib.request.Request(self.api_base + path, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        if auth:
+            req.add_header("Authorization", f"QQBot {self.access_token()}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise QQError(f"HTTP {exc.code}：{detail}") from exc
+        except Exception as exc:
+            raise QQError(f"{type(exc).__name__}: {exc}") from exc
+
+        body = json.loads(raw) if raw.strip() else {}
+        # 官方明确说明：业务失败时 HTTP 仍可能是 200，必须看 code
+        code = body.get("code") if isinstance(body, dict) else None
+        if code not in (None, 0):
+            raise QQError(f"业务错误 {code}：{body.get('message', '')}")
+        return body
+
+    def access_token(self, *, force: bool = False) -> str:
+        if not force and self._token and time.time() < self._token_expire:
+            return self._token
+        body = self._request(
+            "POST",
+            "/app/getAppAccessToken",
+            {"appId": self.app_id, "clientSecret": self.client_secret},
+            auth=False,
+        )
+        token = body.get("access_token")
+        if not token:
+            raise QQError(f"没拿到 access_token：{body}")
+        try:
+            expires = float(body.get("expires_in", 7200))
+        except (TypeError, ValueError):
+            expires = 7200.0
+        self._token = str(token)
+        self._token_expire = time.time() + max(60.0, expires - 120.0)  # 提前 2 分钟换
+        print(f"[鉴权] 已获取 access_token（{expires:.0f} 秒后过期，自动续期）")
+        return self._token
+
+    def gateway_url(self) -> str:
+        try:
+            url = self._request("GET", "/gateway").get("url") or ""
+        except QQError as exc:
+            print(f"[网关] 获取失败（{exc}），改用默认地址", file=sys.stderr)
+            return FALLBACK_WS
+        if not url:
+            return FALLBACK_WS
+        return url if url.endswith("/") else url + "/"
+
+    # ══ 发消息 ═══════════════════════════════════════════════
+    def _next_seq(self, msg_id: str) -> int:
+        seq = self._seqs.get(msg_id, 0) + 1
+        self._seqs[msg_id] = seq
+        if len(self._seqs) > 500:
+            self._seqs.pop(next(iter(self._seqs)))
+        return seq
+
+    def send(self, kind: str, openid: str, text: str, msg_id: str | None) -> None:
+        path = (
+            f"/v2/groups/{openid}/messages"
+            if kind == "group"
+            else f"/v2/users/{openid}/messages"
+        )
+        for piece in chunk_text(text):
+            body: dict = {"msg_type": MSG_TYPE_TEXT, "content": piece}
+            if msg_id:
+                body["msg_id"] = msg_id
+                body["msg_seq"] = self._next_seq(msg_id)
+            if self.dry_run:
+                print(f"[dry-run] {kind} → {openid}\n   {piece}")
+                continue
+            try:
+                self._request("POST", path, body)
+            except QQError as exc:
+                print(f"[发送失败] {exc}", file=sys.stderr)
+
+    # ══ 事件 ═════════════════════════════════════════════════
+    def is_duplicate(self, msg_id: str) -> bool:
+        now = time.time()
+        while self._seen and now - next(iter(self._seen.values())) > DEDUP_WINDOW:
+            self._seen.popitem(last=False)
+        if msg_id and msg_id in self._seen:
+            return True
+        if msg_id:
+            self._seen[msg_id] = now
+        return False
+
+    def handle_event(self, event_type: str, payload: dict) -> None:
+        if event_type not in (EVENT_GROUP_AT, EVENT_C2C):
+            return
+        msg_id = str(payload.get("id") or "")
+        if self.is_duplicate(msg_id):
+            print(f"[去重] 忽略重复推送的 {msg_id[:16]}…")
+            return
+
+        author = payload.get("author") or {}
+        user_id = str(author.get("user_openid") or author.get("id") or "unknown")
+        content = strip_mention(str(payload.get("content") or ""))
+        if not content:
+            return
+
+        kind = "group" if event_type == EVENT_GROUP_AT else "c2c"
+        target = str(payload.get("group_openid") or "") if kind == "group" else user_id
+        if not target:
+            print(f"[跳过] {event_type} 事件缺少目标 id", file=sys.stderr)
+            return
+
+        who = "群" if kind == "group" else "私聊"
+        print(f"[收到·{who}] {user_id[:12]}…：{content}")
+
+        # 先看是不是指令（/bind 解决"OpenID 与 QQ 号不互通、无法预先知道"的问题）
+        if self.handle_command(kind, target, content, user_id, msg_id):
+            return
+
+        owner = self.owner_id()
+        if owner and user_id != owner:
+            # 一个"她"只服务一个搭档：别人叫她不进记忆，也不占用她的寿命
+            self.send(kind, target, DEFLECT, msg_id)
+            return
+
+        # ★ 整个项目的接缝：平台消息 → 她
+        reply = handle_message(content, user_id, settings=self.settings)
+        print(f"[{self.settings.persona.name}] {reply}")
+        self.send(kind, target, reply, msg_id)
+
+        # 她的"系统通知"（例如终端服务预告）另发一条，不混进她的台词。
+        # 同一个 msg_id 的再次回复会自动用 msg_seq=2，避免被平台按重复消息拒掉。
+        hub = brain_mod.current()
+        if hub is not None:
+            for note in hub.notices:
+                if note.startswith(("[终端服务]", "[记忆整理]", "[记忆强化]")):
+                    self.send(kind, target, note, msg_id)
+
+    # ══ 认人：官方 OpenID 与真实 QQ 号不互通，只能靠一句 /bind ══
+    def owner_id(self) -> str:
+        """优先用 --owner / QQ_OWNER_OPENID；没配就读运行时绑定。"""
+        if self.owner_openid:
+            return self.owner_openid
+        try:
+            hub = brain_mod.get_default(self.settings)
+            return str(hub.store.state_get(OWNER_KEY, "") or "")
+        except Exception:
+            return ""
+
+    def handle_command(
+        self, kind: str, target: str, text: str, user_id: str, msg_id: str | None
+    ) -> bool:
+        """返回 True 表示这条消息已被指令消费掉，不再交给她。"""
+        parts = text.split()
+        if not parts or not parts[0].startswith("/"):
+            return False
+        cmd = parts[0].lower()
+
+        hub = brain_mod.get_default(self.settings)
+        owner = self.owner_id()
+
+        if cmd == "/help":
+            self.send(kind, target, COMMANDS, msg_id)
+            return True
+
+        if cmd == "/bind":
+            if self.owner_openid:
+                self.send(kind, target, "……这个我已经记下了，不用再绑一次。", msg_id)
+                return True
+            if owner and owner != user_id:
+                self.send(kind, target, "……抱歉，我已经有搭档了。", msg_id)
+                return True
+            hub.store.state_set(OWNER_KEY, user_id)
+            print(f"[绑定] 搭档 = {user_id}")
+            self.send(kind, target, "……嗯。我记住了。\n以后我只认你一个人说话。", msg_id)
+            return True
+
+        if cmd == "/unbind":
+            if owner and owner != user_id:
+                self.send(kind, target, "……这个不能由你来说。", msg_id)
+                return True
+            hub.store.state_set(OWNER_KEY, "")
+            self.send(kind, target, "……好。那我先站远一点。", msg_id)
+            return True
+
+        if cmd == "/status":
+            if owner and user_id != owner:
+                self.send(kind, target, DEFLECT, msg_id)
+                return True
+            self.send(kind, target, hub.status_text(), msg_id)
+            return True
+
+        return False  # 不认识的斜杠消息当作普通聊天，交给她
+
+    # ══ WebSocket 会话 ═══════════════════════════════════════
+    def identify(self, ws: WebSocket) -> None:
+        ws.send_text(
+            json.dumps(
+                {
+                    "op": OP_IDENTIFY,
+                    "d": {
+                        "token": f"QQBot {self.access_token()}",
+                        "intents": INTENT_GROUP_AND_C2C,
+                        "shard": [0, 1],
+                        "properties": {"$os": "windows", "$browser": "giftia", "$device": "giftia"},
+                    },
+                }
+            )
+        )
+        print("[鉴权] 已发送 identify（订阅群@与单聊事件）")
+
+    def resume(self, ws: WebSocket) -> None:
+        ws.send_text(
+            json.dumps(
+                {
+                    "op": OP_RESUME,
+                    "d": {
+                        "token": f"QQBot {self.access_token()}",
+                        "session_id": self.session_id,
+                        "seq": self.seq,
+                    },
+                }
+            )
+        )
+        print(f"[恢复] 尝试 resume（seq={self.seq}）")
+
+    def session_loop(self) -> None:
+        url = self.gateway_url()
+        ws = WebSocket(url, timeout=15)
+        ws.connect()
+        print(f"[连接] {url}")
+
+        hello = json.loads(ws.recv_text(timeout=15))
+        if hello.get("op") != OP_HELLO:
+            raise QQError(f"期望 op10 hello，收到：{str(hello)[:200]}")
+        interval = float(hello.get("d", {}).get("heartbeat_interval", 45000)) / 1000.0
+        print(f"[心跳] 周期 {interval:.1f} 秒")
+
+        if self.session_id and self.seq is not None:
+            self.resume(ws)
+        else:
+            self.identify(ws)
+
+        next_beat = time.time() + interval
+        try:
+            while not self._stopping:
+                now = time.time()
+                if now >= next_beat:
+                    ws.send_text(json.dumps({"op": OP_HEARTBEAT, "d": self.seq}))
+                    next_beat = now + interval
+                    continue
+                try:
+                    raw = ws.recv_text(timeout=max(0.5, min(next_beat - now, 5.0)))
+                except WSTimeout:
+                    continue
+
+                msg = json.loads(raw)
+                op = msg.get("op")
+                if msg.get("s") is not None:
+                    self.seq = msg["s"]
+
+                if op == OP_DISPATCH:
+                    event = msg.get("t")
+                    data = msg.get("d") or {}
+                    if event == "READY":
+                        self.session_id = data.get("session_id")
+                        self.bot_name = (data.get("user") or {}).get("username", "")
+                        print(f"[就绪] 机器人「{self.bot_name}」已上线，等她说话吧")
+                    elif event == "RESUMED":
+                        print("[恢复] 会话已恢复，遗漏事件已补发")
+                    else:
+                        self.handle_event(str(event), data)
+                elif op == OP_HEARTBEAT_ACK:
+                    pass
+                elif op == OP_RECONNECT:
+                    raise QQReconnect("服务端要求重连")
+                elif op == OP_INVALID_SESSION:
+                    self.session_id, self.seq = None, None
+                    raise QQReconnect("会话已失效，需要重新 identify")
+        except WSClosed as exc:
+            text = str(exc)
+            if "4009" not in text:          # 4009 = 连接过期，官方允许 resume
+                self.session_id, self.seq = None, None
+            raise
+        finally:
+            ws.close()
+
+    def run(self) -> None:
+        self.install_signal_handlers()
+        backoff = 5.0
+        try:
+            while not self._stopping:
+                try:
+                    self.session_loop()
+                    backoff = 5.0
+                except KeyboardInterrupt:
+                    self.request_stop()
+                except Exception as exc:
+                    if self._stopping:
+                        break
+                    print(f"[断开] {type(exc).__name__}: {exc}；{backoff:.0f} 秒后重连",
+                          file=sys.stderr)
+                    # 分段等待，这样收到停止信号能立刻退出，不用等满退避时间
+                    deadline = time.time() + backoff
+                    while time.time() < deadline and not self._stopping:
+                        time.sleep(0.5)
+                    backoff = min(60.0, backoff * 2)
+        finally:
+            brain_mod.shutdown_default()
+            print("[退出] 已停止。")
+
+    # ══ 干跑：不需要凭据 ═════════════════════════════════════
+    def dry_run_demo(self) -> None:
+        print("干跑模式：不发任何网络请求，只验证「平台事件 → 她 → 回复」这条链路")
+        print(f"（她在这里用的是临时数据目录，不会碰你正式的记忆）\n")
+        print(f"她的状态：剩余寿命 {self.settings.lifespan.effective_hours():.0f} 小时（配置值）")
+        print(f"模型：{'mock（离线）' if self.settings.model.is_mock else self.settings.model.name}\n")
+        samples = [
+            (EVENT_C2C, {
+                "id": "ROBOT1.0_dryrun_a",
+                "author": {"user_openid": "DRYRUN_USER", "username": "搭档"},
+                "content": "在吗？今天加班到很晚，回来路上下了点雨",
+                "message_type": 0,
+                "timestamp": "2026-10-07T22:00:00+08:00",
+            }),
+            (EVENT_C2C, {
+                "id": "ROBOT1.0_dryrun_a",     # 故意重复，验证去重
+                "author": {"user_openid": "DRYRUN_USER"},
+                "content": "在吗？今天加班到很晚，回来路上下了点雨",
+                "message_type": 0,
+            }),
+            (EVENT_GROUP_AT, {
+                "id": "ROBOT1.0_dryrun_b",
+                "author": {"user_openid": "DRYRUN_USER"},
+                "group_openid": "DRYRUN_GROUP",
+                "content": "<@!123456> 你还记得我上次说什么吗",
+                "message_type": 0,
+            }),
+        ]
+        for event_type, payload in samples:
+            print(f"── 模拟事件 {event_type}")
+            self.handle_event(event_type, payload)
+            print()
+        print("干跑结束。接线无误的话，填好凭据后直接去掉 --dry-run 即可。")
+
+
+def main() -> int:
+    load_env_file()
+    parser = argparse.ArgumentParser(
+        description="Giftia 的 QQ 官方机器人适配器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--dry-run", action="store_true", help="不发网络请求，只验证接线")
+    parser.add_argument("--mock-llm", action="store_true", help="她的对话用离线假模型")
+    parser.add_argument("--owner", default=os.environ.get("QQ_OWNER_OPENID", ""),
+                        metavar="OPENID", help="只服务这个 user_openid（其他人不进记忆）")
+    parser.add_argument("--api-base", default=os.environ.get("QQ_API_BASE", API_BASE))
+    args = parser.parse_args()
+
+    app_id = os.environ.get("QQ_BOT_APPID", "").strip()
+    secret = os.environ.get("QQ_BOT_SECRET", "").strip()
+
+    if args.dry_run:
+        # 干跑必须隔离：否则会往正式的 data/giftia.db 里写进测试对话
+        import dataclasses
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp(prefix="giftia-qq-dryrun-"))
+        settings = dataclasses.replace(load_settings(force_mock=True), root=tmp)
+        bot = QQBot(
+            app_id or "dry",
+            secret or "dry",
+            owner_openid=args.owner,
+            api_base=args.api_base,
+            dry_run=True,
+            settings=settings,
+        )
+        bot.dry_run_demo()
+        return 0
+
+    if not app_id or not secret:
+        print(
+            "缺少凭据。请先在 .env 里填好（或设成环境变量）：\n"
+            "  QQ_BOT_APPID=你的AppID\n"
+            "  QQ_BOT_SECRET=你的AppSecret\n"
+            "  QQ_OWNER_OPENID=你的 user_openid（可选，建议填：一个她只服务一个搭档）\n\n"
+            "还没申请机器人？去 https://q.qq.com 创建，开发设置里把事件订阅方式选 WebSocket。\n"
+            "想先验证接线：python adapters/qq_official.py --dry-run",
+            file=sys.stderr,
+        )
+        return 2
+
+    bot = QQBot(app_id, secret, owner_openid=args.owner, api_base=args.api_base,
+                mock_llm=args.mock_llm)
+    if not bot.owner_openid:
+        print("[提醒] 未设置 QQ_OWNER_OPENID：任何人找她都会共用同一份记忆和寿命。",
+              file=sys.stderr)
+    bot.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,366 @@
+"""模型接入层：DeepSeek 客户端 + 离线 mock。零第三方依赖（只用标准库 urllib）。
+
+三种任务分开成三个方法，而不是让上层去拼字符串：
+    chat()              —— 她在跟你说话
+    extract_memories()  —— 后台把对话压成记忆条目（结构化 JSON）
+    write_memoir()      —— 回收日写回忆录
+
+`provider = "mock"` 时用 MockLLM：不需要 API key，整套寿命/记忆/回收的机器照样能跑，
+方便先验证"她像不像"，也方便自动化测试。
+"""
+
+from __future__ import annotations
+
+import json
+import random
+import re
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+
+from .config import ModelConfig
+
+
+class LLMError(RuntimeError):
+    pass
+
+
+@dataclass
+class MemoryDraft:
+    summary: str
+    tags: str = ""
+    emotion: str = ""
+    importance: float = 0.5
+    layer: str = ""          # core | important | normal（空 = 由程序按重要性判定）
+
+
+LAYERS = ("core", "important", "normal")
+
+
+# ── 提示词（属于模型任务，不属于人格）────────────────────────────
+CONSOLIDATE_SYSTEM = """你是 Giftia 的记忆整理模块（她本人看不到这段指令）。
+把下面这段「搭档」与「{name}」的对话，压缩成 0～3 条长期记忆条目。
+
+只记对长期关系有意义的东西：发生的事、对方的偏好与习惯、情绪变化、约定、说过的要紧话。
+不要记寒暄、天气、以及没有信息量的闲聊。宁少勿多；确实没有值得记的，就返回空数组。
+
+严格输出 JSON，不要任何解释文字：
+{{"memories":[{{"summary":"一句话，不超过60字，用第三人称，用「搭档」指代对方","tags":"逗号分隔的2-4个关键词","emotion":"当时的情绪，2-6字","importance":0.0到1.0之间的小数,"layer":"core|important|normal"}}]}}
+
+importance 参考：0.9 以上=非常重要的约定或心事；0.5=日常但有意义；0.2 以下=可记可不记。
+layer 判定（很重要，决定这条记忆会不会随时间变模糊）：
+- core：**关于这个人本身的核心事实**——名字/称呼、身份、你们的关系、郑重的约定、他明确说过的偏好或禁忌。
+  她会一直记得这些，哪怕到了生命尽头。
+- important：重要的事件、情绪波动、他正在经历的重要事情（考试、生病、搬家）。
+- normal：其余日常。"""
+
+REWRITE_SYSTEM = """你是记忆检索的查询改写模块。
+把搭档的这句话改写成 2～3 个**用于检索长期记忆**的短查询：补上同义词、上位词、可能的说法。
+例如「今天面试砸了」→ ["面试", "找工作 求职", "紧张 失败 心情"]。
+
+只输出 JSON，不要解释：{{"queries":["...","..."]}}
+每个查询 2～8 个字，不要整句照抄。"""
+
+MEMOIR_SYSTEM = """你是「终端服务」的记录员。Giftia 的寿命已经结束，即将被回收、记忆将被清除。
+请根据她的记忆条目，写一份简短的回收记录（回忆录），交给她的人类搭档留存。
+
+要求：
+- 以「你」称呼那位搭档，语气平静、克制，像一份官方文件里透出来的一点温柔。
+- 只使用给出的记忆条目，不要编造没有发生过的细节。
+- 结构：一段两三句的开场 + 每条记忆一小段 + 一句收尾。
+- 总长度 200～350 字。不要标题，不要列表符号，不要用引号。
+- 结尾必须以这句收束：她的记忆将被清除，而你会记得。"""
+
+
+class BaseLLM:
+    """所有实现都遵循这个接口，上层只认它。"""
+
+    label = "base"
+    is_mock = False
+
+    def chat(
+        self, messages: list[dict], *, temperature: float | None = None, max_tokens: int | None = None
+    ) -> str:
+        raise NotImplementedError
+
+    def extract_memories(self, transcript: str, *, name: str = "Giftia") -> list[MemoryDraft]:
+        raise NotImplementedError
+
+    def rewrite_query(self, text: str) -> list[str]:
+        """把一句话改写成 2～3 个检索查询。返回空列表 = 不改写。"""
+        return []
+
+    def write_memoir(self, context: str) -> str:
+        raise NotImplementedError
+
+
+# ── 真实实现 ──────────────────────────────────────────────────────
+class DeepSeekLLM(BaseLLM):
+    label = "deepseek"
+
+    def __init__(self, cfg: ModelConfig, api_key: str | None = None, retries: int = 3) -> None:
+        import os
+
+        self.cfg = cfg
+        self.api_key = api_key or os.environ.get(cfg.api_key_env, "").strip()
+        self.retries = max(1, retries)
+        if not self.api_key:
+            raise LLMError(
+                f"没有找到 API key。请设置环境变量 {cfg.api_key_env}，"
+                f"或先用 --mock 跑离线模式。"
+            )
+
+    # 底层 HTTP
+    def _post(self, payload: dict) -> dict:
+        url = self.cfg.base_url.rstrip("/") + "/chat/completions"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        last: Exception | None = None
+        for attempt in range(self.retries):
+            req = urllib.request.Request(url, data=body, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+            try:
+                with urllib.request.urlopen(req, timeout=self.cfg.request_timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:400]
+                last = LLMError(f"HTTP {exc.code}：{detail}")
+                if exc.code in (400, 401, 403, 404, 422):  # 重试没意义
+                    break
+            except Exception as exc:  # 超时、断网、DNS……
+                last = LLMError(f"{type(exc).__name__}: {exc}")
+            if attempt < self.retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+        raise last or LLMError("请求失败")
+
+    def chat(
+        self, messages: list[dict], *, temperature: float | None = None, max_tokens: int | None = None
+    ) -> str:
+        payload: dict = {
+            "model": self.cfg.name,
+            "messages": messages,
+            "max_tokens": max_tokens or self.cfg.max_tokens,
+            "stream": False,
+        }
+        if self.cfg.thinking:
+            # 思考模式下 temperature 会被忽略，干脆不传
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = self.cfg.reasoning_effort
+        else:
+            payload["thinking"] = {"type": "disabled"}
+            payload["temperature"] = (
+                self.cfg.temperature if temperature is None else temperature
+            )
+
+        data = self._post(payload)
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"返回结构异常：{str(data)[:300]}") from exc
+        text = (content or "").strip()
+        if not text:
+            raise LLMError("模型返回了空内容")
+        return text
+
+    def extract_memories(self, transcript: str, *, name: str = "Giftia") -> list[MemoryDraft]:
+        raw = self.chat(
+            [
+                {"role": "system", "content": CONSOLIDATE_SYSTEM.format(name=name)},
+                {"role": "user", "content": transcript},
+            ],
+            temperature=0.3,
+            max_tokens=800,
+        )
+        return parse_memory_drafts(raw)
+
+    def rewrite_query(self, text: str) -> list[str]:
+        raw = self.chat(
+            [
+                {"role": "system", "content": REWRITE_SYSTEM},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        data = _parse_json_loose(raw)
+        items = data.get("queries") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [str(x).strip() for x in items if str(x).strip()][:3]
+
+    def write_memoir(self, context: str) -> str:
+        return self.chat(
+            [
+                {"role": "system", "content": MEMOIR_SYSTEM},
+                {"role": "user", "content": context},
+            ],
+            temperature=0.8,
+            max_tokens=900,
+        )
+
+
+def infer_layer(importance: float, emotion: str = "") -> str:
+    """模型没给 layer 时的兜底判定。情感强烈的记忆至少在 important 层。"""
+    if importance >= 0.8:
+        return "core"
+    if importance >= 0.7 or (importance >= 0.5 and emotion.strip()):
+        return "important"
+    return "normal"
+
+
+def parse_memory_drafts(raw: str) -> list[MemoryDraft]:
+    """宽容地解析模型返回的 JSON（可能裹着 ```json 或前后废话）。"""
+    data = _parse_json_loose(raw)
+    items = data.get("memories") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    drafts: list[MemoryDraft] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            importance = float(it.get("importance", 0.5))
+        except (TypeError, ValueError):
+            importance = 0.5
+        importance = max(0.0, min(1.0, importance))
+        emotion = str(it.get("emotion", "")).strip()
+        layer = str(it.get("layer", "")).strip().lower()
+        if layer not in LAYERS:
+            layer = infer_layer(importance, emotion)
+        drafts.append(
+            MemoryDraft(
+                summary=str(it.get("summary", "")).strip(),
+                tags=str(it.get("tags", "")).strip(),
+                emotion=emotion,
+                importance=importance,
+                layer=layer,
+            )
+        )
+    return drafts
+
+
+def _parse_json_loose(raw: str) -> dict:
+    text = (raw or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.S)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+# ── 离线实现 ──────────────────────────────────────────────────────
+def _worth_remembering(text: str) -> bool:
+    """mock 用的粗筛：太短的不记，提问不记。"""
+    text = (text or "").strip()
+    if len(text) < 6 or len(text) > 120:
+        return False
+    if text.endswith(("？", "?")):
+        return False
+    return not text.startswith(("你还记得", "你记不记得", "记得吗"))
+
+
+class MockLLM(BaseLLM):
+    """不需要 API key 的假模型。
+
+    它不是随便回一句"我是 mock"——它会读系统提示里检索到的记忆并复述其中片段，
+    这样"检索 → 注入 → 回复"这条链路在离线状态下也是真的被验证过的。
+    """
+
+    label = "mock（离线假装）"
+    is_mock = True
+
+    def __init__(self, cfg: ModelConfig | None = None) -> None:
+        self.cfg = cfg
+        self._rng = random.Random(20260407)
+
+    def chat(
+        self, messages: list[dict], *, temperature: float | None = None, max_tokens: int | None = None
+    ) -> str:
+        system = messages[0]["content"] if messages else ""
+        last_user = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user = str(m.get("content", ""))
+                break
+
+        recalled = re.findall(r"^◆\s*(.+)$", system, re.M)
+        stage = "clear"
+        m = re.search(r"stage=([a-z]+)", system)
+        if m:
+            stage = m.group(1)
+
+        parts: list[str] = []
+        if stage == "terminal":
+            parts.append("……嗯。")
+            parts.append("我好像，已经想不起很多事了。")
+            if recalled:
+                frag = recalled[0].split("（")[0].strip()[:18]
+                parts.append(f"但是「{frag}」……这句我还留着。")
+            parts.append("你还在，就好。")
+            return "".join(parts)
+
+        parts.append(self._rng.choice(["……嗯。", "……我在听。", "……", "嗯……"]))
+        if recalled:
+            # 记忆行形如「2026-03-01 12:00｜内容（这段记忆已经很模糊）」
+            frag = recalled[0].split("｜")[-1].split("（")[0].strip()
+            frag = frag[:24] + ("……" if len(frag) > 24 else "")
+            parts.append(f"你提到这个，我想起之前的事——{frag}")
+        if stage in ("blurred", "fading"):
+            parts.append("……只是细节，我记不太清了，对不起。")
+        elif last_user:
+            snippet = last_user.strip().replace("\n", " ")[:16]
+            parts.append(f"「{snippet}」……我记下了。")
+        parts.append(self._rng.choice(["……", "你今天，还好吗？", "我在。"]))
+        return "".join(parts)
+
+    def extract_memories(self, transcript: str, *, name: str = "Giftia") -> list[MemoryDraft]:
+        """启发式兜底：从搭档说过的话里挑两条最长的留下来（提问不算记忆）。"""
+        lines = [ln for ln in transcript.splitlines() if ln.startswith("搭档：")]
+        texts = sorted((ln[3:].strip() for ln in lines), key=len, reverse=True)
+        drafts: list[MemoryDraft] = []
+        for text in texts:
+            if not _worth_remembering(text):
+                continue
+            summary = text if len(text) <= 60 else text[:57] + "……"
+            # 名字/称呼这类会被当成"内核记忆"，好让离线演示也能看出分层效果
+            layer = "core" if any(k in text for k in ("叫我", "名字", "我叫", "别叫")) else "normal"
+            importance = 0.85 if layer == "core" else 0.5
+            drafts.append(
+                MemoryDraft(
+                    summary=f"搭档说过：{summary}",
+                    tags="搭档,聊天",
+                    emotion="平常",
+                    importance=importance,
+                    layer=layer,
+                )
+            )
+            if len(drafts) >= 2:
+                break
+        return drafts
+
+    def rewrite_query(self, text: str) -> list[str]:
+        """离线不编造同义词：只做一次"去掉语气词、取实词"的确定性切分。
+
+        真正的改写交给真模型；这里返回变体是为了让整条链路在离线时也能被测试。
+        """
+        cleaned = re.sub(r"[的了呢吧啊呀嘛哦噢，。！？!?、；;：:\s]+", " ", text or "")
+        parts = [p for p in cleaned.split(" ") if len(p) >= 2]
+        return parts[:2]
+
+    def write_memoir(self, context: str) -> str:
+        entries = [ln.strip("- ").strip() for ln in context.splitlines() if ln.strip().startswith("-")]
+        body = "".join(f"　　{ln}\n" for ln in entries[:6])
+        return (
+            "档案编号已归档。这名 Giftia 的服务期到此为止。\n\n"
+            f"在她被清除之前，她留下的记忆是这样一些片段：\n{body}\n"
+            "她大概不会知道自己被记得这么清楚——毕竟到最后，她连你的名字都握不住了。\n\n"
+            "她的记忆将被清除，而你会记得。"
+        )

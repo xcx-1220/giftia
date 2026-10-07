@@ -1,0 +1,15 @@
+# 默认按文本处理，检出时用平台换行（Windows 上就是 CRLF）
+* text=auto
+
+# 下面这几个是要传到 Linux 上直接跑的：必须是 LF。
+# 否则 Windows 检出成 CRLF 后，bash 会报 `$'\r': command not found`，
+# systemd 也会因为 unit 文件里的 \r 读不出指令。
+*.sh          text eol=lf
+*.service     text eol=lf
+.env.example  text eol=lf
+
+# 她的记忆是可读的文本（回忆录 Markdown、封存 JSON），别被当二进制
+*.md          text
+*.json        text
+*.toml        text
+*.py          text
