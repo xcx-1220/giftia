@@ -286,7 +286,11 @@ class QQBot:
         who = "群" if kind == "group" else "私聊"
         print(f"[收到·{who}] {user_id[:12]}…：{content}")
 
-        # 先看是不是指令（/bind 解决"OpenID 与 QQ 号不互通、无法预先知道"的问题）
+        # 记住最近活跃的群 —— 她主动发消息到群里时用它当目标
+        if kind == "group":
+            brain_mod.get_default(self.settings).set_last_group(target)
+
+        # 先看是不是指令（官方 openid 与 QQ 号不互通，所以有 /bind 兜底）
         if self.handle_command(kind, target, content, user_id, msg_id):
             return
 
@@ -418,34 +422,53 @@ class QQBot:
 
         return False  # 不认识的斜杠消息当作普通聊天，交给她
 
+    def _outreach_targets(self) -> list[tuple[str, str]]:
+        """这次主动消息发去哪：[(kind, openid)]。由 [outreach] target 决定。"""
+        mode = str(self.settings.outreach.target or "owner").strip().lower()
+        out: list[tuple[str, str]] = []
+        owner = self.owner_id()
+        group = brain_mod.get_default(self.settings).last_group_id
+        if mode in ("owner", "both") and owner:
+            out.append(("c2c", owner))
+        if mode in ("group", "both") and group:
+            out.append(("group", group))
+        return out
+
     def _maybe_outreach(self) -> None:
-        """她主动来找你。
+        """她主动来找你（或群里）。
 
         只在主线程里跑（Giftia 不是线程安全的），所以由 WebSocket 循环定时调用，
         而不是另开一个后台线程。
         """
         if not self.settings.outreach.enabled:
             return
-        target = self.owner_id()
-        if not target:
-            return  # 还没 /bind，不知道发给谁
         hub = brain_mod.get_default(self.settings)
-        if not can_send(self.settings, hub.store, hub.clock.now()):
-            return
-        plan_, text = hub.compose_outreach(record=False)
-        if not plan_ or not text.strip():
-            return
-
-        body: dict = {"msg_type": 0, "content": text}
-        if self.settings.outreach.use_wakeup:
-            body["is_wakeup"] = True
-        try:
-            self._request("POST", f"/v2/users/{target}/messages", body)
-        except QQError as exc:
-            print(f"[主动发送失败] {exc}", file=sys.stderr)
-            return
-        hub.note_outreach_sent(text)  # 成功才记账
-        print(f"[主动·{plan_.reason_label}] {text}")
+        if not self._outreach_targets():
+            return  # 还没认人 / 还没进过群，不知道发给谁
+        for kind, target in self._outreach_targets():
+            if not can_send(self.settings, hub.store, hub.clock.now()):
+                return
+            which = "owner" if kind == "c2c" else "group"
+            plan_, text = hub.compose_outreach(record=False, target=which)
+            if not plan_ or not text.strip():
+                continue
+            body: dict = {"msg_type": 0, "content": text}
+            # 互动召回只对单聊有意义，群消息不带这个字段
+            if self.settings.outreach.use_wakeup and kind == "c2c":
+                body["is_wakeup"] = True
+            path = (
+                f"/v2/users/{target}/messages"
+                if kind == "c2c"
+                else f"/v2/groups/{target}/messages"
+            )
+            try:
+                self._request("POST", path, body)
+            except QQError as exc:
+                print(f"[主动发送失败·{which}] {exc}", file=sys.stderr)
+                continue
+            hub.note_outreach_sent(text, keep_in_history=(kind == "c2c"))
+            where = "私聊" if kind == "c2c" else "群里"
+            print(f"[主动·{where}·{plan_.reason_label}] {text}")
 
     # ══ WebSocket 会话 ═══════════════════════════════════════
     def identify(self, ws: WebSocket) -> None:

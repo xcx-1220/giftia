@@ -145,6 +145,10 @@ class OutreachConfig:
     # True = 用官方的「互动召回消息」（is_wakeup），额度更紧但更合规；
     # False = 普通主动消息（有频控，没有 30 天 4 条的硬限制）
     use_wakeup: bool = False
+    # 主动消息发给谁：owner（私聊给搭档，默认）| group（发到最后活跃的群）| both
+    # 注意：发到群里时只会用"大家都看得见"的理由（大日子/纪念日），
+    # 梦、心事、"快到终端服务了"这类只在私聊说。
+    target: str = "owner"
 
 
 @dataclass(frozen=True)
@@ -203,8 +207,9 @@ class RuntimeConfig:
     handler_name: str = ""
     user_id: str = "handler"
     show_memoir_after_recycle: bool = True
-    # 群里被陌生人 @ 时：false = 装作没看见（默认，群聊不该刷屏），true = 以"客人"身份回一句
-    group_stranger_reply: bool = False
+    # 群里被 @ 时：true = 回答（默认，以"客人"身份：不检索记忆、不写记忆、不推进关系）；
+    #             false = 装作没看见
+    group_stranger_reply: bool = True
     # 自动认主（省掉 /bind）：
     #   私聊里第一个说话的人 = 搭档；
     #   群里只有**群主** @ 她时才算（陌生人做不到这一点）。

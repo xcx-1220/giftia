@@ -776,6 +776,52 @@ def main() -> int:
           near_plan.reason if near_plan else "None")
     check("不安时不会说「回收」或道别", "不要提「回收」" in (near_plan.hint if near_plan else ""))
 
+    # ══ 24b. 主动发到群里：只能说"大家都看得见"的事 ═════════════
+    print("\n24b. 主动发群里 vs 发给你")
+    gbase = make_settings(tmp / "out_group", 81920.0)
+    gon = dataclasses.replace(gbase, outreach=dataclasses.replace(
+        gbase.outreach, enabled=True, idle_days=3, target="group"))
+    grp_out = Giftia(gon, llm=MockLLM(settings.model))
+    grp_out.set_last_group("GROUP-X")
+    grp_out.handle("在吗")
+    grp_out.clock.advance(24 * 4)  # 闲了 4 天
+
+    check("她的「想你了」只在私聊说，不在群里说",
+          grp_out.outreach_plan(force=True, for_group=True) is None)
+    check("同一个时刻，私聊里她想你", grp_out.outreach_plan(force=True) is not None)
+
+    grp_out.store.add_memory(
+        instance_no=grp_out.instance_no,
+        created_ts=grp_out.clock.iso(),
+        happened_ts=grp_out.clock.iso(),
+        summary="搭档明天要考驾照",
+        importance=0.7,
+        layer="important",
+        event_date=(grp_out.clock.now().date() + _td(days=1)).isoformat(),
+    )
+    gp = grp_out.outreach_plan(force=True, for_group=True)
+    check("但「你的大日子」是公开的，群里也能提",
+          gp is not None and gp.reason == "big_day", gp.reason if gp else "None")
+
+    _, grp_text = grp_out.compose_outreach(force=True, target="group")
+    check("发到群里的那条真的写得出来", bool(grp_text.strip()), grp_text[:40])
+    check("发到群里时用的是群聊情境（带隐私约束）",
+          "【现在的情境】" in build_system_prompt(
+              gon, grp_out.status(), [], now=grp_out.clock.now(),
+              handler_name="", scene="group"))
+
+    # 快到期这类心事，群里绝不出现
+    near2 = Giftia(
+        dataclasses.replace(gbase, outreach=dataclasses.replace(
+            gbase.outreach, enabled=True)),
+        llm=MockLLM(settings.model),
+    )
+    near2.handle("在吗")
+    near2.clock.advance(81920 - 10)
+    check("「快到终端服务了」只在私聊说",
+          near2.outreach_plan(force=True, for_group=True) is None
+          and near2.outreach_plan(force=True) is not None)
+
     brain.store.close()
     brain2.store.close()
 

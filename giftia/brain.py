@@ -112,11 +112,20 @@ class Giftia:
 
     @property
     def handler_id(self) -> str:
-        """平台上的搭档 id（适配器 /bind 时写入）。核心不关心它长什么样。"""
+        """平台上的搭档 id（适配器 /bind 或自动认主时写入）。核心不关心它长什么样。"""
         return str(self.store.state_get("handler_id", "") or "")
 
     def set_handler_id(self, user_id: str) -> None:
         self.store.state_set("handler_id", str(user_id or ""))
+
+    @property
+    def last_group_id(self) -> str:
+        """最近一次跟她说过话的群（她主动发群里时用）。"""
+        return str(self.store.state_get("last_group_openid", "") or "")
+
+    def set_last_group(self, group_openid: str) -> None:
+        if group_openid:
+            self.store.state_set("last_group_openid", str(group_openid))
 
     # ── 群里认得的人 ──────────────────────────────────────
     def known_people(self) -> dict[str, str]:
@@ -450,7 +459,9 @@ class Giftia:
         )
 
     # ── 主动联系 ──────────────────────────────────────────
-    def outreach_plan(self, *, force: bool = False) -> OutreachPlan | None:
+    def outreach_plan(
+        self, *, force: bool = False, for_group: bool = False
+    ) -> OutreachPlan | None:
         now = self.clock.now()
         bond = self.current_bond(now)
         occasions = find_occasions(
@@ -470,13 +481,15 @@ class Giftia:
             dream=latest_untold(self.settings, self.store, self.clock, self.instance_no),
             instance_no=self.instance_no,
             force=force,
+            for_group=for_group,
         )
 
     def compose_outreach(
-        self, *, record: bool = False, force: bool = False
+        self, *, record: bool = False, force: bool = False, target: str = "owner"
     ) -> tuple[OutreachPlan | None, str]:
-        """她想主动找你时说的一句。record=True 才真的记账（并写进会话）。"""
-        plan_ = self.outreach_plan(force=force)
+        """她想主动找你（或群里）时说的一句。record=True 才真的记账。"""
+        for_group = target != "owner"
+        plan_ = self.outreach_plan(force=force, for_group=for_group)
         if plan_ is None:
             return None, ""
         now = self.clock.now()
@@ -500,9 +513,11 @@ class Giftia:
             bond=bond,
             mood=self.current_mood(now),
             handler_name=self.handler_name,
-            scene="c2c",
+            # 发群里时走 group 情境：多一段"别当众说私事"的约束
+            scene="group" if for_group else "c2c",
+            people=self._people_for_prompt(),
             occasions=occasions,
-            dream=dream,
+            dream=None if for_group else dream,
         )
         text = compose_outreach_text(self.settings, self.llm, plan_, system_prompt=system)
         if text and record:
@@ -510,19 +525,23 @@ class Giftia:
                 self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
             )
             record_sent(self.store, now)
-            if dream is not None:
+            if dream is not None and not for_group:
                 self.store.mark_dream_told(dream.id)
         return plan_, text
 
     def outreach_text(self) -> str:
         return outreach_history(self.settings, self.store, self.clock)
 
-    def note_outreach_sent(self, text: str) -> None:
-        """适配器真的发出去之后调用：写进会话上下文 + 记账扣额度。"""
+    def note_outreach_sent(self, text: str, *, keep_in_history: bool = True) -> None:
+        """适配器真的发出去之后调用：记账扣额度（私聊的还写进会话上下文）。
+
+        发到群里的那句不写进会话 —— 那是当众说的话，不该混进你俩的私聊上下文。
+        """
         now = self.clock.now()
-        self.store.add_message(
-            self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
-        )
+        if keep_in_history:
+            self.store.add_message(
+                self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
+            )
         record_sent(self.store, now)
 
     def _rewrite_queries(self, text: str) -> list[str]:

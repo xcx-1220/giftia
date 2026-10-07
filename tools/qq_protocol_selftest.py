@@ -275,7 +275,7 @@ def main() -> int:
     group = [c for c in sends if "/v2/groups/GROUP-1/messages" in c[1]]
     other = [c for c in sends if "/v2/users/OTHER/messages" in c[1]]
     check("单聊回复发到了 /v2/users/OWNER/messages", len(c2c) == 1, str([c[1] for c in sends]))
-    check("群聊回复发到了 /v2/groups/GROUP-1/messages", len(group) == 1, str([c[1] for c in sends]))
+    check("群聊回复发到了 /v2/groups/GROUP-1/messages", len(group) == 2, str([c[1] for c in sends]))
     if c2c:
         body = c2c[0][2]
         check("msg_type = 0（纯文本）", body.get("msg_type") == 0, str(body))
@@ -287,9 +287,10 @@ def main() -> int:
               f"{body.get('content')!r} vs {results.get('assistant_text')!r}")
     check("重复推送的那条事件没有导致重复回复（去重生效）", len(c2c) == 1,
           f"收到 {len(c2c)} 条回复")
-    check("全流程一共只发出 3 条消息", len(sends) == 3, str([c[1] for c in sends]))
-    check("群里陌生人 @ 她 → 保持安静，不在群里刷屏（默认策略）",
-          len([c for c in sends if "GROUP-1" in c[1]]) == 1,
+    check("全流程一共发出 4 条消息（搭档单聊 + 搭档群聊 + 陌生人单聊挡回 + 陌生人群聊客套）",
+          len(sends) == 4, str([c[1] for c in sends]))
+    check("群里陌生人 @ 她 → 她会以「客人」身份回一句（默认策略）",
+          len([c for c in sends if "GROUP-1" in c[1]]) == 2,
           str([c[1] for c in sends]))
 
     print("\n4. 群聊 @ 标记与陌生人隔离")
@@ -301,6 +302,62 @@ def main() -> int:
     check("陌生人被挡回，且挡回话术是戏内的",
           len(other) == 1 and str(other[0][2].get("content", "")).startswith("……"),
           str(other))
+
+    print("\n4b. 群里还有别人时的两种策略")
+    # group_stranger_reply = false → 装作没看见（安静）
+    quiet_settings = dataclasses.replace(
+        load_settings(force_mock=True),
+        root=Path(tempfile.mkdtemp(prefix="giftia-quiet-")),
+        runtime=dataclasses.replace(
+            load_settings(force_mock=True).runtime, group_stranger_reply=False
+        ),
+    )
+    brain_mod.reset_default()
+    quiet = adapter.QQBot("X", "Y", owner_openid="", settings=quiet_settings)
+    quiet_calls: list[tuple[str, str, str]] = []
+    quiet.send = lambda kind, target, text, msg_id: quiet_calls.append((kind, target, text))  # type: ignore[method-assign]
+    quiet.handle_event(adapter.EVENT_C2C, {
+        "id": "Q-1", "author": {"user_openid": "ME"}, "content": "你好",
+    })  # 私聊自动认主
+    quiet.handle_event(adapter.EVENT_GROUP_AT, {
+        "id": "Q-2", "author": {"user_openid": "SOMEONE", "member_role": "member"},
+        "group_openid": "G2", "content": "<@!1> 我叫阿伟",
+    })
+    check("group_stranger_reply = false → 群里别人 @ 她，她装作没看见",
+          len(quiet_calls) == 1, str([c[2] for c in quiet_calls]))
+    quiet_hub = brain_mod.get_default(quiet_settings)
+    check("但名字还是被记下来了（她认得群里的人，只是不说话）",
+          quiet_hub.known_people().get("SOMEONE") == "阿伟",
+          str(quiet_hub.known_people()))
+
+    # 默认（true）→ 以客人身份回答，且不写记忆
+    brain_mod.reset_default()
+    loud_settings = dataclasses.replace(
+        load_settings(force_mock=True), root=Path(tempfile.mkdtemp(prefix="giftia-loud-"))
+    )
+    loud = adapter.QQBot("X", "Y", owner_openid="", settings=loud_settings)
+    loud_calls: list[tuple[str, str, str]] = []
+    loud.send = lambda kind, target, text, msg_id: loud_calls.append((kind, target, text))  # type: ignore[method-assign]
+    loud.handle_event(adapter.EVENT_C2C, {
+        "id": "L-1", "author": {"user_openid": "ME"}, "content": "我叫小林",
+    })
+    loud_hub = brain_mod.get_default(loud_settings)
+    before = loud_hub.store.count_messages(loud_hub.instance_no)
+    loud.handle_event(adapter.EVENT_GROUP_AT, {
+        "id": "L-2", "author": {"user_openid": "FRIEND", "member_role": "member"},
+        "group_openid": "G3", "content": "<@!1> 你好呀，我叫阿伟",
+    })
+    check("默认策略下，群里别人 @ 她会得到回复",
+          len(loud_calls) == 2 and "抱歉" not in loud_calls[1][2], str([c[2] for c in loud_calls]))
+    check("客人说的话不进你们的记忆",
+          loud_hub.store.count_messages(loud_hub.instance_no) == before,
+          f"{before} → {loud_hub.store.count_messages(loud_hub.instance_no)}")
+    check("她记住了客人的名字",
+          loud_hub.known_people().get("FRIEND") == "阿伟",
+          str(loud_hub.known_people()))
+    check("最近活跃的群被记下来（她主动发群里要用）",
+          loud_hub.last_group_id == "G3", repr(loud_hub.last_group_id))
+    brain_mod.reset_default()
 
     print("\n5. 优雅退出（SIGTERM 路径）")
     mems = results.get("memories")
@@ -345,7 +402,8 @@ def main() -> int:
     })
     grp_hub = brain_mod.get_default(group_settings)
     check("群里普通成员不会认主（防抢注）", grp_hub.handler_id == "", repr(grp_hub.handler_id))
-    check("群里的陌生人也保持安静（默认策略）", grp_calls == [], str(grp_calls))
+    check("群里的普通成员会被以客人身份回应（默认策略）",
+          len(grp_calls) == 1 and "抱歉" not in grp_calls[0][2], str(grp_calls))
 
     grp_auto.handle_event(adapter.EVENT_GROUP_AT, {
         "id": "AUTO-4", "author": {"user_openid": "OWNER-X", "member_role": "owner"},

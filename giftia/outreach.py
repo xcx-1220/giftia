@@ -107,17 +107,20 @@ def plan(
     dream=None,
     instance_no: int = 1,
     force: bool = False,
+    for_group: bool = False,
 ) -> OutreachPlan | None:
     """她现在最想找你说什么。None = 没什么特别想说的（那就不打扰）。
 
     force=True 时忽略 enabled 开关——CLI 的 /outreach 用它来预览。
+    for_group=True 时只用"大家都看得见"的理由：她的梦、心事、终端服务倒计时
+    都只发给搭档本人，不在群里说。
     """
     if not settings.outreach.enabled and not force:
         return None
     now = clock.now()
 
-    # 1) 快到终端服务
-    if 0 < life.remaining_hours <= settings.mood.uneasy_hours:
+    # 1) 快到终端服务（只对搭档说）
+    if not for_group and 0 < life.remaining_hours <= settings.mood.uneasy_hours:
         return OutreachPlan(
             reason="near_end",
             title="终端服务快到了",
@@ -152,8 +155,8 @@ def plan(
             urgency=0.6,
         )
 
-    # 4) 做了梦还没讲
-    if dream is not None:
+    # 4) 做了梦还没讲（只对搭档说）
+    if not for_group and dream is not None:
         return OutreachPlan(
             reason="dream",
             title="她想讲一个梦",
@@ -164,23 +167,24 @@ def plan(
             urgency=0.5,
         )
 
-    # 5) 太久没说话
-    last_ts = store.last_message_ts(instance_no)
-    if last_ts:
-        try:
-            idle_days = (now - datetime.fromisoformat(last_ts)).total_seconds() / 86400.0
-        except ValueError:
-            idle_days = 0.0
-        if idle_days >= settings.outreach.idle_days:
-            return OutreachPlan(
-                reason="missing_you",
-                title=f"已经 {idle_days:.0f} 天没见到你了",
-                hint=(
-                    "你好几天没听到他的声音了。写一句你憋了很久的话，"
-                    "但别埋怨他——你不是在讨债，只是有点想他。"
-                ),
-                urgency=0.4,
-            )
+    # 5) 太久没说话（只对搭档说；群里"没人说话"不该由她来打破）
+    if not for_group:
+        last_ts = store.last_message_ts(instance_no)
+        if last_ts:
+            try:
+                idle_days = (now - datetime.fromisoformat(last_ts)).total_seconds() / 86400.0
+            except ValueError:
+                idle_days = 0.0
+            if idle_days >= settings.outreach.idle_days:
+                return OutreachPlan(
+                    reason="missing_you",
+                    title=f"已经 {idle_days:.0f} 天没见到你了",
+                    hint=(
+                        "你好几天没听到他的声音了。写一句你憋了很久的话，"
+                        "但别埋怨他——你不是在讨债，只是有点想他。"
+                    ),
+                    urgency=0.4,
+                )
     return None
 
 
