@@ -27,11 +27,13 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=giftia-qq
 
-[Environment]
-PYTHONUNBUFFERED=1
-PYTHONIOENCODING=utf-8
+# 环境变量必须是 [Service] 里的指令，**不能**写成 [Environment] 段 ——
+# 写成段 systemd 会报 "Unknown section 'Environment'. Ignoring." 全部忽略，
+# 于是 PYTHONUNBUFFERED 失效，日志会卡在输出缓冲里看不到。
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
 # 代码目录是只读的，别让 Python 试图写 .pyc
-PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 
 # ── 加固：整个文件系统对她只读，只有 data/ 能写 ──────────────
 NoNewPrivileges=true
