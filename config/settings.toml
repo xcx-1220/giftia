@@ -81,11 +81,16 @@ show_memoir_after_recycle = true
 # 阶段本身写在 persona.toml 的 [bond.stages.*] 里（那是"她怎么说话"，属于人格）
 [relationship]
 enabled              = true
-gain_daily           = 1.5      # 每天第一次认真说话
+gain_daily           = 1.5      # 每天第一次认真说话（未打折扣时）
 gain_emotion_bonus   = 0.5      # 那天说了一件有情绪的事
 gain_core_memory     = 2.0      # 记住一件"关于他本人"的事（名字/关系/约定）
 gain_important_memory = 1.0
 decay_per_day        = 0.0      # 默认不衰减：她不会因为你忙就少喜欢你一点
+# 递减增长（强烈建议保持 true）：实际涨幅 = 名义值 × (1 - 当前亲密度/100)。
+# 越亲近越难涨，「亲近」「无可替代」因此必须靠时间熬，而不是靠刷。
+# 按默认参数、每天都见面的曲线大致是：
+#   第 11 天「搭档」 → 第 34 天「熟悉」 → 第 85 天「亲近」 → 第 180 天「无可替代」
+diminish             = true
 
 
 # ── 心情：寿命压力 > 你的语气 > 每日漂移 ─────────────────────────

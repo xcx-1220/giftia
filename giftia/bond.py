@@ -111,6 +111,18 @@ class BondTracker:
         )
 
     # ── 写 ────────────────────────────────────────────────
+    def _scale(self, gain: float, affinity: float) -> float:
+        """递减增长：越亲近，同样的付出涨得越少。"""
+        if not self.settings.relationship.diminish:
+            return gain
+        return gain * max(0.0, 1.0 - affinity / 100.0)
+
+    def set_affinity(self, instance_no: int, value: float) -> None:
+        """直接设定亲密度（调试、演示、以及测试用）。"""
+        self.store.state_set(
+            self._key("affinity", instance_no), f"{max(0.0, min(100.0, value)):.4f}"
+        )
+
     def touch(
         self,
         now,
@@ -133,8 +145,11 @@ class BondTracker:
             if abs(tone) >= self.settings.mood.tone_threshold:
                 # 说了一件有情绪的事，比随口寒暄更靠近
                 gain += self.settings.relationship.gain_emotion_bonus
-            affinity = min(100.0, before.affinity + gain)
-            self.store.state_set(self._key("affinity", instance_no), f"{affinity:.4f}")
+            gained = self._scale(gain, before.affinity)
+            self.store.state_set(
+                self._key("affinity", instance_no),
+                f"{min(100.0, before.affinity + gained):.4f}",
+            )
             self.store.state_set(
                 self._key("interactions", instance_no), str(before.interactions + 1)
             )
@@ -156,7 +171,8 @@ class BondTracker:
             return
         current = self._get_float("affinity", instance_no)
         self.store.state_set(
-            self._key("affinity", instance_no), f"{min(100.0, current + gain):.4f}"
+            self._key("affinity", instance_no),
+            f"{min(100.0, current + self._scale(gain, current)):.4f}",
         )
 
     def decay(self, now, instance_no: int) -> None:

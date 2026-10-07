@@ -403,10 +403,38 @@ def main() -> int:
         rel.handle("嗯，今天也还行")
         seen_notice = seen_notice or any(n.startswith("[关系]") for n in rel.notices)
     b4 = rel.current_bond()
-    check("持续相处后亲密度上来了", b4.affinity >= 40, f"{b4.affinity:.1f}")
-    check("两条腿都够了才升到「熟悉」（或更高）",
-          b4.stage.key in ("familiar", "close", "irreplaceable"), b4.stage.label)
+    check("持续相处后亲密度上来了", b4.affinity >= 30, f"{b4.affinity:.1f}")
+    check("间歇相处 30 天 → 至少到「搭档」",
+          b4.stage.key in ("partner", "familiar", "close"), b4.stage.label)
     check("升级时她会主动提示", seen_notice)
+
+    # 递减增长：越亲近，同样的付出涨得越少
+    fresh = Giftia(make_settings(tmp / "bond_dim", 81920.0), llm=MockLLM(settings.model))
+    fresh.handle("你好")
+    early = fresh.current_bond().affinity
+    fresh.bond.set_affinity(fresh.instance_no, 90.0)
+    fresh.clock.advance(24)
+    fresh.handle("你好")
+    late = fresh.current_bond().affinity - 90.0
+    check("增长递减：初期一天的涨幅远大于后期",
+          early > late * 5, f"初期 {early:.2f} vs 后期 {late:.2f}")
+    check("递减时后期涨幅仍为正（不会卡死）", late > 0, f"{late:.3f}")
+
+    # 每天都见面的完整曲线（settings.toml 里承诺的那条）
+    steady = Giftia(make_settings(tmp / "bond_curve", 81920.0), llm=MockLLM(settings.model))
+    reached: dict[str, int] = {}
+    for day in range(1, 200):
+        steady.clock.advance(24)
+        steady.handle("嗯，今天也还行")
+        reached.setdefault(steady.current_bond().stage.key, day)
+    check("每天见面 → 第 11 天左右到「搭档」",
+          8 <= reached.get("partner", 999) <= 15, str(reached))
+    check("每天见面 → 第 34 天左右到「熟悉」",
+          25 <= reached.get("familiar", 999) <= 45, str(reached))
+    check("每天见面 → 第 80 天左右到「亲近」（即“认识三个月”那档）",
+          65 <= reached.get("close", 999) <= 100, str(reached))
+    check("「无可替代」要熬半年以上",
+          reached.get("irreplaceable", 999) >= 170, str(reached))
 
     # 直接验证判定规则本身（这是"认识三个月"那句需求的落点）
     check("亲密度拉满但只认识 10 天 → 只够「搭档」",

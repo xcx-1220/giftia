@@ -84,11 +84,14 @@ class MoodDef:
 @dataclass(frozen=True)
 class RelationshipConfig:
     enabled: bool = True
-    gain_daily: float = 1.5            # 每天第一次认真说话
+    gain_daily: float = 1.5            # 每天第一次认真说话（未打折扣时）
     gain_emotion_bonus: float = 0.5    # 那天说了一件有情绪的事
     gain_core_memory: float = 2.0      # 记住一件"关于他本人"的事
     gain_important_memory: float = 1.0
     decay_per_day: float = 0.0         # 默认不衰减：她不会因为你忙就少喜欢你一点
+    # 递减增长：实际涨幅 = 名义值 × (1 - 当前亲密度/100)。
+    # 越亲近越难涨，于是「亲近」「无可替代」要靠时间熬，而不是靠刷。
+    diminish: bool = True
 
 
 @dataclass(frozen=True)
