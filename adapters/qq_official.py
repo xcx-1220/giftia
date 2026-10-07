@@ -69,6 +69,13 @@ INTENT_GROUP_AND_C2C = 1 << 25  # 群聊 @机器人 + 单聊
 
 EVENT_GROUP_AT = "GROUP_AT_MESSAGE_CREATE"
 EVENT_C2C = "C2C_MESSAGE_CREATE"
+# 群里开启"接收所有消息"之后，**每一条**群消息（不限于 @）都会推这个事件。
+# intent 和 @ 事件是同一个（GROUP_AND_C2C_EVENT = 1<<25），不需要多订阅什么，
+# 开关在群里的机器人资料页上，由群管理员打开。
+EVENT_GROUP_MESSAGE = "GROUP_MESSAGE_CREATE"
+# 上面那个开关被打开/关闭时各推一次
+EVENT_GROUP_MSG_RECEIVE = "GROUP_MSG_RECEIVE"
+EVENT_GROUP_MSG_REJECT = "GROUP_MSG_REJECT"
 MSG_TYPE_TEXT = 0
 MAX_CHARS = 350          # 超出会被平台以"消息长度超限"拒掉，主动分条
 DEDUP_WINDOW = 300.0     # 同一 msg_id 在这个秒数内只处理一次
@@ -118,6 +125,32 @@ def strip_mention(content: str) -> str:
     while content.startswith("<@") and ">" in content:
         content = content.split(">", 1)[1]
     return content.strip()
+
+
+def extract_content(payload: dict) -> str:
+    """把一条消息的正文取出来。
+
+    QQ 的"聊天记录"转发（message_type=102）和"引用消息"（103）不在 content 里，
+    而是放在 msg_elements 里带结构化内容 —— 别人把聊天记录转给她时，
+    她读到的就是这里，所以这两类也要能取出来。
+    """
+    content = strip_mention(str(payload.get("content") or ""))
+    elements = payload.get("msg_elements") or []
+    if not elements:
+        return content
+    parts: list[str] = [content] if content.strip() else []
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        text = strip_mention(str(el.get("content") or ""))
+        if text:
+            parts.append(text)
+        for sub in el.get("msg_elements") or []:  # 引用里套引用 / 并行消息
+            if isinstance(sub, dict):
+                sub_text = strip_mention(str(sub.get("content") or ""))
+                if sub_text:
+                    parts.append(sub_text)
+    return "\n".join(parts).strip()
 
 
 class QQBot:
@@ -253,45 +286,93 @@ class QQBot:
                 print(f"[发送失败] {exc}", file=sys.stderr)
 
     # ══ 事件 ═════════════════════════════════════════════════
-    def is_duplicate(self, msg_id: str) -> bool:
+    # 同一条消息可能被推两次：
+    #   · 平台重推（网络抖动 / resume 补发）
+    #   · 群里开了"接收所有消息"后，全量事件与 @ 事件可能同时到
+    # 所以去重表里存的是"回复过没有"：
+    #   已经回过的再收到 = 重复；只旁听过的 @ 版来了，还是要回。
+    def is_duplicate(self, msg_id: str, *, reply_worthy: bool = False) -> bool:
+        """返回 True = 这条不用再处理了。"""
         now = time.time()
-        while self._seen and now - next(iter(self._seen.values())) > DEDUP_WINDOW:
+        while self._seen and now - next(iter(self._seen.values()))[0] > DEDUP_WINDOW:
             self._seen.popitem(last=False)
-        if msg_id and msg_id in self._seen:
-            return True
-        if msg_id:
-            self._seen[msg_id] = now
+        if not msg_id:
+            return False
+        prev = self._seen.get(msg_id)
+        if prev is not None:
+            _ts, prev_replied = prev
+            if prev_replied:
+                return True  # 已经回过了 → 重复
+            if not reply_worthy:
+                return True  # 上次也只是旁听 → 重复
+            # 上次只旁听、这次是按 @ 推过来的 → 放行，让她回
+        self._seen[msg_id] = (now, reply_worthy or bool(prev and prev[1]))
         return False
 
     def handle_event(self, event_type: str, payload: dict) -> None:
-        if event_type not in (EVENT_GROUP_AT, EVENT_C2C):
+        # 群里开了 / 关了"接收所有消息"
+        if event_type in (EVENT_GROUP_MSG_RECEIVE, EVENT_GROUP_MSG_REJECT):
+            group = str(payload.get("group_openid") or "")
+            on = event_type == EVENT_GROUP_MSG_RECEIVE
+            if group:
+                brain_mod.get_default(self.settings).store.state_set(
+                    f"fullmode:{group}", 1 if on else 0
+                )
+            print(
+                f"[全量] 群 {group[:10]}… {'开启' if on else '关闭'}了「接收所有消息」"
+                + ("——她从此听得见群里每一句话" if on else "")
+            )
             return
-        msg_id = str(payload.get("id") or "")
-        if self.is_duplicate(msg_id):
-            print(f"[去重] 忽略重复推送的 {msg_id[:16]}…")
+        if event_type not in (EVENT_GROUP_AT, EVENT_GROUP_MESSAGE, EVENT_C2C):
             return
 
+        msg_id = str(payload.get("id") or "")
         author = payload.get("author") or {}
         user_id = str(author.get("user_openid") or author.get("id") or "unknown")
-        content = strip_mention(str(payload.get("content") or ""))
-        if not content:
-            return
-
-        kind = "group" if event_type == EVENT_GROUP_AT else "c2c"
+        speaker = str(author.get("username") or "").strip()
+        kind = "group" if event_type in (EVENT_GROUP_AT, EVENT_GROUP_MESSAGE) else "c2c"
         target = str(payload.get("group_openid") or "") if kind == "group" else user_id
         if not target:
             print(f"[跳过] {event_type} 事件缺少目标 id", file=sys.stderr)
             return
 
+        # 全量模式下，没点到她的消息也要"听得见"（这是她看聊天记录的来源）。
+        # 判断有没有 @ 她：@ 事件本身就算；全量事件看 mentions 里有没有机器人。
+        mentions = payload.get("mentions") or []
+        at_bot = event_type == EVENT_GROUP_AT or any(
+            bool(m.get("bot")) for m in mentions if isinstance(m, dict)
+        )
+        if self.is_duplicate(msg_id, reply_worthy=(kind == "c2c" or at_bot)):
+            print(f"[去重] 忽略重复推送的 {msg_id[:16]}…")
+            return
+
+        content = extract_content(payload)
+        if not content:
+            return
+
         who = "群" if kind == "group" else "私聊"
-        print(f"[收到·{who}] {user_id[:12]}…：{content}")
+        print(f"[收到·{who}{'' if at_bot else '·旁听'}] {user_id[:12]}…：{content[:60]}")
 
         # 记住最近活跃的群 —— 她主动发消息到群里时用它当目标
         if kind == "group":
             brain_mod.get_default(self.settings).set_last_group(target)
+            # 平台每条群消息都带昵称。先用昵称认人（等比自我介绍再覆盖），
+            # 否则她每次都得问"你是哪位"——群里没人会喜欢这个。
+            if speaker:
+                hub0 = brain_mod.get_default(self.settings)
+                if hub0.remember_person(user_id, speaker):
+                    print(f"[认得] 群里有人叫「{hub0.known_people().get(user_id, '')}」")
 
         # 先看是不是指令（官方 openid 与 QQ 号不互通，所以有 /bind 兜底）
         if self.handle_command(kind, target, content, user_id, msg_id):
+            return
+
+        # 群里没点到她 → 只记进聊天记录，不搭话（全量模式的价值就在这里）
+        if kind == "group" and not at_bot:
+            handle_message(
+                content, user_id, settings=self.settings, scene="group",
+                group_id=target, speaker_name=speaker, log_only=True,
+            )
             return
 
         hub = brain_mod.get_default(self.settings)
@@ -321,28 +402,40 @@ class QQBot:
             if hub.learn_name(content, user_id, owner=False):
                 print(f"[认得] 群里有人叫「{hub.known_people().get(user_id, '')}」")
             if not self.settings.runtime.group_stranger_reply:
+                # 名字记下了，话也留个记录：她"听得见"，只是不搭话
+                handle_message(
+                    content, user_id, settings=self.settings, scene="group",
+                    group_id=target, speaker_name=speaker, is_handler=False, log_only=True,
+                )
                 print("[跳过] 群里其他人说话，按配置保持安静")
                 return
-            # 以"客人"身份礼貌回一句：不检索记忆、不落库、不推进关系
+            # 以"客人"身份礼貌回一句：只看这个群里公开发生过的事，
+            # 碰不到你和她之间的私聊记忆，也不会推进你们的关系
             guest_reply = handle_message(
-                content, user_id, settings=self.settings, scene="guest"
+                content, user_id, settings=self.settings, scene="group",
+                group_id=target, speaker_name=speaker, is_handler=False,
             )
             print(f"[{self.settings.persona.name}·客人] {guest_reply}")
             self.send(kind, target, guest_reply, msg_id)
             return
 
         if not is_handler:
-            # 私聊里的别人：戏内挡回去，不进记忆、不占她的寿命
+            # 私聊里的别人：戏内挡回去，不进你们的记忆
             self.send(kind, target, DEFLECT, msg_id)
             return
 
         # ★ 整个项目的接缝：平台消息 → 她
-        # scene 会多注入一段群聊约束（主要是隐私：群里别人也看得到）
+        # scene 多注入一段群聊约束（主要是隐私：群里别人也看得到）；
+        # group_id / speaker_name 决定这条记忆"归谁"——群聊必须传，
+        # 否则她分不清谁在哪个群说了什么。
         reply = handle_message(
             content,
             user_id,
             settings=self.settings,
             scene="group" if kind == "group" else "c2c",
+            group_id=target if kind == "group" else "",
+            speaker_name=speaker,
+            is_handler=True,
         )
         print(f"[{self.settings.persona.name}] {reply}")
         self.send(kind, target, reply, msg_id)

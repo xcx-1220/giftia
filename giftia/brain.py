@@ -83,6 +83,14 @@ class Giftia:
         self.last_scene = "c2c"
         self.last_dream: Dream | None = None
         self.last_occasions: list[Occasion] = []
+        # 谁在说话 / 在哪儿说 —— 决定她此刻能想起什么（隐私的闸门）
+        self.scope_key = "m"                     # m=搭档 / p<id>=某人私聊 / g<id>=某个群
+        self.memory_view: list[tuple[str, str]] = [("private", "")]
+        self.memory_scope: tuple[str, str] = ("private", "")
+        self.speaker_id = ""
+        self.speaker_name = ""
+        self.group_id = ""
+        self.is_handler = True
 
     # ── 称呼与「认得的人」────────────────────────────────
     # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
@@ -94,6 +102,9 @@ class Giftia:
     )
     # 名字后面必须是停顿/结尾/语气词，否则容易把整句话当成名字
     NAME_TAIL = re.compile(r"^([，。！？、,.!?\s]|$|[吧啊哦呀呢就了])")
+    # 出现这些词才值得让模型再判一次（「我是小雨」这种歧义句式只有模型分得清）
+    NAME_MARKERS = ("我叫", "叫我", "我的名字", "名字叫", "我是")
+    NOT_A_NAME = set("?？!！。，,、的了吗呢啊吧是不我你他她它们个这那些什么怎么")
     # 含这些字的候选不是名字
     NOT_A_NAME = "的了是吗吧呢么你我他她它来去个事问说想要能会有在别不"
 
@@ -151,11 +162,12 @@ class Giftia:
         return True
 
     def learn_name(self, text: str, user_id: str, *, owner: bool) -> str:
-        """从自我介绍里学名字。保守：只认「我叫X」「叫我X」，且 X 要像个名字。
+        """从自我介绍里学名字。
 
-        宁可漏，不可错——所以「我是……」这种歧义句式不认，
-        「别叫我X」这种否定句也跳过（那是在否掉旧称呼，不是在自我介绍）。
-        真模型那条路（整理记忆时返回 preferred_name）是更强的手段，两者互补。
+        两层：先走保守的正则（只认「我叫X」「叫我X」，宁可漏不可错），
+        没认出来才让模型再判一次——「我是小雨」和「我是来问你个事的」
+        句式一模一样，只有模型分得清。
+        「别叫我X」这种否定句两层都会跳过（那是在否掉旧称呼，不是自我介绍）。
         """
         text = text or ""
         for pattern in self.INTRO_PATTERNS:
@@ -178,6 +190,25 @@ class Giftia:
                 if self.remember_person(user_id, candidate):
                     self.notices.append(f"[认得] 她记住了群里有人叫「{candidate}」")
                 return candidate
+
+        # 正则没认出来 → 让模型再判一次。只在这种短句且带自我介绍的标志词时才多花一次调用。
+        # 「我是小雨」和「我是来问你个事的」长得一样，只有模型分得清。
+        if len(text) <= 30 and any(m in text for m in self.NAME_MARKERS):
+            name = ""
+            try:
+                name = self.llm.extract_self_name(text) if self.llm else ""
+            except Exception:
+                name = ""
+            name = (name or "").strip()
+            if name and 1 < len(name) <= 16:
+                if owner:
+                    if name != self.handler_name:
+                        self.store.state_set("handler_name", name)
+                        self.notices.append(f"[称呼] 她自己学会了：以后叫你「{name}」")
+                    return name
+                if self.remember_person(user_id, name):
+                    self.notices.append(f"[认得] 她记住了有人叫「{name}」")
+                return name
         return ""
 
     def _people_for_prompt(self) -> list[tuple[str, bool]]:
@@ -198,7 +229,21 @@ class Giftia:
 
     @property
     def session_id(self) -> str:
-        return f"i{self.instance_no}-{self.clock.now().strftime('%Y%m%d')}"
+        """当前会话 id。
+
+        按"跟谁 / 在哪个群"分开（scope_key），再按天轮换——每天等于睡一觉，
+        第二天的工作记忆是空的，但长期记忆照旧。
+        """
+        return f"i{self.instance_no}-{self.scope_key}-{self.clock.now().strftime('%Y%m%d')}"
+
+    @property
+    def history_prefix(self) -> str:
+        """这个会话的所有历史（跨天）。她"往上翻聊天记录"就是查这个前缀。"""
+        return f"i{self.instance_no}-{self.scope_key}-"
+
+    def history(self, limit: int = 40) -> list[dict]:
+        """最近的聊天记录（跨天，含她自己的回复）——和她在 QQ 里看到的视角一致。"""
+        return self.store.messages_by_prefix(self.history_prefix, limit)
 
     @property
     def is_mock(self) -> bool:
@@ -208,13 +253,28 @@ class Giftia:
         return self.lifespan.status()
 
     # ── 主入口（平台无关）─────────────────────────────────
-    def handle(self, text: str, user_id: str | None = None, scene: str = "c2c") -> str:
+    def handle(
+        self,
+        text: str,
+        user_id: str | None = None,
+        scene: str = "c2c",
+        *,
+        group_id: str = "",
+        speaker_name: str = "",
+        is_handler: bool | None = None,
+        log_only: bool = False,
+    ) -> str:
         """平台无关入口。
 
         scene：
-          c2c   —— 私下（默认）
-          group —— 群里被点名：有记忆有关系，但多一段隐私约束
-          guest —— 群里的其他人：**不检索、不落库、不推进关系**，只是礼貌回一句
+          c2c   —— 私下
+          group —— 群里（多一段隐私约束）
+          guest —— 同 group，语义上强调"不是搭档"（兼容旧调用）
+
+        group_id / speaker_name：群里分清"谁在哪个群说的"，隐私分区靠它。
+        is_handler：说话的人是不是搭档。None = 自己判断（绑过就按绑定判，
+                    没绑过则私聊算、群里不算）。
+        log_only：只把这句话记进聊天记录、不回复（群里全量模式下的"旁听"）。
         """
         self.notices = []
         self.last_scene = scene if scene in ("c2c", "group", "guest") else "c2c"
@@ -222,19 +282,50 @@ class Giftia:
         if not text:
             return ""
 
-        if self.last_scene == "guest":
-            # 先看他有没有自我介绍（她认人靠这个）
-            if user_id:
-                self.learn_name(text, user_id, owner=False)
-            return self._guest_reply(text)
+        uid = user_id or "handler"
+        owner = self.handler_id
+        if is_handler is None:
+            is_handler = (uid == owner) if owner else (self.last_scene != "group")
+        self.is_handler = bool(is_handler)
+        self.speaker_id = uid
+        self.speaker_name = speaker_name or self.known_people().get(uid, "")
+        self.group_id = group_id
 
-        # 学名字。约定：能走到这里的 c2c/group 消息都是**搭档本人**说的
-        # （群里其他人由适配器走 guest 分支）。所以 user_id 为空也要学 ——
-        # 本地 CLI 就是这么调的，否则"我叫小林"在命令行里永远不会被记住。
-        self.learn_name(text, user_id or "handler", owner=True)
+        # ★ 隐私的闸门：谁在说话，决定她此刻能想起谁的事。
+        #   群里 → 只有"这个群里公开发生过的事"（别人的私聊记忆根本查不出来）
+        #   搭档 → 你的私事 + 你自己 + 所有群
+        #   别人私聊 → 只有"他和她之间"的事
+        if self.last_scene in ("group", "guest") and group_id:
+            self.scope_key = f"g{group_id[:12]}"
+            self.memory_view = [("group", group_id)]
+            self.memory_scope = ("group", group_id)
+        elif self.is_handler:
+            self.scope_key = "m"
+            self.memory_view = [("private", ""), ("person", uid), ("group", "*")]
+            self.memory_scope = ("private", "")
+        else:
+            self.scope_key = f"p{uid[:12]}"
+            self.memory_view = [("person", uid)]
+            self.memory_scope = ("person", uid)
 
-        # 到期：先让她说完最后一句，再走回收流程
-        if self.lifespan.is_expired():
+        # 学名字：谁都可以自我介绍（搭档、群友、私聊来的客人）
+        self.learn_name(text, uid, owner=self.is_handler)
+
+        if log_only:
+            # 旁听：记下这句话就走（不进检索、不回复、不推进任何东西）
+            self.store.add_message(
+                self.session_id,
+                self.instance_no,
+                "user",
+                text,
+                self.clock.iso(),
+                self.speaker_id,
+                self.speaker_name,
+            )
+            return ""
+
+        # 到期回收只跟搭档有关（别人说话不该触发她的回收流程）
+        if self.is_handler and self.lifespan.is_expired():
             try:
                 last_words = self._chat(text)
             except LLMError:
@@ -243,33 +334,11 @@ class Giftia:
             return f"{last_words}\n\n{self.run_recycle('寿命结束')}"
 
         reply = self._chat(text)
-        self._post_turn()
+        if self.is_handler:
+            self._post_turn()
+        else:
+            self.consolidate()
         return reply
-
-    def _guest_reply(self, text: str) -> str:
-        """访客模式：搭档以外的人在群里跟她说话。
-
-        刻意**不**检索记忆、不写消息、不推进关系与心情：
-        客人碰不到你们之间的隐私，也不会替你刷亲密度。
-        """
-        system = build_system_prompt(
-            self.settings,
-            self.status(),
-            [],
-            now=self.clock.now(),
-            bond=None,
-            mood=None,
-            handler_name=self.handler_name,
-            scene="guest",
-            people=self._people_for_prompt(),
-        )
-        try:
-            return self.llm.chat(
-                [{"role": "system", "content": system}, {"role": "user", "content": text}]
-            )
-        except LLMError as exc:
-            self.notices.append(f"[模型请求失败] {exc}")
-            return "……（她朝你点了点头，没有多说什么。）"
 
     # ── 一次对话 ──────────────────────────────────────────
     def current_bond(self, now=None) -> Bond:
@@ -310,7 +379,8 @@ class Giftia:
             self.session_id, self.settings.memory.session_window
         )
         query = self._recall_query(recent, text)
-        memories = self.store.active_memories(self.instance_no)
+        # ★ 只在她"此刻能看到"的记忆里检索 —— 群聊时检索不到别人私聊的内容
+        memories = self.store.active_memories(self.instance_no, view=self.memory_view)
         recalled = recall(query, memories, life.stage, self.settings.memory, now)
 
         # 检索太弱时才多花一次调用去改写查询（常见情况下不增加延迟）
@@ -347,6 +417,10 @@ class Giftia:
         self.last_dream = latest_untold(
             self.settings, self.store, self.clock, self.instance_no
         )
+        # ★ 梦只用"你的事"做梦，而且只在私聊里讲得出来。
+        #   否则她在群里讲梦 = 当众说出你的私事（真机测试抓到过这条泄漏）。
+        if not (self.is_handler and self.last_scene == "c2c"):
+            self.last_dream = None
 
         system = build_system_prompt(
             self.settings,
@@ -360,6 +434,9 @@ class Giftia:
             people=self._people_for_prompt(),
             occasions=self.last_occasions,
             dream=self.last_dream,
+            speaker_name=self.speaker_name,
+            is_handler=self.is_handler,
+            group_chat=self._render_group_chat() if self.group_id else "",
         )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))
@@ -387,11 +464,14 @@ class Giftia:
 
     def _chat(self, text: str) -> str:
         now = self.clock.now()
-        # 只有真的说话才推进关系与心情（预览 /prompt 不会）
-        self._tick_inner(text, now)
+        # 只有跟搭档说话才推进关系与心情 —— 别人刷不动你们的亲密度
+        # （但记忆照记：这一轮说的话一样会被整理成属于他们的记忆）
+        if self.is_handler:
+            self._tick_inner(text, now)
         messages, recalled = self._prepare(text)
         # 做梦放在回复之后：这一场梦下次说话时再讲，免得"刚做完就讲"
-        self._maybe_dream(now)
+        if self.is_handler:
+            self._maybe_dream(now)
         self.last_recalled = recalled
         if recalled:
             # 被塞进提示词 ≠ 被想起。这里只记账，强化要等她真的说出口。
@@ -400,7 +480,13 @@ class Giftia:
             )
 
         self.store.add_message(
-            self.session_id, self.instance_no, "user", text, self.clock.iso(now)
+            self.session_id,
+            self.instance_no,
+            "user",
+            text,
+            self.clock.iso(now),
+            self.speaker_id,
+            self.speaker_name,
         )
         try:
             reply = self.llm.chat(messages)
@@ -430,11 +516,20 @@ class Giftia:
 
     # ── 做梦 ──────────────────────────────────────────────
     def _maybe_dream(self, now) -> None:
-        """闲置够了就做一场梦。这一场下次说话时才会讲出来。"""
+        """闲置够了就做一场梦。这一场下次说话时才会讲出来。
+
+        只有跟搭档的对话才会触发做梦（别人来找她不会让她做梦），
+        而且梦的素材只取"你的事"。
+        """
         if not should_dream(self.settings, self.store, self.clock, self.instance_no):
             return
         dream = make_dream(
-            self.settings, self.store, self.clock, self.llm, self.instance_no
+            self.settings,
+            self.store,
+            self.clock,
+            self.llm,
+            self.instance_no,
+            view=[("private", ""), ("person", self.handler_id or "handler")],
         )
         if dream is not None:
             self.notices.append("[做梦] 她睡着的时候做了一个梦（下次说话可能会讲）")
@@ -557,19 +652,54 @@ class Giftia:
         user_lines = [m["content"] for m in recent if m["role"] == "user"][-2:]
         return " ".join([*user_lines, text])
 
+    def _render_group_chat(self, limit: int = 18, per_line: int = 90) -> str:
+        """群里最近的聊天记录（含没点到她的话）。
+
+        这就是"像正常 QQ 用户一样往上翻聊天记录"：全量模式开着时，
+        群里的每一条都在这里；没开的时候，只有点到她的那些。
+        """
+        rows = self.history(limit)
+        lines: list[str] = []
+        for m in rows:
+            content = " ".join(str(m["content"]).split())
+            if not content:
+                continue
+            if len(content) > per_line:
+                content = content[:per_line] + "…"
+            if m["role"] == "assistant":
+                lines.append(f"{self.settings.persona.name}：{content}")
+            else:
+                who = str(m.get("speaker_name") or "") or self.known_people().get(
+                    str(m.get("speaker_id") or ""), ""
+                )
+                lines.append(f"{who or '某人'}：{content}")
+        return "\n".join(lines)
+
     def _window(self, recent: list[dict]) -> list[dict]:
-        """工作记忆：按字符预算从最旧的开始丢。"""
+        """工作记忆：按字符预算从最旧的开始丢。
+
+        群聊里给每句话带上说话人（"阿伟：……"）——否则她分不清谁说了什么，
+        而"分清谁是谁"正是群聊里最重要的事。
+        """
         budget = self.settings.memory.session_char_budget
+        is_group = self.last_scene in ("group", "guest")
         picked: list[dict] = []
         total = 0
         for m in reversed(recent):
-            cost = len(str(m["content"]))
+            content = str(m["content"])
+            if is_group and m["role"] == "user":
+                who = str(m.get("speaker_name") or "") or self.known_people().get(
+                    str(m.get("speaker_id") or ""), ""
+                )
+                if who:
+                    content = f"{who}：{content}"
+            cost = len(content)
             if picked and total + cost > budget:
                 break
-            picked.append(m)
+            picked.append({"role": m["role"], "content": content})
             total += cost
         picked.reverse()
-        return [{"role": m["role"], "content": m["content"]} for m in picked]
+        return picked
 
     # ── 每轮之后 ──────────────────────────────────────────
     def _post_turn(self) -> None:
@@ -595,6 +725,7 @@ class Giftia:
             self.notices.append(f"[称呼] 她记住了：以后叫你「{name[:16]}」")
 
     def consolidate(self, force: bool = False) -> int:
+        scope, subject = self.memory_scope
         return consolidate(
             self.store,
             self.llm,
@@ -602,7 +733,11 @@ class Giftia:
             session_id=self.session_id,
             now_iso=self.clock.iso(),
             force=force,
-            on_draft=self._on_draft,
+            scope=scope,
+            subject_id=subject,
+            speaker_id=self.speaker_id if scope != "private" else "",
+            # 只有跟搭档的对话才推进关系、才能改她的称呼
+            on_draft=self._on_draft if self.is_handler else None,
         )
 
     # ── 回收 ──────────────────────────────────────────────
@@ -856,13 +991,30 @@ def handle_message(
     *,
     settings: Settings | None = None,
     scene: str = "c2c",
+    group_id: str = "",
+    speaker_name: str = "",
+    is_handler: bool | None = None,
+    log_only: bool = False,
 ) -> str:
     """一行代码接入任何平台：
 
         from giftia.brain import handle_message
-        reply = handle_message(群里收到的文本, user_id=发送者openid, scene="group")
+        reply = handle_message(群里收到的文本, user_id=发送者openid, scene="group",
+                               group_id=群openid, speaker_name=昵称)
+
+    group_id / speaker_name 决定这条记忆"归谁"——**群里必须传**，
+    否则她分不清谁在哪个群说了什么，隐私分区也会失效。
+    log_only=True 表示旁听（全量群消息里没点到她的那些）：只记不答。
     """
-    return get_default(settings).handle(text, user_id, scene=scene)
+    return get_default(settings).handle(
+        text,
+        user_id,
+        scene=scene,
+        group_id=group_id,
+        speaker_name=speaker_name,
+        is_handler=is_handler,
+        log_only=log_only,
+    )
 
 def current() -> Giftia | None:
     return _default

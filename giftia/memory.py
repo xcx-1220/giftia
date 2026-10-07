@@ -398,15 +398,41 @@ def mark_cited(
 
 
 def build_transcript(messages: list[dict], persona_name: str) -> str:
+    """把一段对话拼成给模型看的稿子。
+
+    群聊里每句话带说话人（"阿伟：……"），整理出来的记忆才会写对"是谁的事"；
+    私聊里保持原来的"搭档"，不改她已有的记忆语气。
+    """
     lines = []
     for m in messages:
-        who = "搭档" if m["role"] == "user" else persona_name
+        if m["role"] == "user":
+            who = str(m.get("speaker_name") or "").strip() or "搭档"
+        else:
+            who = persona_name
         lines.append(f"{who}：{str(m['content']).strip()}")
     return "\n".join(lines)
 
 
-def load_pending(store: Store, instance_no: int) -> list[dict]:
-    return store.open_messages(instance_no, store.meta_get_int("last_consolidated_msg_id", 0))
+def load_pending(
+    store: Store, instance_no: int, session_id: str | None = None
+) -> list[dict]:
+    """还没被整理成记忆的消息。
+
+    按会话分开整理：群里聊的和私聊的要存成不同归属的记忆，
+    否则"阿伟在群里说的话"会被写成"搭档的事"。
+    """
+    if session_id is None:
+        return store.open_messages(
+            instance_no, store.meta_get_int("last_consolidated_msg_id", 0)
+        )
+    key = f"last_consolidated:{session_id}"
+    cursor = store.meta_get_int(key, -1)
+    if cursor < 0:
+        # 第一次为这个会话建游标：从全局游标接上，
+        # 免得升级之后把历史消息重新整理一遍、记忆翻倍。
+        cursor = store.meta_get_int("last_consolidated_msg_id", 0)
+        store.meta_set(key, cursor)
+    return store.open_messages(instance_no, cursor, session_id=session_id)
 
 
 def consolidate(
@@ -417,15 +443,21 @@ def consolidate(
     session_id: str,
     now_iso: str,
     force: bool = False,
+    scope: str = "private",
+    subject_id: str = "",
+    speaker_id: str = "",
     on_draft=None,
 ) -> int:
     """把未整理的对话压成记忆条目。返回新增条数。
+
+    scope / subject_id 决定这条记忆**属于谁**（见 store._view_clause）：
+    私聊的记忆不会被群聊检索到，这是整个多人场景的隐私基础。
 
     on_draft(draft) 会在每条记忆写入后回调 —— 关系系统用它来给
     "记住了一件关于他本人的事"加分，称呼系统用它来发现"他要求改口"。
     """
     instance_no = store.meta_get_int("instance_no", 1)
-    pending = load_pending(store, instance_no)
+    pending = load_pending(store, instance_no, session_id)
     if not pending:
         return 0
     if not force and len(pending) < settings.memory.consolidate_every:
@@ -468,6 +500,9 @@ def consolidate(
             layer=layer,
             strength=initial_strength(d.importance, d.emotion),
             event_date=d.event_date,
+            scope=scope,
+            subject_id=subject_id,
+            speaker_id=speaker_id,
         )
         added += 1
         if on_draft is not None:
@@ -478,7 +513,8 @@ def consolidate(
 
     ids = [m["id"] for m in pending]
     store.mark_consolidated(ids)
-    store.meta_set("last_consolidated_msg_id", ids[-1])
+    store.meta_set(f"last_consolidated:{session_id}", ids[-1])
+    store.meta_set("last_consolidated_msg_id", max(ids[-1], store.meta_get_int("last_consolidated_msg_id", 0)))
     return added
 
 

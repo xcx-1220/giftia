@@ -47,7 +47,15 @@ CREATE TABLE IF NOT EXISTS memories (
     last_recalled_at TEXT,
     injected_at      TEXT,
     -- 「他的大日子」：他说过的将来某一天（考试/面试/生日/约定），到那天她会记得
-    event_date       TEXT
+    event_date       TEXT,
+    -- 这条记忆属于谁：
+    --   private = 搭档的私事（只有你和她知道）
+    --   person  = 某个人的私聊（subject_id = 那个人的 openid）
+    --   group   = 某个群里公开发生的事（subject_id = group_openid）
+    scope            TEXT    NOT NULL DEFAULT 'private',
+    subject_id       TEXT    NOT NULL DEFAULT '',
+    -- 原话是谁说的（群里分清谁是谁）
+    speaker_id       TEXT    NOT NULL DEFAULT ''
 );
 
 -- 她做过的梦。梦不是记忆：不进检索、不参与退化，只在第二天讲给你听。
@@ -91,7 +99,14 @@ class Store:
             "last_recalled_at": "TEXT",
             "injected_at": "TEXT",
             "event_date": "TEXT",
-        }
+            "scope": "TEXT NOT NULL DEFAULT 'private'",
+            "subject_id": "TEXT NOT NULL DEFAULT ''",
+            "speaker_id": "TEXT NOT NULL DEFAULT ''",
+        },
+        "messages": {
+            "speaker_id": "TEXT NOT NULL DEFAULT ''",
+            "speaker_name": "TEXT NOT NULL DEFAULT ''",
+        },
     }
 
     def __init__(self, db_path: Path | str) -> None:
@@ -155,12 +170,19 @@ class Store:
 
     # ── messages ──────────────────────────────────────────
     def add_message(
-        self, session_id: str, instance_no: int, role: str, content: str, ts: str
+        self,
+        session_id: str,
+        instance_no: int,
+        role: str,
+        content: str,
+        ts: str,
+        speaker_id: str = "",
+        speaker_name: str = "",
     ) -> int:
         cur = self.conn.execute(
-            "INSERT INTO messages(session_id, instance_no, role, content, ts) "
-            "VALUES(?, ?, ?, ?, ?)",
-            (session_id, instance_no, role, content, ts),
+            "INSERT INTO messages(session_id, instance_no, role, content, ts, "
+            "speaker_id, speaker_name) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (session_id, instance_no, role, content, ts, speaker_id, speaker_name),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -172,12 +194,33 @@ class Store:
         )
         return list(reversed(rows))
 
-    def open_messages(self, instance_no: int, after_id: int = 0) -> list[dict[str, Any]]:
-        """还没被整理成记忆条目的消息。"""
+    def messages_by_prefix(self, prefix: str, limit: int = 40) -> list[dict[str, Any]]:
+        """按会话前缀取历史（跨天）。
+
+        session_id 形如 i1-gXXXX-20261007，前缀 i1-gXXXX- 就是"这个群的所有记录"——
+        她"往上翻聊天记录"查的就是它，和她在 QQ 里看到的视角一致。
+        """
+        safe = prefix.replace("%", "").replace("_", "")
+        rows = self._rows(
+            "SELECT * FROM messages WHERE session_id LIKE ? ORDER BY id DESC LIMIT ?",
+            (safe + "%", limit),
+        )
+        return list(reversed(rows))
+
+    def open_messages(
+        self, instance_no: int, after_id: int = 0, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """还没被整理成记忆条目的消息（按会话分开整理，别把别人的对话混进来）。"""
+        if session_id is None:
+            return self._rows(
+                "SELECT * FROM messages WHERE instance_no = ? AND consolidated = 0 AND id > ? "
+                "ORDER BY id ASC",
+                (instance_no, after_id),
+            )
         return self._rows(
-            "SELECT * FROM messages WHERE instance_no = ? AND consolidated = 0 AND id > ? "
-            "ORDER BY id ASC",
-            (instance_no, after_id),
+            "SELECT * FROM messages WHERE instance_no = ? AND session_id = ? "
+            "AND consolidated = 0 AND id > ? ORDER BY id ASC",
+            (instance_no, session_id, after_id),
         )
 
     def mark_consolidated(self, ids: list[int]) -> None:
@@ -239,11 +282,15 @@ class Store:
         layer: str = "normal",
         strength: float = 1.0,
         event_date: str = "",
+        scope: str = "private",
+        subject_id: str = "",
+        speaker_id: str = "",
     ) -> int:
         cur = self.conn.execute(
             "INSERT INTO memories(instance_no, created_ts, happened_ts, summary, tags, "
-            "emotion, importance, source_session, layer, strength, event_date) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "emotion, importance, source_session, layer, strength, event_date, "
+            "scope, subject_id, speaker_id) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 instance_no,
                 created_ts,
@@ -256,6 +303,9 @@ class Store:
                 layer,
                 float(strength),
                 event_date or None,
+                scope,
+                subject_id,
+                speaker_id,
             ),
         )
         self.conn.commit()
@@ -315,11 +365,45 @@ class Store:
         self.conn.execute("UPDATE memories SET layer = ? WHERE id = ?", (layer, memory_id))
         self.conn.commit()
 
-    def active_memories(self, instance_no: int) -> list[dict[str, Any]]:
-        """当前这一任的她能想起来的记忆（不含已封存的前任记忆）。"""
+    @staticmethod
+    def _view_clause(view: list[tuple[str, str]] | None) -> tuple[str, list]:
+        """"她此刻能想起哪些记忆" → SQL 片段。
+
+        view 是 [(scope, subject), ...]：
+          ("private", "")            搭档的私事
+          ("person", "<openid>")     某个人的私聊
+          ("group", "<group_openid>")某个群里公开发生的事（"*" = 所有群）
+        None = 不过滤（导出/自检用）；[] = 什么都不给看。
+        """
+        if view is None:
+            return "", []
+        if not view:
+            return " AND 0", []
+        parts: list[str] = []
+        args: list = []
+        for scope, subject in view:
+            if not subject or subject == "*":
+                parts.append("scope = ?")
+                args.append(scope)
+            else:
+                parts.append("(scope = ? AND subject_id = ?)")
+                args += [scope, subject]
+        return " AND (" + " OR ".join(parts) + ")", args
+
+    def active_memories(
+        self, instance_no: int, view: list[tuple[str, str]] | None = None
+    ) -> list[dict[str, Any]]:
+        """当前这一任的她能想起来的记忆（不含已封存的前任记忆）。
+
+        view 决定"此刻她能看到谁的事"——见 _view_clause。
+        这是隐私的闸门：群聊场景只给 group 视角，别人的私聊记忆根本查不出来。
+        """
+        extra, args = self._view_clause(view)
         return self._rows(
-            "SELECT * FROM memories WHERE instance_no = ? AND sealed = 0 ORDER BY id ASC",
-            (instance_no,),
+            "SELECT * FROM memories WHERE instance_no = ? AND sealed = 0"
+            + extra
+            + " ORDER BY id ASC",
+            (instance_no, *args),
         )
 
     def all_memories(self, instance_no: int | None = None) -> list[dict[str, Any]]:
@@ -341,6 +425,11 @@ class Store:
             "UPDATE memories SET sealed = 1 WHERE instance_no = ?", (instance_no,)
         )
         self.conn.commit()
+
+    # ── 群聊记录：就是 messages 表本身 ──────────────────────
+    # 群里每个人的话都以 role="user" 存进 session_id = "g:<group_openid>"，
+    # 她自己的回复是 role="assistant" —— 所以"往上翻聊天记录"就是
+    # recent_messages("g:<gid>")，和她在 QQ 里看到的视角一致（单一数据源，不另立一张表）。
 
     # ── diary ─────────────────────────────────────────────
     def add_diary(self, ts: str, content: str, kind: str = "handler", title: str = "") -> int:

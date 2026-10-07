@@ -87,8 +87,7 @@ MEMOIR_SYSTEM = """你是「终端服务」的记录员。Giftia 的寿命已经
 - 总长度 200～350 字。不要标题，不要列表符号，不要用引号。
 - 结尾必须以这句收束：她的记忆将被清除，而你会记得。"""
 
-DREAM_SYSTEM = """你是 Giftia 的睡眠整理模块（她本人看不到这段指令）。
-下面是她记忆里的一些碎片——它们已经被时间磨得残缺不全。
+DREAM_SYSTEM = """你是 Giftia 的睡眠整理模块（她本人看不到这段指令）。下面是她记忆里的一些碎片——它们已经被时间磨得残缺不全。
 
 请把这些碎片揉成**一场梦**，用她的第一人称写，40～90 字。
 
@@ -97,6 +96,16 @@ DREAM_SYSTEM = """你是 Giftia 的睡眠整理模块（她本人看不到这段
 - 只使用给出的碎片，不要引入新的人、地点或事件。
 - 不要解释"这是梦"，不要提到记忆、遗忘、系统、数据库。
 - 不要写"我梦见"开头，直接进入场景。结尾可以停在半句话上。"""
+
+NAME_SYSTEM = """判断下面这句话里，说话人是不是在**介绍自己的名字**。
+
+- 是自我介绍 → **只输出那个名字**（2～16 个字），不要标点、不要解释、不要加引号。
+- 只是描述身份或状态 → 输出 NONE。
+  例：「我是学生」「我是来问你个事的」「我是新来的」「我是说……」「我是那种人」都是 NONE。
+- 完全不是在说自己 → 输出 NONE。
+
+说话人可能在名字后面接着说别的（「我叫小林，今年二十八」），这种情况只输出名字。
+名字可以是昵称、网名、外号，允许很长的中二名字（照抄，不要概括）。"""
 
 
 class BaseLLM:
@@ -118,6 +127,14 @@ class BaseLLM:
     def write_dream(self, fragments: list[str], *, name: str = "Giftia") -> str:
         """把记忆碎片揉成一场梦。"""
         raise NotImplementedError
+
+    def extract_self_name(self, text: str) -> str:
+        """判断这句话是不是自我介绍；是就返回名字，不是就返回空串。
+
+        存在的理由：「我是小雨」和「我是来问你个事的」句式完全一样，
+        正则分不清，但这两者搞错的代价差很多（把"来问你个事"当成名字会很难看）。
+        """
+        return ""
 
     def rewrite_query(self, text: str) -> list[str]:
         """把一句话改写成 2～3 个检索查询。返回空列表 = 不改写。"""
@@ -246,6 +263,28 @@ class DeepSeekLLM(BaseLLM):
             temperature=1.0,
             max_tokens=300,
         )
+
+    def extract_self_name(self, text: str) -> str:
+        raw = self.chat(
+            [
+                {"role": "system", "content": NAME_SYSTEM},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+            max_tokens=40,
+        )
+        return clean_name(raw)
+
+
+def clean_name(raw: str) -> str:
+    """把模型返回的名字洗干净；NONE / 空 / 超长都当作"没认出来"。"""
+    name = str(raw or "").strip().strip("「」『』\"'“”‘’。，,.!?！？：: \n\t")
+    if not name or name.upper().startswith("NONE"):
+        return ""
+    name = name.splitlines()[0].strip()
+    if len(name) < 2 or len(name) > 16:
+        return ""
+    return name
 
 
 def infer_layer(importance: float, emotion: str = "") -> str:
@@ -422,6 +461,29 @@ class MockLLM(BaseLLM):
         if not cleaned:
             return ""
         return "梦里有" + "，还有".join(cleaned) + "。\n中间好像断过一次，接不上了。"
+
+    # 离线版的"这是不是自我介绍"：句式判定 + 停用词，够测试用。
+    _NAME_STOP = ("学生", "来问", "新来", "是说", "那种", "想", "要", "在", "个", "的")
+    _NAME_CUT = "，。！？,.!? \n\t今年月日岁数第"
+    # 名字不会以这些字开头（"我是说你别急" → "说你别急" 就该被否掉）
+    _NAME_HEAD = set("说别你我他她是想要来去有没有不在真太很就都也还这那什么")
+
+    def extract_self_name(self, text: str) -> str:
+        m = re.search(
+            r"我(?:的名字)?(?:叫|是)([\u4e00-\u9fa5A-Za-z0-9_·]{2,20})", str(text or "")
+        )
+        if not m:
+            return ""
+        name = m.group(1)
+        for ch in self._NAME_CUT:
+            name = name.split(ch)[0]
+        if len(name) < 2 or len(name) > 16:
+            return ""
+        if name[0] in self._NAME_HEAD:
+            return ""
+        if any(word in name for word in self._NAME_STOP):
+            return ""
+        return name
 
     def write_memoir(self, context: str) -> str:
         entries = [ln.strip("- ").strip() for ln in context.splitlines() if ln.strip().startswith("-")]

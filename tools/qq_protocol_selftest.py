@@ -235,6 +235,8 @@ def main() -> int:
         results["session_id"] = bot.session_id
         results["bot_name"] = bot.bot_name
         results["msg_count"] = len(rows)
+        results["sessions"] = {str(r["session_id"]) for r in rows}
+        results["speakers"] = [str(r.get("speaker_name") or "") for r in rows]
         results["memories"] = len(store.all_memories())
         results["assistant_text"] = next(
             (r["content"] for r in rows if r["role"] == "assistant"), ""
@@ -297,8 +299,13 @@ def main() -> int:
     user_texts = results.get("user_texts") or []
     check("群里的 <@!123456> 已被剥掉，她才不会对着符号说话",
           "我下周三要考驾照，有点紧张" in user_texts, str(user_texts))
-    check("陌生人的消息没有进她的记忆（消息数仍是 4）",
-          results.get("msg_count") == 4, str(results.get("msg_count")))
+    check("群友说的话记在他自己的会话里，没混进搭档的会话",
+          any("-g" in s for s in (results.get("sessions") or set()))
+          and all(
+              "-m-" in s or "-g" in s
+              for s in (results.get("sessions") or set())
+          ),
+          str(results.get("sessions")))
     check("陌生人被挡回，且挡回话术是戏内的",
           len(other) == 1 and str(other[0][2].get("content", "")).startswith("……"),
           str(other))
@@ -342,16 +349,19 @@ def main() -> int:
         "id": "L-1", "author": {"user_openid": "ME"}, "content": "我叫小林",
     })
     loud_hub = brain_mod.get_default(loud_settings)
-    before = loud_hub.store.count_messages(loud_hub.instance_no)
+    before_private = len(
+        loud_hub.store.active_memories(loud_hub.instance_no, view=[("private", "")])
+    )
     loud.handle_event(adapter.EVENT_GROUP_AT, {
         "id": "L-2", "author": {"user_openid": "FRIEND", "member_role": "member"},
         "group_openid": "G3", "content": "<@!1> 你好呀，我叫阿伟",
     })
     check("默认策略下，群里别人 @ 她会得到回复",
           len(loud_calls) == 2 and "抱歉" not in loud_calls[1][2], str([c[2] for c in loud_calls]))
-    check("客人说的话不进你们的记忆",
-          loud_hub.store.count_messages(loud_hub.instance_no) == before,
-          f"{before} → {loud_hub.store.count_messages(loud_hub.instance_no)}")
+    check("客人说的话不会变成「你们之间」的私事",
+          len(loud_hub.store.active_memories(loud_hub.instance_no, view=[("private", "")]))
+          == before_private,
+          str(before_private))
     check("她记住了客人的名字",
           loud_hub.known_people().get("FRIEND") == "阿伟",
           str(loud_hub.known_people()))
@@ -431,6 +441,87 @@ def main() -> int:
     check("关掉自动认主后仍然可以手动 /bind",
           strict.handle_command("c2c", "ME", "/bind", "ME", "AUTO-6"))
     check("手动 /bind 生效", strict_hub.handler_id == "ME", repr(strict_hub.handler_id))
+
+    brain_mod.reset_default()
+
+    print("\n7. 全量群消息：听得见每一句话，但只在被点名时才说话")
+    full_settings = dataclasses.replace(
+        load_settings(force_mock=True), root=Path(tempfile.mkdtemp(prefix="giftia-full-"))
+    )
+    full = adapter.QQBot("X", "Y", owner_openid="", settings=full_settings)
+    full_calls: list[tuple[str, str, str]] = []
+    full.send = lambda kind, target, text, msg_id: full_calls.append((kind, target, text))  # type: ignore[method-assign]
+    full.handle_event(adapter.EVENT_C2C, {
+        "id": "F-1", "author": {"user_openid": "ME", "username": "小林"}, "content": "你好",
+    })
+    full_hub = brain_mod.get_default(full_settings)
+
+    full.handle_event(adapter.EVENT_GROUP_MSG_RECEIVE, {
+        "group_openid": "GROUP-X", "op_member_openid": "ME", "timestamp": 1,
+    })
+    check("群里打开「接收所有消息」时她会收到通知",
+          int(full_hub.store.state_get("fullmode:GROUP-X", 0)) == 1)
+
+    before_full = len(full_calls)
+    full.handle_event(adapter.EVENT_GROUP_MESSAGE, {
+        "id": "F-2",
+        "author": {"user_openid": "F1", "username": "阿伟", "member_role": "member"},
+        "group_openid": "GROUP-X",
+        "content": "今天中午吃什么",
+    })
+    check("全量模式下，没点到她的话一个字都不回",
+          len(full_calls) == before_full, str(full_calls[-1:]))
+    log_rows = full_hub.store.messages_by_prefix(f"i{full_hub.instance_no}-g", 20)
+    check("但那句话进了她的聊天记录（这就是「往上翻」的来源）",
+          any("今天中午吃什么" in str(r["content"]) for r in log_rows),
+          str([r["content"][:12] for r in log_rows]))
+    check("聊天记录里标了是谁说的",
+          any(str(r.get("speaker_name")) == "阿伟" for r in log_rows),
+          str([r.get("speaker_name") for r in log_rows]))
+    check("平台的昵称直接进了花名册（群里没人喜欢每次都被问「你是哪位」）",
+          full_hub.known_people().get("F1") == "阿伟",
+          str(full_hub.known_people()))
+
+    full.handle_event(adapter.EVENT_GROUP_MESSAGE, {
+        "id": "F-3",
+        "author": {"user_openid": "F1", "username": "阿伟", "member_role": "member"},
+        "group_openid": "GROUP-X",
+        "content": "艾拉你说呢",
+        "mentions": [{"id": "BOT", "bot": True, "username": "艾拉"}],
+    })
+    check("全量模式下，@ 她的消息她会回",
+          len(full_calls) == before_full + 1, str(full_calls[-1:]))
+
+    full.handle_event(adapter.EVENT_GROUP_MESSAGE, {
+        "id": "F-4", "author": {"user_openid": "F2", "username": "小雨"},
+        "group_openid": "GROUP-X", "content": "在吗",
+    })
+    n_before = len(full_calls)
+    full.handle_event(adapter.EVENT_GROUP_MESSAGE, {
+        "id": "F-4", "author": {"user_openid": "F2", "username": "小雨"},
+        "group_openid": "GROUP-X", "content": "在吗",
+        "mentions": [{"id": "BOT", "bot": True}],
+    })
+    check("先去重只旁听过、随后按 @ 补推 → 她仍然会回（只挡真重复）",
+          len(full_calls) == n_before + 1, str(full_calls[-1:]))
+
+    forwarded = adapter.extract_content({
+        "content": "",
+        "message_type": 102,
+        "msg_elements": [
+            {"content": "=== 消息 1 ===\n[消息内容] 今天的学习计划已完成\n\n=== 消息 2 ==="}
+        ],
+    })
+    check("别人**转发聊天记录**给她时，她读得到里面的内容（message_type=102）",
+          "学习计划已完成" in forwarded, forwarded[:40])
+
+    quoted = adapter.extract_content({
+        "content": "他说的这句",
+        "message_type": 103,
+        "msg_elements": [{"content": "被引用的原话"}],
+    })
+    check("引用消息时，引用内容也一起读得到（message_type=103）",
+          "被引用的原话" in quoted and "他说的这句" in quoted, quoted)
 
     brain_mod.reset_default()
 

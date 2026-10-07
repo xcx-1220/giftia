@@ -556,13 +556,19 @@ def main() -> int:
     check("注入的称呼跟着变", "他叫「小林」" in renamed, renamed[:0] or "")
     check("学会称呼时给出提示", any("称呼" in n for n in nm.notices), str(nm.notices))
 
-    for bad in ("我是来问你个事的", "我叫小林今年二十八岁", "别叫我搭档了"):
+    for bad in ("我是来问你个事的", "别叫我搭档了", "我是学生", "我是说你别急"):
         probe = Giftia(
             make_settings(tmp / f"nb{abs(hash(bad)) % 9999}", 81920.0),
             llm=MockLLM(settings.model),
         )
         probe.handle(bad, user_id="u1")
         check(f"有歧义就不乱学：「{bad}」", probe.handler_name == "", probe.handler_name)
+
+    # 名字后面接着说别的，也应当只摘出名字（模型那层的价值就在这里）
+    mixed = Giftia(make_settings(tmp / "name_mixed", 81920.0), llm=MockLLM(settings.model))
+    mixed.handle("我叫小林今年二十八岁", user_id="u1")
+    check("「我叫小林今年二十八岁」只摘出「小林」", mixed.handler_name == "小林",
+          mixed.handler_name)
 
     nm2 = Giftia(make_settings(tmp / "name2", 81920.0), llm=NameLLM(settings.model))
     nm2.handle("以后叫我小林吧")
@@ -612,11 +618,19 @@ def main() -> int:
 
     before_msgs = pp.store.count_messages(pp.instance_no)
     before_aff = pp.current_bond().affinity
+    before_private = len(pp.store.active_memories(pp.instance_no, view=[("private", "")]))
     pp.handle("他最近怎么样呀，你们聊了什么", user_id="friend-1", scene="guest")
-    check("访客说话不写进你们的记忆",
-          pp.store.count_messages(pp.instance_no) == before_msgs,
-          f"{before_msgs} → {pp.store.count_messages(pp.instance_no)}")
+    check("访客说话不会变成「你们之间」的记忆",
+          len(pp.store.active_memories(pp.instance_no, view=[("private", "")])) == before_private,
+          f"{before_private} → {len(pp.store.active_memories(pp.instance_no, view=[('private', '')]))}")
     check("访客不会替你刷亲密度", pp.current_bond().affinity == before_aff)
+    check("但访客的话记在他和客人自己的会话里（下次他还接得上）",
+          pp.store.count_messages(pp.instance_no) > before_msgs
+          and any(
+              str(m["session_id"]).startswith(f"i{pp.instance_no}-p")
+              for m in pp.store.all_messages(pp.instance_no, limit=10)
+          ),
+          str([m["session_id"] for m in pp.store.all_messages(pp.instance_no, limit=10)]))
 
     guest_sys = build_system_prompt(
         pp.settings,
@@ -821,6 +835,108 @@ def main() -> int:
     check("「快到终端服务了」只在私聊说",
           near2.outreach_plan(force=True, for_group=True) is None
           and near2.outreach_plan(force=True) is not None)
+
+    # ══ 25. 多人记忆分区：谁的事归谁 ═══════════════════════════
+    print("\n25. 多人记忆分区（群聊 / 私聊 / 别人，各看各的）")
+    mv = Giftia(make_settings(tmp / "multi", 81920.0), llm=MockLLM(settings.model))
+    mv.set_handler_id("OWNER")
+    mv.handle("我叫小林", user_id="OWNER")
+    for summary, scope, subject, speaker in (
+        ("搭档下周三要考驾照，有点紧张", "private", "", ""),
+        ("阿伟说他最近在戒烟，很难受", "group", "G-1", "FRIEND"),
+        ("客人私聊说他养了一只叫团子的猫", "person", "FRIEND", "FRIEND"),
+    ):
+        mv.store.add_memory(
+            instance_no=mv.instance_no,
+            created_ts=mv.clock.iso(),
+            happened_ts=mv.clock.iso(),
+            summary=summary,
+            importance=0.7,
+            layer="important",
+            scope=scope,
+            subject_id=subject,
+            speaker_id=speaker,
+        )
+
+    owner_view = mv.store.active_memories(
+        mv.instance_no, view=[("private", ""), ("person", "OWNER"), ("group", "*")]
+    )
+    check("搭档能看到自己的私事", any("考驾照" in m["summary"] for m in owner_view))
+    check("搭档也知道群里发生过什么", any("戒烟" in m["summary"] for m in owner_view))
+
+    group_view = mv.store.active_memories(mv.instance_no, view=[("group", "G-1")])
+    check("群里能看到群里说过的话", any("戒烟" in m["summary"] for m in group_view))
+    check("★ 群里看不到搭档的私事", not any("考驾照" in m["summary"] for m in group_view))
+    check("群里看不到别人私下说的话", not any("团子" in m["summary"] for m in group_view))
+    check("另一个群的事也不会串进来",
+          mv.store.active_memories(mv.instance_no, view=[("group", "G-2")]) == [])
+
+    friend_view = mv.store.active_memories(mv.instance_no, view=[("person", "FRIEND")])
+    check("别人私聊时只看到他和她之间的事", any("团子" in m["summary"] for m in friend_view))
+    check("别人私聊看不到搭档的私事", not any("考驾照" in m["summary"] for m in friend_view))
+
+    # 提示词层面：群里根本检索不出来
+    mv.handle("考驾照", user_id="OWNER", scene="group", group_id="G-1", speaker_name="小林")
+    grp_prompt = mv._prepare("下周三要做什么")[0][0]["content"]
+    probe = grp_prompt.find("下周三")
+    where = ""
+    if probe >= 0:
+        head = grp_prompt.rfind("【", 0, probe)
+        where = grp_prompt[head : probe + 12].replace("\n", "⏎")
+    check("★ 群聊的提示词里检索不到搭档的私事（那条只有私聊能看到）",
+          probe < 0, f"出现在：{where!r}")
+
+    mv.handle("你好呀", user_id="FRIEND", scene="group", group_id="G-1", speaker_name="阿伟")
+    friend_prompt = mv._prepare("你好呀")[0][0]["content"]
+    check("群里别人说话时，明确告诉她「这是谁」", "现在跟你说话的是谁" in friend_prompt)
+    check("并且强调「不是你的搭档」", "不是你的搭档" in friend_prompt)
+    check("群聊记录被注入（没点到她的话也听得见）",
+          "【群里刚才在聊什么】" in friend_prompt)
+    check("群聊里每句话带说话人，她才分得清谁是谁", "阿伟：" in friend_prompt)
+
+    # 全量模式旁听：只记不答
+    before_log = mv.store.count_messages(mv.instance_no)
+    silent = mv.handle(
+        "今天天气不错", user_id="OTHER", scene="group", group_id="G-1",
+        speaker_name="路人", log_only=True,
+    )
+    check("全量模式的旁听：记下来但一个字都不回",
+          silent == "" and mv.store.count_messages(mv.instance_no) == before_log + 1,
+          f"{silent!r} / {before_log} → {mv.store.count_messages(mv.instance_no)}")
+    check("旁听的记录标了是谁说的",
+          str(mv.store.all_messages(mv.instance_no, limit=1)[0]["speaker_name"]) == "路人")
+
+    # 会话分区 + 跨天历史
+    sessions = {
+        str(m["session_id"]).rsplit("-", 1)[0]
+        for m in mv.store.all_messages(mv.instance_no, limit=60)
+    }
+    check("私聊和群聊在不同会话里（工作记忆不会串）",
+          any(s.endswith("-m") for s in sessions) and any("-g" in s for s in sessions),
+          str(sessions))
+
+    mv.clock.advance(24 * 2)
+    hist = mv.history(limit=50)
+    check("聊天记录跨天保留（像往上翻聊天记录）", len(hist) >= 3, f"{len(hist)} 条")
+    check("翻到的记录里能看出谁说了什么",
+          any(str(m.get("speaker_name")) == "阿伟" for m in hist),
+          str([(m["role"], m.get("speaker_name")) for m in hist]))
+
+    # ══ 26. 群里的名字：谁都可以自我介绍 ═══════════════════════
+    print("\n26. 群里认人：名字与人对得上")
+    nm2 = Giftia(make_settings(tmp / "names", 81920.0), llm=MockLLM(settings.model))
+    nm2.set_handler_id("OWNER")
+    nm2.handle("我叫小林", user_id="OWNER")
+    nm2.handle("我叫阿伟", user_id="F1", scene="group", group_id="G-1", speaker_name="阿伟")
+    nm2.handle("我是小雨", user_id="F2", scene="group", group_id="G-1", speaker_name="小雨")
+    people = nm2.known_people()
+    check("群里两个人自我介绍都被记住", people.get("F1") == "阿伟" and people.get("F2") == "小雨",
+          str(people))
+    check("搭档的称呼不会被群友顶掉", nm2.handler_name == "小林", nm2.handler_name)
+    nm2.handle("你好", user_id="F1", scene="group", group_id="G-1", speaker_name="阿伟")
+    p2 = nm2._prepare("你好")[0][0]["content"]
+    check("她能把名字和人对上号（下一个说话的人）", "阿伟" in p2)
+    check("花名册里也标出了搭档", "小林（你的搭档）" in p2)
 
     brain.store.close()
     brain2.store.close()

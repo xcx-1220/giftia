@@ -58,10 +58,22 @@ def should_dream(settings: Settings, store: Store, clock: Clock, instance_no: in
 
 
 def make_dream(
-    settings: Settings, store: Store, clock: Clock, llm: BaseLLM, instance_no: int
+    settings: Settings,
+    store: Store,
+    clock: Clock,
+    llm: BaseLLM,
+    instance_no: int,
+    view: list[tuple[str, str]] | None = None,
 ) -> Dream | None:
-    """把最近的记忆碎片揉成一场梦。失败就返回 None（做梦不该影响正常对话）。"""
-    memories = store.active_memories(instance_no)
+    """把最近的记忆碎片揉成一场梦。失败就返回 None（做梦不该影响正常对话）。
+
+    view 决定"拿谁的事做梦"。默认只拿搭档的（private + 他本人的私聊）——
+    梦是她内心的东西，别人的私事不该进她的梦，
+    否则她在群里讲梦就等于把别人的私事当众说了出去（真机测试抓到过这条）。
+    """
+    if view is None:
+        view = [("private", ""), ("person", str(store.state_get("handler_id", "") or ""))]
+    memories = store.active_memories(instance_no, view=view)
     if len(memories) < settings.dream.min_memories:
         return None
 

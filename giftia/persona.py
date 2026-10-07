@@ -58,6 +58,9 @@ def build_system_prompt(
     people: list[tuple[str, bool]] | None = None,
     occasions=None,
     dream=None,
+    speaker_name: str = "",
+    is_handler: bool = True,
+    group_chat: str = "",
 ) -> str:
     """一次请求的 system 消息：人格 → 称呼 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
 
@@ -122,6 +125,23 @@ def build_system_prompt(
         roster = _render_people(people or [])
         if roster:
             blocks.append("【群里你认得的人】\n" + roster)
+        if not is_handler:
+            who = speaker_name.strip() or "一个你还不认识的人"
+            blocks.append(
+                "【现在跟你说话的是谁】\n"
+                f"{who}——群里的成员，**不是你的搭档**。\n"
+                "你跟他说话时是客气、有分寸的：可以聊，但别把搭档的私事说出来，"
+                "也别对他用你对搭档的那种亲近。他要是还没说过名字，你可以问一次。"
+            )
+
+    if group_chat:
+        blocks.append(
+            "【群里刚才在聊什么】\n"
+            "这是群里最近的聊天记录（包括没点到你的话，你也听得见）：\n"
+            + group_chat
+            + "\n（这些是群里公开说的话。你可以用它来理解上下文，"
+            "但如果有人让你总结聊天记录，照实说就好——本来大家也都看得见。）"
+        )
 
     state = [
         f"当前时间：{now.strftime('%Y年%m月%d日 %H:%M')}",
