@@ -417,8 +417,13 @@ def consolidate(
     session_id: str,
     now_iso: str,
     force: bool = False,
+    on_added=None,
 ) -> int:
-    """把未整理的对话压成记忆条目。返回新增条数。"""
+    """把未整理的对话压成记忆条目。返回新增条数。
+
+    on_added(layer, importance) 会在每条记忆写入后回调 —— 关系系统用它来
+    给"记住了一件关于他本人的事"加分。
+    """
     instance_no = store.meta_get_int("instance_no", 1)
     pending = load_pending(store, instance_no)
     if not pending:
@@ -462,6 +467,11 @@ def consolidate(
             strength=initial_strength(d.importance, d.emotion),
         )
         added += 1
+        if on_added is not None:
+            try:
+                on_added(layer, float(d.importance))
+            except Exception:
+                pass  # 关系加成失败不该影响记忆落库
 
     ids = [m["id"] for m in pending]
     store.mark_consolidated(ids)

@@ -95,6 +95,7 @@ def perform_recycle(
     *,
     reason: str = "寿命结束",
     quiet: bool = False,
+    extra_context: str = "",
 ) -> RecycleReport:
     life = lifespan.status()
     instance_no = life.instance_no
@@ -111,6 +112,8 @@ def perform_recycle(
 
     # 1) 回忆录
     context = _memoir_context(stats, memories, settings.persona.name)
+    if extra_context.strip():
+        context = extra_context.strip() + "\n\n" + context
     try:
         memoir = llm.write_memoir(context)
     except Exception:
@@ -133,6 +136,11 @@ def perform_recycle(
         f"- 服务时长：{stats['service_hours']:.1f} 小时",
         f"- 事由：{reason}",
         f"- 封存记忆：{len(memories)} 条",
+    ]
+    if extra_context.strip():
+        # 关系状态作为**事实**写进档案，而不是只丢给模型自由发挥
+        body += ["", "## 关系", "", extra_context.strip()]
+    body += [
         "",
         "## 回忆录",
         "",

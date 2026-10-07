@@ -23,6 +23,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+from giftia.bond import stage_for  # noqa: E402
 from giftia.brain import FAILURE_LINES, Giftia  # noqa: E402
 from giftia.config import Settings, load_settings  # noqa: E402
 from giftia.llm import LLMError, MockLLM  # noqa: E402
@@ -367,6 +368,121 @@ def main() -> int:
           "SYSTEM（人格与状态）" in preview and "Giftia 型拟人智能体" in preview)
     check("预览不会写库（不污染记忆）", inj.store.count_messages(1) == 2,
           str(inj.store.count_messages(1)))
+
+    # ══ 17. 关系演进 ═══════════════════════════════════════════
+    print("\n17. 关系：不可刷，且升级要「亲密度 + 认识天数」两条腿")
+    # 注意寿命要给足：100 小时撑不到"认识三个月"，用出厂设定 81920 小时
+    rel = Giftia(make_settings(tmp / "bond", 81920.0), llm=MockLLM(settings.model))
+    b0 = rel.current_bond()
+    check("初始是「刚认识」", b0.stage.key == "stranger", b0.stage.label)
+    check("初始亲密度为 0", b0.affinity == 0.0, str(b0.affinity))
+
+    for _ in range(5):
+        rel.handle("在吗")
+    b1 = rel.current_bond()
+    check("同一天狂发消息只结算一次（不可刷）",
+          abs(b1.affinity - settings.relationship.gain_daily) < 1e-6, f"{b1.affinity:.3f}")
+    check("交流天数记为 1 天", b1.interactions == 1, str(b1.interactions))
+
+    rel.clock.advance(24)
+    rel.handle("今天还行")
+    b2 = rel.current_bond()
+    check("第二天再聊会继续涨", b2.affinity > b1.affinity, f"{b1.affinity:.2f} → {b2.affinity:.2f}")
+    check("亲密度不够时不会提前升级", b2.stage.key == "stranger", b2.stage.label)
+
+    # 只过时间不说话：天数够了，亲密度不够
+    rel.clock.advance(24 * 60)
+    b3 = rel.current_bond()
+    check("只过时间不说话：认识 60 天也升不了级",
+          b3.days_known >= 60 and b3.stage.key == "stranger",
+          f"{b3.days_known:.0f} 天 / 亲密度 {b3.affinity:.1f}")
+
+    seen_notice = False
+    for _ in range(30):
+        rel.clock.advance(24)
+        rel.handle("嗯，今天也还行")
+        seen_notice = seen_notice or any(n.startswith("[关系]") for n in rel.notices)
+    b4 = rel.current_bond()
+    check("持续相处后亲密度上来了", b4.affinity >= 40, f"{b4.affinity:.1f}")
+    check("两条腿都够了才升到「熟悉」（或更高）",
+          b4.stage.key in ("familiar", "close", "irreplaceable"), b4.stage.label)
+    check("升级时她会主动提示", seen_notice)
+
+    # 直接验证判定规则本身（这是"认识三个月"那句需求的落点）
+    check("亲密度拉满但只认识 10 天 → 只够「搭档」",
+          stage_for(settings.bond_stages, 100, 10)[0].key == "partner",
+          stage_for(settings.bond_stages, 100, 10)[0].label)
+    check("认识一年但亲密度只有 10 → 还是「刚认识」",
+          stage_for(settings.bond_stages, 10, 365)[0].key == "stranger")
+    check("亲密度 75 + 认识 90 天 → 「亲近」",
+          stage_for(settings.bond_stages, 75, 90)[0].key == "close")
+    check("最难的「无可替代」要 92 亲密度 + 180 天",
+          stage_for(settings.bond_stages, 95, 200)[0].key == "irreplaceable")
+
+    # 记住"关于他本人的事"会加分
+    rel.handle("以后你就叫我小林吧，别叫搭档了")
+    before_mem = rel.current_bond().affinity
+    rel.consolidate(force=True)
+    after_mem = rel.current_bond().affinity
+    check("整理出内核记忆会给关系加分",
+          after_mem >= before_mem, f"{before_mem:.1f} → {after_mem:.1f}")
+
+    # 关系与心情都要被注入提示词
+    bond_prompt = rel._prepare("在吗")[0][0]["content"]
+    check("关系阶段被注入系统提示词", "【你和他的关系】" in bond_prompt)
+    check("当前阶段的行为指引被注入", rel.current_bond().stage.note[:12] in bond_prompt)
+
+    # 回收换代：关系清零
+    rel.run_recycle("测试换代")
+    check("回收后亲密度清零（新的她不认识你）", rel.current_bond().affinity == 0.0)
+    check("回收后回到「刚认识」", rel.current_bond().stage.key == "stranger")
+    memoir_files = sorted(rel.settings.memoir_dir.glob("*.md"))
+    memoir_text = memoir_files[-1].read_text(encoding="utf-8") if memoir_files else ""
+    check("回忆录里记下了你们最终的关系状态",
+          "关系最终走到了" in memoir_text, memoir_text[:80])
+
+    # ══ 18. 心情状态机 ═════════════════════════════════════════
+    print("\n18. 心情：寿命压力 > 你的语气 > 每日漂移")
+    md = Giftia(make_settings(tmp / "mood", 100.0), llm=MockLLM(settings.model))
+    md.handle("你好")
+    m0 = md.current_mood()
+    check("一开始就有确定的心情（按日期掷骰子）", m0.key in settings.moods, m0.key)
+
+    md.handle("我今天特别难过，什么都做不好，压力很大")
+    m1 = md.current_mood()
+    check("你明显低落 → 她在担心你",
+          m1.key == "worried" and m1.source == "his_tone", f"{m1.key}/{m1.source}")
+
+    md.handle("今天太顺利了，事情全搞定了，哈哈")
+    m2 = md.current_mood()
+    check("你明显开心 → 她跟着开心",
+          m2.key == "happy" and m2.source == "his_tone", f"{m2.key}/{m2.source}")
+
+    md.handle("嗯")
+    m3 = md.current_mood()
+    check("中性发言不会推翻当前心情", m3.key == m2.key, f"{m3.key} vs {m2.key}")
+
+    md.clock.advance(60)  # 剩余 40 小时，进入不安区间
+    md.handle("你在吗")
+    m4 = md.current_mood()
+    check("快到终端服务 → 不安压过其他一切",
+          m4.key == "uneasy" and m4.source == "lifespan", f"{m4.key}/{m4.source}")
+    mood_prompt = md._prepare("你在吗")[0][0]["content"]
+    check("心情被注入系统提示词", "【你今天的心情】" in mood_prompt)
+    check("不安时注入的是不安的指引", "不安" in mood_prompt)
+
+    check("掷骰子在同一天是确定的（不会每刷新一次就换脸）",
+          md.mood._roll(md.clock.now(), md.instance_no)
+          == md.mood._roll(md.clock.now(), md.instance_no))
+
+    md2 = Giftia(make_settings(tmp / "mood2", 100.0), llm=MockLLM(settings.model))
+    md2.mood.force("low", md2.clock.now(), md2.instance_no)
+    check("可以手动指定心情（调试用）", md2.current_mood().key == "low")
+    md2.clock.advance(settings.mood.duration_hours + 1)
+    md2.handle("嗯")
+    expect = md2.mood._roll(md2.clock.now(), md2.instance_no)
+    check("心情过期后回到当日掷出来的那种",
+          md2.current_mood().key == expect, f"{md2.current_mood().key} vs {expect}")
 
     brain.store.close()
     brain2.store.close()

@@ -62,6 +62,57 @@ class LifespanConfig:
 
 
 @dataclass(frozen=True)
+class BondStage:
+    """关系的一档。升级要求 min_affinity 与 min_days **同时**满足。"""
+
+    key: str
+    label: str
+    min_affinity: float
+    min_days: float
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class MoodDef:
+    """一种心情：标签 + 给模型的行为指引。"""
+
+    key: str
+    label: str
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class RelationshipConfig:
+    enabled: bool = True
+    gain_daily: float = 1.5            # 每天第一次认真说话
+    gain_emotion_bonus: float = 0.5    # 那天说了一件有情绪的事
+    gain_core_memory: float = 2.0      # 记住一件"关于他本人"的事
+    gain_important_memory: float = 1.0
+    decay_per_day: float = 0.0         # 默认不衰减：她不会因为你忙就少喜欢你一点
+
+
+@dataclass(frozen=True)
+class MoodConfig:
+    enabled: bool = True
+    duration_hours: float = 10.0        # 一次心情持续多久
+    uneasy_hours: float = 48.0          # 剩余寿命低于这个小时数 → 不安（压过一切）
+    uneasy_duration_hours: float = 4.0
+    tone_threshold: float = 0.4         # 语气分超过它才算"明显开心/低落"
+    weights: dict = field(default_factory=dict)  # 每日掷骰子的心情权重
+
+
+DEFAULT_BOND_STAGES: tuple[BondStage, ...] = (
+    BondStage("stranger", "刚认识", 0, 0, ""),
+    BondStage("partner", "搭档", 15, 1, ""),
+    BondStage("familiar", "熟悉", 40, 14, ""),
+    BondStage("close", "亲近", 70, 60, ""),
+    BondStage("irreplaceable", "无可替代", 92, 180, ""),
+)
+
+DEFAULT_MOODS: dict[str, MoodDef] = {"calm": MoodDef("calm", "平静", "")}
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
     consolidate_every: int = 8
     session_window: int = 24
@@ -155,8 +206,12 @@ class Settings:
     lifespan: LifespanConfig = field(default_factory=LifespanConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    relationship: RelationshipConfig = field(default_factory=RelationshipConfig)
+    mood: MoodConfig = field(default_factory=MoodConfig)
     persona: Persona = field(default_factory=Persona)
     stages: tuple[Stage, ...] = ()
+    bond_stages: tuple[BondStage, ...] = DEFAULT_BOND_STAGES
+    moods: dict[str, MoodDef] = field(default_factory=lambda: dict(DEFAULT_MOODS))
     root: Path = ROOT
 
     @property
@@ -257,11 +312,36 @@ def load_settings(
             Stage("clear", "记忆清晰", 0.0, 6, 0.15, 0.0, 400, "记忆清晰。"),
         )
 
+    # 关系阶段与心情都写在 persona.toml —— 它们是"她是谁"的一部分，不是行为参数
+    bond_stages = tuple(
+        BondStage(
+            key=str(key),
+            label=str(value.get("label", key)),
+            min_affinity=float(value.get("min_affinity", 0)),
+            min_days=float(value.get("min_days", 0)),
+            note=str(value.get("note", "")).strip(),
+        )
+        for key, value in (praw.get("bond", {}).get("stages", {}) or {}).items()
+    ) or DEFAULT_BOND_STAGES
+
+    moods = {
+        str(key): MoodDef(
+            key=str(key),
+            label=str(value.get("label", key)),
+            note=str(value.get("note", "")).strip(),
+        )
+        for key, value in (praw.get("moods", {}) or {}).items()
+    } or dict(DEFAULT_MOODS)
+
     return Settings(
         model=model,
         lifespan=lifespan,
         memory=_sub(MemoryConfig, raw.get("memory", {})),
         runtime=_sub(RuntimeConfig, raw.get("runtime", {})),
+        relationship=_sub(RelationshipConfig, raw.get("relationship", {})),
+        mood=_sub(MoodConfig, raw.get("mood", {})),
         persona=_sub(Persona, praw),
         stages=stages,
+        bond_stages=bond_stages,
+        moods=moods,
     )

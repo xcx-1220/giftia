@@ -12,8 +12,10 @@ from .brain import Giftia
 
 HELP = """\
 指令一览：
-  /status            寿命、记忆、时钟的完整状态
-  /prompt <一句话>    看她这一轮**实际被注入了什么**（人格 + 状态 + 记忆 + 规则）
+  /status            寿命、关系、心情、记忆、时钟的完整状态
+  /bond              关系阶段、亲密度进度、还差什么才能升级
+  /mood [名字]        看她此刻的心情；带名字则手动指定（调试用）
+  /prompt <一句话>    看她这一轮**实际被注入了什么**（人格 + 关系 + 心情 + 记忆 + 规则）
   /memories          她的长期记忆（你看到的原始版）
   /recall <文本>      演示检索：她拿到什么、被模糊成什么样
   /remember          立刻把未整理的对话压成记忆条目
@@ -117,6 +119,18 @@ def _handle_command(brain: Giftia, text: str) -> bool:
 
     elif cmd == "/prompt":
         print(brain.preview_prompt(arg or "在吗"))
+
+    elif cmd == "/bond":
+        print(brain.bond_text())
+
+    elif cmd == "/mood":
+        if arg:
+            try:
+                print(brain.force_mood(arg))
+            except KeyError:
+                print(f"没有这种心情：{arg}（直接输入 /mood 看全部可选值）")
+        else:
+            print(brain.mood_text())
 
     elif cmd == "/recall":
         print(brain.recall_text(arg))

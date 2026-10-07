@@ -17,6 +17,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 
+from .bond import Bond, BondTracker
 from .clock import Clock
 from .config import Settings, load_settings
 from .lifespan import Lifespan, LifeStatus
@@ -29,6 +30,7 @@ from .memory import (
     recall,
     retention_of,
 )
+from .mood import Mood, MoodTracker, tone_of
 from .persona import after_recycle_line, build_system_prompt, greeting
 from .recycle import RecycleReport, perform_recycle
 from .store import Store
@@ -61,10 +63,14 @@ class Giftia:
         self.llm = llm or make_llm(settings)
         self.lifespan = Lifespan(settings, self.store, self.clock)
         self.lifespan.ensure_activated()
+        self.bond = BondTracker(self.store, settings)
+        self.mood = MoodTracker(self.store, settings)
         self.notices: list[str] = []
         self.last_recalled: list[Recalled] = []
         self.last_cited: list[int] = []
         self.rewritten_queries: list[str] = []
+        self.last_bond: Bond | None = None
+        self.last_mood: Mood | None = None
 
     # ── 基本属性 ──────────────────────────────────────────
     @property
@@ -103,6 +109,32 @@ class Giftia:
         return reply
 
     # ── 一次对话 ──────────────────────────────────────────
+    def current_bond(self, now=None) -> Bond:
+        return self.bond.load(
+            now or self.clock.now(), self.instance_no, self.lifespan.activated_at
+        )
+
+    def current_mood(self, now=None) -> Mood:
+        return self.mood.current(now or self.clock.now(), self.instance_no)
+
+    def _tick_inner(self, text: str, now) -> None:
+        """只有真的说了一句话才推进关系与心情（预览、看状态都不会）。"""
+        self.bond.decay(now, self.instance_no)
+        self.last_bond = self.bond.touch(
+            now,
+            self.instance_no,
+            self.lifespan.activated_at,
+            text=text,
+            tone=tone_of(text),
+        )
+        self.last_mood = self.mood.tick(
+            now, self.lifespan.status(), self.instance_no, last_user_text=text
+        )
+        if self.last_bond.progressed:
+            self.notices.append(
+                f"[关系] 你们的关系变成了「{self.last_bond.stage.label}」"
+            )
+
     def _prepare(self, text: str) -> tuple[list[dict], list[Recalled]]:
         """组装这一轮真正会发给模型的消息。
 
@@ -139,7 +171,14 @@ class Giftia:
                         f"{len(merged)} 条"
                     )
 
-        system = build_system_prompt(self.settings, life, recalled, now=now)
+        system = build_system_prompt(
+            self.settings,
+            life,
+            recalled,
+            now=now,
+            bond=self.current_bond(now),
+            mood=self.current_mood(now),
+        )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))
         messages.append({"role": "user", "content": text})
@@ -165,8 +204,10 @@ class Giftia:
         return "\n".join(lines)
 
     def _chat(self, text: str) -> str:
-        messages, recalled = self._prepare(text)
         now = self.clock.now()
+        # 只有真的说话才推进关系与心情（预览 /prompt 不会）
+        self._tick_inner(text, now)
+        messages, recalled = self._prepare(text)
         self.last_recalled = recalled
         if recalled:
             # 被塞进提示词 ≠ 被想起。这里只记账，强化要等她真的说出口。
@@ -246,13 +287,34 @@ class Giftia:
             session_id=self.session_id,
             now_iso=self.clock.iso(),
             force=force,
+            # 记住"关于他本人的事"会让关系更近一点
+            on_added=lambda layer, importance: self.bond.on_memory(self.instance_no, layer),
         )
 
     # ── 回收 ──────────────────────────────────────────────
     def run_recycle(self, reason: str = "手动触发") -> str:
-        report: RecycleReport = perform_recycle(
-            self.settings, self.store, self.clock, self.llm, self.lifespan, reason=reason
+        now = self.clock.now()
+        old_instance = self.instance_no
+        bond = self.bond.load(now, old_instance, self.lifespan.activated_at)
+        extra = (
+            f"他们之间的关系最终走到了「{bond.stage.label}」"
+            f"（亲密度 {bond.affinity:.0f}/100，认识 {bond.days_known:.0f} 天，"
+            f"其中 {bond.interactions} 天有过交流）。"
         )
+        report: RecycleReport = perform_recycle(
+            self.settings,
+            self.store,
+            self.clock,
+            self.llm,
+            self.lifespan,
+            reason=reason,
+            extra_context=extra,
+        )
+        # 换代：新的她不认识你，关系与心情一并清零
+        self.bond.reset(old_instance)
+        self.mood.reset(old_instance)
+        self.last_bond = None
+        self.last_mood = None
         self.notices.append(
             f"[终端服务] 实例 #{report.instance_no} 已回收，新实例 #{report.new_instance_no} 上线"
         )
@@ -264,10 +326,11 @@ class Giftia:
     def banner(self) -> str:
         st = self.status()
         model = self.llm.label if self.is_mock else self.settings.model.name
+        b, m = self.current_bond(), self.current_mood()
         return (
             f"{self.settings.persona.name} · {self.settings.persona.model_code} · 实例 #{st.instance_no}\n"
             f"剩余寿命 {st.human_remaining()}　设计寿命 {st.human_total()}（已用 {st.used_ratio:.2%}）\n"
-            f"记忆状态 {st.stage.label}　模型 {model}"
+            f"记忆状态 {st.stage.label}　关系 {b.stage.label}　心情 {m.label}　模型 {model}"
         )
 
     def status_text(self) -> str:
@@ -278,9 +341,13 @@ class Giftia:
                 str(m.get("layer") or "normal"), 0
             ) + 1
         cited = sum(int(m.get("recall_count") or 0) for m in mems)
+        b, mood = self.current_bond(), self.current_mood()
         return "\n".join(
             [
                 self.lifespan.status_block(),
+                f"关系阶段      {b.stage.label}（亲密度 {b.affinity:.0f}/100，"
+                f"认识 {b.days_known:.1f} 天）",
+                f"此刻心情      {mood.label}",
                 f"记忆条目      {len(mems)} 条（内核 {counts['core']}／重要 "
                 f"{counts['important']}／常规 {counts['normal']}）",
                 f"被想起过      {cited} 次（只有她真的说出口才算）",
@@ -290,6 +357,50 @@ class Giftia:
                 f"会话 ID       {self.session_id}",
             ]
         )
+
+    def bond_text(self) -> str:
+        b, m = self.current_bond(), self.current_mood()
+        filled = int(round(b.affinity / 100.0 * 24))
+        bar = "█" * filled + "·" * (24 - filled)
+        stages = " → ".join(s.label for s in sorted(self.settings.bond_stages, key=lambda s: (s.min_days, s.min_affinity)))
+        return "\n".join(
+            [
+                f"关系阶段      {b.stage.label}",
+                f"亲密度        [{bar}] {b.affinity:.0f}/100",
+                f"认识          {b.days_known:.1f} 天（这一任激活至今）",
+                f"交流过        {b.interactions} 天（同一天说一百句也只算一天）",
+                f"下一步        {b.missing()}",
+                f"阶段梯度      {stages}",
+                "",
+                f"此刻心情      {m.label}（来源：{m.source or '未定'}）",
+                f"              {m.note}",
+                "",
+                "关系怎么涨：每天第一次认真说话 +gain_daily；说了有情绪的事再 +bonus；",
+                "            整理出「关于他本人的事」+gain_core_memory。这些都不可刷。",
+                "心情优先级：寿命压力 > 你的语气 > 每日漂移（想手动试：/mood <名字>）",
+            ]
+        )
+
+    def mood_text(self) -> str:
+        m = self.current_mood()
+        keys = "、".join(f"{k}（{v.label}）" for k, v in self.settings.moods.items())
+        return "\n".join(
+            [
+                f"此刻心情      {m.label}（来源：{m.source or '未定'}）",
+                f"              {m.note}",
+                f"持续到        {m.until[:16].replace('T', ' ') or '—'}",
+                "",
+                f"可用的心情    {keys}",
+                "手动指定：/mood low（调试用，会按正常时长过期）",
+            ]
+        )
+
+    def force_mood(self, key: str) -> str:
+        key = (key or "").strip()
+        if key not in self.settings.moods:
+            raise KeyError(key)
+        mood = self.mood.force(key, self.clock.now(), self.instance_no)
+        return f"心情已设为「{mood.label}」。下一条消息她就会按这个状态说话。"
 
     def memories_text(self, limit: int = 30) -> str:
         mems = self.store.active_memories(self.instance_no)

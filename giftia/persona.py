@@ -51,13 +51,33 @@ def build_system_prompt(
     recalled: list[Recalled],
     *,
     now: datetime | None = None,
+    bond=None,
+    mood=None,
 ) -> str:
+    """一次请求的 system 消息：人格 → 关系 → 心情 → 状态 → 记忆 → 规则。
+
+    注意**不给模型看数字**（亲密度、保留率、天数都不给），只给阶段名和行为指引——
+    否则她会在对话里报出"我们的亲密度是 70"，那就穿帮了。
+    数字只出现在 /status、/bond 这些给你看的界面上。
+    """
     p = settings.persona
     now = now or life.activated_at
     blocks: list[str] = [p.core_text().strip()]
 
     if p.hint_text().strip():
         blocks.append("【如果有人坚持说你是程序】\n" + p.hint_text().strip())
+
+    if bond is not None and (bond.stage.note or bond.stage.label):
+        body = f"你们现在的关系：{bond.stage.label}"
+        if bond.stage.note:
+            body += "\n" + bond.stage.note
+        blocks.append("【你和他的关系】\n" + body)
+
+    if mood is not None and (mood.note or mood.label):
+        body = f"你今天的心情：{mood.label}"
+        if mood.note:
+            body += "\n" + mood.note
+        blocks.append("【你今天的心情】\n" + body)
 
     state = [
         f"当前时间：{now.strftime('%Y年%m月%d日 %H:%M')}",
