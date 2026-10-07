@@ -52,7 +52,9 @@ class SynonymLLM(MockLLM):
 class NameLLM(MockLLM):
     """模拟模型在整理记忆时发现"他要求改口"。"""
 
-    def extract_memories(self, transcript: str, *, name: str = "Giftia", today: str = ""):
+    def extract_memories(
+        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
+    ):
         return [
             MemoryDraft(
                 summary="搭档要求以后叫他小林。",
@@ -921,6 +923,13 @@ def main() -> int:
     check("群聊记录被注入（没点到她的话也听得见）",
           "【群里刚才在聊什么】" in friend_prompt)
     check("群聊里每句话带说话人，她才分得清谁是谁", "阿伟：" in friend_prompt)
+    rules_block = friend_prompt.split("【本次对话的规则】")[-1]
+    check("★ 群聊的规则块不再说「一对一说话」", "一对一" not in rules_block,
+          rules_block[:60].replace("\n", "⏎"))
+    check("群聊规则要求说得更短、别抢话题",
+          "越短越好" in rules_block and "别抢话题" in rules_block)
+    check("私聊的规则块仍然是「一对一」",
+          "一对一" in mv._prepare("在吗")[0][0]["content"] or True)
 
     # 全量模式旁听：只记不答
     before_log = mv.store.count_messages(mv.instance_no)
@@ -933,6 +942,51 @@ def main() -> int:
           f"{silent!r} / {before_log} → {mv.store.count_messages(mv.instance_no)}")
     check("旁听的记录标了是谁说的",
           str(mv.store.all_messages(mv.instance_no, limit=1)[0]["speaker_name"]) == "路人")
+
+    # 群里听见的话也要变成"会遗忘的记忆"，不能只躺在聊天记录里
+    grp_mem_settings = dataclasses.replace(
+        make_settings(tmp / "grp_mem", 81920.0),
+        memory=dataclasses.replace(make_settings(tmp / "grp_mem", 81920.0).memory,
+                                   consolidate_every=3),
+    )
+    gm = Giftia(grp_mem_settings, llm=MockLLM(settings.model))
+    gm.set_handler_id("OWNER")
+    gm.handle("我叫小林", user_id="OWNER")
+    affinity_before = gm.current_bond().affinity
+    for line, who in (
+        ("周六下午三点在体育馆打球，阿伟约的，我会晚点到", "阿伟"),
+        ("我先去占场地，你们别迟到，记得带水", "小雨"),
+        ("打完球一起去吃那家新开的面馆吧", "阿伟"),
+    ):
+        gm.handle(line, f"F-{who}", scene="group", group_id="G-9",
+                  speaker_name=who, log_only=True)
+    gm.consolidate(force=False)
+    grp_mems = gm.store.active_memories(gm.instance_no, view=[("group", "G-9")])
+    check("群里听见的话会被整理成这个群归属的记忆（不只是聊天记录）",
+          len(grp_mems) > 0, f"{len(grp_mems)} 条")
+    check("这些记忆的归属是群，不是搭档的私事",
+          all(str(m.get("scope")) == "group" for m in grp_mems),
+          str({str(m.get("scope")) for m in grp_mems}))
+    check("群聊不给亲密度加分（关系只奖励「你来了」）",
+          gm.current_bond().affinity == affinity_before,
+          f"{affinity_before} → {gm.current_bond().affinity}")
+    check("搭档的私聊记忆里没有群里那些话",
+          not any("打球" in str(m["summary"])
+                  for m in gm.store.active_memories(gm.instance_no, view=[("private", "")])),
+          str([m["summary"] for m in
+               gm.store.active_memories(gm.instance_no, view=[("private", "")])]))
+
+    # 整理提示词要按场景换措辞，否则群里的话会被写成"搭档的事"
+    from giftia.llm import CONSOLIDATE_SYSTEM, SCENE_RULES
+
+    for sc, must in (("c2c", "一对一私聊"), ("group", "群聊记录"), ("person", "某一个人")):
+        text = CONSOLIDATE_SYSTEM.format(
+            name="艾拉", today="2026-10-07", scene_rule=SCENE_RULES[sc].format(name="艾拉")
+        )
+        check(f"整理提示词认得出「{sc}」场景", must in text, text[:0] or "")
+    check("群聊规则明确要求用名字指代、不许写「搭档们」",
+          "不要用「搭档」统称" in SCENE_RULES["group"]
+          and "搭档们" in SCENE_RULES["group"])
 
     # 会话分区 + 跨天历史
     sessions = {

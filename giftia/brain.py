@@ -322,6 +322,10 @@ class Giftia:
                 self.speaker_id,
                 self.speaker_name,
             )
+            # 攒够了就把"听见的话"整理成这个群归属的记忆 ——
+            # 不然"听得见"永远只是聊天记录，不会变成会随时间模糊的记忆。
+            # consolidate 会先数条数，不够就直接返回，几乎不花钱。
+            self.consolidate()
             return ""
 
         # 到期回收只跟搭档有关（别人说话不该触发她的回收流程）
@@ -743,8 +747,13 @@ class Giftia:
             scope=scope,
             subject_id=subject,
             speaker_id=self.speaker_id if scope != "private" else "",
-            # 只有跟搭档的对话才推进关系、才能改她的称呼
-            on_draft=self._on_draft if self.is_handler else None,
+            # 只有**私聊里**跟搭档的对话才推进关系、才能改她的称呼。
+            # 群聊再热闹也不给亲密度加分——关系奖励的是"你来了"，不是"你说了多少"。
+            on_draft=(
+                self._on_draft
+                if (self.is_handler and self.last_scene == "c2c")
+                else None
+            ),
         )
 
     # ── 回收 ──────────────────────────────────────────────

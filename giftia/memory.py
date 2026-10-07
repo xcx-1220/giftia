@@ -469,6 +469,8 @@ def consolidate(
             build_transcript(pending, settings.persona.name),
             name=settings.persona.name,
             today=now_iso[:10],
+            # 群聊和私聊要用不同的措辞规则，否则群里的话会被写成"搭档的事"
+            scene="group" if scope == "group" else ("person" if scope == "person" else "c2c"),
         )
     except Exception as exc:  # 网络/解析失败都不能丢记忆
         drafts = _fallback_drafts(pending, settings)

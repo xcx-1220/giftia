@@ -16,7 +16,7 @@ from .lifespan import LifeStatus
 from .memory import Recalled
 
 RULES = """【本次对话的规则】
-- 你在和你的搭档一对一说话。一次回复 1～4 句，短一点，不要写成小作文。
+- {scene_line}
 - 不要复述「你现在想起的事」的原文，要用你自己的话说出来，像真的在回忆。
 - 严格按每条记忆前面的标记来决定你怎么说它（这是你此刻的真实状态，不是演戏）：
   · [可以确信] —— 你可以直接把它当成发生过的事说出来。
@@ -30,6 +30,17 @@ CONFIDENCE_MARK = {
     "cite": "[可以确信]",
     "cautious": "[需要含糊]",
     "associate": "[只是隐约觉得]",
+}
+
+# 规则块第一句要跟着场景变 —— 群聊里说"你在和你的搭档一对一说话"是错的，
+# 会让她在群里说得太长、太亲密。
+SCENE_LINES = {
+    "c2c": "你在和你的搭档一对一说话。一次回复 1～4 句，短一点，不要写成小作文。",
+    "person": "你在和一个人一对一说话（他不是你的搭档）。一次回复 1～3 句，礼貌、有分寸。",
+    "group": (
+        "这是**群聊**，别人也都看得到。一次回复 1～2 句，越短越好；"
+        "只回答点到你的那件事，别抢话题、别接连发言。"
+    ),
 }
 
 
@@ -154,9 +165,15 @@ def build_system_prompt(
 
     blocks.append("【关于记忆】\n" + (life.stage.note or "你对自己的记忆很有把握。"))
     blocks.append("【你现在想起的事】\n" + render_memories(recalled))
-    blocks.append(RULES)
+    blocks.append(RULES.format(scene_line=_scene_line(scene, is_handler)))
 
     return "\n\n".join(b for b in blocks if b.strip())
+
+
+def _scene_line(scene: str, is_handler: bool) -> str:
+    if scene in ("group", "guest"):
+        return SCENE_LINES["group"]
+    return SCENE_LINES["c2c"] if is_handler else SCENE_LINES["person"]
 
 
 def _render_people(people: list[tuple[str, bool]]) -> str:

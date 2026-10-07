@@ -43,7 +43,8 @@ LAYERS = ("core", "important", "normal")
 
 # ── 提示词（属于模型任务，不属于人格）────────────────────────────
 CONSOLIDATE_SYSTEM = """你是 Giftia 的记忆整理模块（她本人看不到这段指令）。
-把下面这段「搭档」与「{name}」的对话，压缩成 0～3 条长期记忆条目。
+把下面这段对话，压缩成 0～3 条长期记忆条目。
+{scene_rule}
 
 只记对长期关系有意义的东西：发生的事、对方的偏好与习惯、情绪变化、约定、说过的要紧话。
 不要记寒暄、天气、以及没有信息量的闲聊。宁少勿多；确实没有值得记的，就返回空数组。
@@ -97,6 +98,16 @@ DREAM_SYSTEM = """你是 Giftia 的睡眠整理模块（她本人看不到这段
 - 不要解释"这是梦"，不要提到记忆、遗忘、系统、数据库。
 - 不要写"我梦见"开头，直接进入场景。结尾可以停在半句话上。"""
 
+SCENE_RULES = {
+    "c2c": "这段是「搭档」和「{name}」的一对一私聊：用「搭档」指代对方。",
+    "person": "这段是「{name}」和**某一个人**的私聊：用那个人的名字指代他，不要用「搭档」。",
+    "group": (
+        "这段是**群聊记录**：说话的人不止一个，稿子每行开头的名字就是发言人。"
+        "**逐个用他们的名字**指代（例如「阿伟」「小雨」），不要用「搭档」统称，"
+        "也不要写成「搭档们」。小林是她的搭档，其余人是群里的人。"
+    ),
+}
+
 NAME_SYSTEM = """判断下面这句话里，说话人是不是在**介绍自己的名字**。
 
 - 是自我介绍 → **只输出那个名字**（2～16 个字），不要标点、不要解释、不要加引号。
@@ -120,7 +131,7 @@ class BaseLLM:
         raise NotImplementedError
 
     def extract_memories(
-        self, transcript: str, *, name: str = "Giftia", today: str = ""
+        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
     ) -> list[MemoryDraft]:
         raise NotImplementedError
 
@@ -213,13 +224,17 @@ class DeepSeekLLM(BaseLLM):
         return text
 
     def extract_memories(
-        self, transcript: str, *, name: str = "Giftia", today: str = ""
+        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
     ) -> list[MemoryDraft]:
         raw = self.chat(
             [
                 {
                     "role": "system",
-                    "content": CONSOLIDATE_SYSTEM.format(name=name, today=today or "（未提供）"),
+                    "content": CONSOLIDATE_SYSTEM.format(
+                        name=name,
+                        today=today or "（未提供）",
+                        scene_rule=SCENE_RULES.get(scene, SCENE_RULES["c2c"]).format(name=name),
+                    ),
                 },
                 {"role": "user", "content": transcript},
             ],
@@ -417,13 +432,26 @@ class MockLLM(BaseLLM):
         return "".join(parts)
 
     def extract_memories(
-        self, transcript: str, *, name: str = "Giftia", today: str = ""
+        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
     ) -> list[MemoryDraft]:
-        """启发式兜底：从搭档说过的话里挑两条最长的留下来（提问不算记忆）。"""
-        lines = [ln for ln in transcript.splitlines() if ln.startswith("搭档：")]
-        texts = sorted((ln[3:].strip() for ln in lines), key=len, reverse=True)
+        """启发式兜底：从别人说过的话里挑两条最长的留下来（提问不算记忆）。
+
+        注意是"别人"而不只是"搭档"：群聊稿子里的发言人也一样会被记住，
+        真模型读的也是同一份稿子。
+        """
+        rows: list[tuple[str, str]] = []
+        for line in transcript.splitlines():
+            if "：" not in line:
+                continue
+            who, text = line.split("：", 1)
+            who, text = who.strip(), text.strip()
+            if not text or who == name:  # 她自己说的话不算"记忆素材"
+                continue
+            rows.append((who, text))
+        rows.sort(key=lambda r: len(r[1]), reverse=True)
+
         drafts: list[MemoryDraft] = []
-        for text in texts:
+        for who, text in rows:
             if not _worth_remembering(text):
                 continue
             summary = text if len(text) <= 60 else text[:57] + "……"
@@ -432,7 +460,7 @@ class MockLLM(BaseLLM):
             importance = 0.85 if layer == "core" else 0.5
             drafts.append(
                 MemoryDraft(
-                    summary=f"搭档说过：{summary}",
+                    summary=f"{who or '搭档'}说过：{summary}",
                     tags="搭档,聊天",
                     emotion="平常",
                     importance=importance,
