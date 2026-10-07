@@ -527,6 +527,16 @@ systemctl stop giftia-qq        # 停止（会先把未整理的对话存成记�
 tar czf ~/giftia-backup-$(date +%F).tgz -C /opt/giftia data   # 备份：记忆全在这一个目录
 ```
 
+**确认服务器和仓库是否一致**（在你本机的项目目录里跑，只读、不碰 `data/`）：
+
+```powershell
+.\tools\check_sync.ps1
+```
+
+逐文件比 SHA256，输出「同步 ✓」或列出哪几个文件不同并给出重新部署的命令。
+比"应该部署了吧"可靠——中途有一次我的部署命令被 shell 引号拆坏、安装脚本其实没跑完，
+就是靠它发现的。
+
 ### 服务器带来的三个新坑
 
 1. **只在一台机器上跑**。家里和服务器同时跑，会有两个她抢着回你同一条消息。
@@ -621,6 +631,7 @@ tools/qq_protocol_selftest.py  53 项 QQ 适配器协议自测（本地假网关
 tools/ws_testserver.py  两个协议测试共用的服务端帧编解码
 tools/live_check.py     真实 API 连通性检查（临时目录，不碰正式数据）
 tools/check_deploy.py   部署后核对：迁移是否安全、她的记忆还在不在（在服务器上跑）
+tools/check_sync.ps1    同步检查：逐文件比对本地仓库与服务器上的代码（在 Windows 上跑）
 tools/demo_life.py      一次看完她的一生（离线）
 adapters/qq_official.py QQ 官方机器人适配器（鉴权/连接/收发的真机验证见第 6 节）
 deploy/setup.sh         一键部署到 Linux 服务器
