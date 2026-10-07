@@ -13,7 +13,8 @@ from .brain import Giftia
 HELP = """\
 指令一览：
   /status            寿命、关系、心情、记忆、时钟的完整状态
-  /name <称呼>        改口：以后她这么叫你（例如 /name 小林）
+  /name [称呼]        改口：以后她这么叫你（第一次见面她也会问你）
+  /people            看她认得群里哪些人
   /bond              关系阶段、亲密度进度、还差什么才能升级
   /mood [名字]        看她此刻的心情；带名字则手动指定（调试用）
   /prompt <一句话>    看她这一轮**实际被注入了什么**（人格 + 关系 + 心情 + 记忆 + 规则）
@@ -126,12 +127,19 @@ def _handle_command(brain: Giftia, text: str) -> bool:
 
     elif cmd == "/name":
         if not arg:
-            print(f"她现在叫你「{brain.handler_name}」。改口：/name 小林")
+            if brain.handler_name:
+                print(f"她现在叫你「{brain.handler_name}」。改口：/name 小林")
+            else:
+                print("她还不知道你叫什么（这是出厂状态）。"
+                      "告诉她：/name 小林，或者直接在对话里说「我叫小林」。")
         else:
             try:
                 print(brain.set_handler_name(arg))
             except ValueError as exc:
                 print(f"改不了：{exc}")
+
+    elif cmd == "/people":
+        print(brain.people_text())
 
     elif cmd == "/mood":
         if arg:

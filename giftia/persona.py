@@ -55,16 +55,18 @@ def build_system_prompt(
     mood=None,
     handler_name: str = "",
     scene: str = "c2c",
+    people: list[tuple[str, bool]] | None = None,
 ) -> str:
-    """一次请求的 system 消息：人格 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
+    """一次请求的 system 消息：人格 → 称呼 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
 
-    注意**不给模型看数字**（亲密度、保留率、天数都不给），只给阶段名和行为指引——
-    否则她会在对话里报出"我们的亲密度是 70"，那就穿帮了。
-    数字只出现在 /status、/bond 这些给你看的界面上。
+    两个刻意的克制：
+    - **不预设她知道什么**。称呼由运行时给：还不知道时，她被告知"你不知道他叫什么"，
+      而不是硬塞一个默认称呼。人格内核里也没有"你珍惜和这个人相处的时间"这类
+      需要相处过才成立的话。
+    - **不给模型看数字**（亲密度、保留率、天数都不给），只给阶段名和行为指引——
+      否则她会在对话里报出"我们的亲密度是 70"，那就穿帮了。
 
-    handler_name 是**运行时**的称呼（他会改口），不传就用配置里的默认值。
-    scene="group" 时会多注入一段群聊约束，主要是隐私保护：
-    群里别人也看得到，她不能把你私下说的事当众讲出来。
+    scene：c2c（私下）/ group（群里，被点名）/ guest（群里的其他人，无记忆无关系）。
     """
     p = settings.persona
     name = (handler_name or "").strip()
@@ -73,6 +75,10 @@ def build_system_prompt(
 
     if p.hint_text(name).strip():
         blocks.append("【如果有人坚持说你是程序】\n" + p.hint_text(name).strip())
+
+    naming = p.naming_text(name).strip()
+    if naming:
+        blocks.append("【你怎么称呼他】\n" + naming)
 
     if bond is not None and (bond.stage.note or bond.stage.label):
         body = f"你们现在的关系：{bond.stage.label}"
@@ -86,10 +92,19 @@ def build_system_prompt(
             body += "\n" + mood.note
         blocks.append("【你今天的心情】\n" + body)
 
-    if scene == "group":
+    if scene == "guest":
+        guest_text = p.guest_text(name).strip()
+        if guest_text:
+            blocks.append("【现在的情境】\n" + guest_text)
+    elif scene == "group":
         group_text = p.group_text(name).strip()
         if group_text:
             blocks.append("【现在的情境】\n" + group_text)
+
+    if scene in ("group", "guest"):
+        roster = _render_people(people or [])
+        if roster:
+            blocks.append("【群里你认得的人】\n" + roster)
 
     state = [
         f"当前时间：{now.strftime('%Y年%m月%d日 %H:%M')}",
@@ -107,11 +122,15 @@ def build_system_prompt(
     return "\n\n".join(b for b in blocks if b.strip())
 
 
-def greeting(settings: Settings, life: LifeStatus, *, first_time: bool) -> str:
-    p = settings.persona
-    if first_time:
-        return p.line("opening_line")
-    return p.line("greeting_line")
+def _render_people(people: list[tuple[str, bool]]) -> str:
+    """群里的花名册。她只知道谁是谁，不知道别人的底细。"""
+    if not people:
+        return ""
+    lines = ["你在群里认得这些人，别叫错："]
+    for person, is_owner in people:
+        lines.append(f"- {person}（你的搭档）" if is_owner else f"- {person}")
+    lines.append("其他人你还不认识——等他们自我介绍，别乱猜、也别乱叫。")
+    return "\n".join(lines)
 
 
 def after_recycle_line(settings: Settings) -> str:

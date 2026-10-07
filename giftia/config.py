@@ -167,10 +167,11 @@ class MemoryConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    handler_name: str = "搭档"
+    # 空 = 她还不知道你叫什么（第一次见面她会问）。这是出厂状态，不是预设。
+    handler_name: str = ""
     user_id: str = "handler"
     show_memoir_after_recycle: bool = True
-    # 群里被陌生人 @ 时：false = 装作没看见（默认，群聊不该刷屏），true = 戏内挡回去
+    # 群里被陌生人 @ 时：false = 装作没看见（默认，群聊不该刷屏），true = 以"客人"身份回一句
     group_stranger_reply: bool = False
 
 
@@ -178,16 +179,20 @@ class RuntimeConfig:
 class Persona:
     name: str = "艾拉"
     model_code: str = "Giftia-Type-07"
-    handler_title: str = "搭档"
+    # 还不知道该怎么称呼他时，人格文本里用的兜底代词（不是称呼本身）
+    handler_title: str = "他"
     core: str = ""
-    opening_line: str = "……请多指教。"
+    opening_line: str = "……请问，我该怎么称呼你？"
     greeting_line: str = "……你来了。"
     after_recycle_line: str = "……初次见面。"
     out_of_character_hint: str = ""
     group_hint: str = ""
+    guest_hint: str = ""
+    naming_unknown: str = ""
+    naming_known: str = ""
 
     def core_text(self, handler_title: str | None = None) -> str:
-        """填好占位符。handler_title 传运行时称呼（他会改口），不传则用配置里的默认值。"""
+        """填好占位符。handler_title 传运行时称呼；还不知道时用兜底代词。"""
         return _fill(self.core, self, handler_title)
 
     def hint_text(self, handler_title: str | None = None) -> str:
@@ -198,6 +203,16 @@ class Persona:
 
     def group_text(self, handler_title: str | None = None) -> str:
         return _fill(self.group_hint, self, handler_title)
+
+    def guest_text(self, handler_title: str | None = None) -> str:
+        return _fill(self.guest_hint, self, handler_title)
+
+    def naming_text(self, handler_name: str = "") -> str:
+        """「你怎么称呼他」这一块：知道名字 vs 还不知道，是两套文本。"""
+        name = (handler_name or "").strip()
+        if name:
+            return _fill(self.naming_known, self, name)
+        return _fill(self.naming_unknown, self)
 
 
 def _fill(text: str, p: "Persona", handler_title: str | None = None) -> str:

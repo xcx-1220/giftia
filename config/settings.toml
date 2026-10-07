@@ -71,11 +71,13 @@ confidence_cautious_retention = 0.5   # 保留率低于此值 → 必须用"好�
 
 
 [runtime]
-handler_name = "搭档"            # 她一开始怎么称呼你（之后会随你改口）
+# 留空 = 她还不知道你叫什么（出厂状态）。第一次见面她会问；
+# 你也可以用 /name 小林 直接告诉她，或者她整理记忆时自己从"以后叫我小林"里学会。
+handler_name = ""
 user_id      = "handler"
 # 终端服务简报：回收后是否打印"上一任"的回忆录摘要
 show_memoir_after_recycle = true
-# 群里被陌生人 @ 时：false = 装作没看见（默认，群里不该刷屏），true = 戏内挡回去
+# 群里被陌生人 @ 时：false = 装作没看见（默认，群聊不该刷屏），true = 以"客人"身份礼貌回一句
 group_stranger_reply = false
 
 

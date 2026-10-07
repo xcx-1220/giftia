@@ -528,34 +528,49 @@ def main() -> int:
     check("心情过期后回到当日掷出来的那种",
           md2.current_mood().key == expect, f"{md2.current_mood().key} vs {expect}")
 
-    # ══ 19. 称呼 ═══════════════════════════════════════════════
-    print("\n19. 称呼：是数据，不是写死在人格里的常量")
+    # ══ 19. 出厂状态与称呼 ═════════════════════════════════════
+    print("\n19. 出厂状态：不预设她知道什么")
     nm = Giftia(make_settings(tmp / "name", 81920.0), llm=MockLLM(settings.model))
-    check("默认叫「搭档」", nm.handler_name == settings.runtime.handler_name, nm.handler_name)
+    check("出厂时她不知道你叫什么（空，而不是预设称呼）",
+          nm.handler_name == "", repr(nm.handler_name))
     base_prompt = nm._prepare("在吗")[0][0]["content"]
-    check("默认称呼被注入人格", "你称呼他为「搭档」" in base_prompt)
-    nm.set_handler_name("小林")
-    check("改口之后立即生效", nm.handler_name == "小林", nm.handler_name)
+    check("注入的是「你还不知道他叫什么」",
+          "不知道" in base_prompt and "他叫什么" in base_prompt)
+    check("并且叮嘱她只问一次", "只问一次" in base_prompt)
+    check("人格内核不预设你们已经相处过",
+          "你珍惜和这个人相处的时间" not in base_prompt)
+    opening = nm.settings.persona.line("opening_line")
+    check("开场白是问名字，不是宣布关系",
+          "怎么称呼你" in opening and "你就是我的搭档" not in opening, opening[:40])
+    check("重开一任的开场白同样不预设记忆",
+          "怎么称呼你" in nm.settings.persona.line("after_recycle_line"))
+
+    nm.handle("你好，我叫小林", user_id="u1")
+    check("从自我介绍里自己学会了称呼", nm.handler_name == "小林", nm.handler_name)
+
+    nm_cli = Giftia(make_settings(tmp / "name_cli", 81920.0), llm=MockLLM(settings.model))
+    nm_cli.handle("我叫小林")   # 本地 CLI 就是这么调的：不带 user_id
+    check("本地命令行（不带 user_id）也能学会称呼",
+          nm_cli.handler_name == "小林", nm_cli.handler_name)
     renamed = nm._prepare("在吗")[0][0]["content"]
-    check("注入的称呼跟着变",
-          "你称呼他为「小林」" in renamed and "你称呼他为「搭档」" not in renamed)
-    check("人格里不再有跟她较劲的「改不掉」",
-          "改不掉" not in renamed)
-    nm.run_recycle("测试换代")
-    check("换代后称呼仍保留（终端服务档案里有）", nm.handler_name == "小林", nm.handler_name)
-    check("但新的她不记得你们的关系", nm.current_bond().affinity == 0.0)
+    check("注入的称呼跟着变", "他叫「小林」" in renamed, renamed[:0] or "")
+    check("学会称呼时给出提示", any("称呼" in n for n in nm.notices), str(nm.notices))
+
+    for bad in ("我是来问你个事的", "我叫小林今年二十八岁", "别叫我搭档了"):
+        probe = Giftia(
+            make_settings(tmp / f"nb{abs(hash(bad)) % 9999}", 81920.0),
+            llm=MockLLM(settings.model),
+        )
+        probe.handle(bad, user_id="u1")
+        check(f"有歧义就不乱学：「{bad}」", probe.handler_name == "", probe.handler_name)
 
     nm2 = Giftia(make_settings(tmp / "name2", 81920.0), llm=NameLLM(settings.model))
     nm2.handle("以后叫我小林吧")
     nm2.consolidate(force=True)
-    check("模型识别出改口要求时自动改口", nm2.handler_name == "小林", nm2.handler_name)
-    check("改口时会给出提示", any("称呼" in n for n in nm2.notices), str(nm2.notices))
-
-    nm3 = Giftia(make_settings(tmp / "name3", 81920.0), llm=MockLLM(settings.model))
-    nm3.handle("我叫小林，今年二十八岁")
-    nm3.consolidate(force=True)
-    check("只是自我介绍不会触发改口（避免误判）",
-          nm3.handler_name == settings.runtime.handler_name, nm3.handler_name)
+    check("模型那条路（整理记忆时）也能改口", nm2.handler_name == "小林", nm2.handler_name)
+    nm2.run_recycle("测试换代")
+    check("换代后称呼仍保留（终端服务档案里有）", nm2.handler_name == "小林")
+    check("但新的她不记得你们的关系", nm2.current_bond().affinity == 0.0)
 
     # ══ 20. 群聊情境 ═══════════════════════════════════════════
     print("\n20. 群聊：她不能把你的私事当众说出去")
@@ -575,6 +590,46 @@ def main() -> int:
     grp.handle("在吗", scene="c2c")
     check("回到私聊后约束消失",
           "【现在的情境】" not in grp._prepare("在吗")[0][0]["content"])
+
+    # ══ 21. 群成员与访客模式 ═══════════════════════════════════
+    print("\n21. 群里认得的人 & 访客模式（客人碰不到你们的隐私）")
+    pp = Giftia(make_settings(tmp / "people", 100.0), llm=MockLLM(settings.model))
+    pp.set_handler_id("owner-1")
+    pp.handle("我叫小林", user_id="owner-1")
+    check("搭档自己的名字成为称呼", pp.handler_name == "小林", pp.handler_name)
+
+    pp.handle("大家好，我叫阿伟", user_id="friend-1", scene="guest")
+    check("群里别人的自我介绍被记下来",
+          pp.known_people().get("friend-1") == "阿伟", str(pp.known_people()))
+    check("但不会顶替她叫搭档的称呼", pp.handler_name == "小林", pp.handler_name)
+
+    pp.handle("在吗", user_id="owner-1", scene="group")
+    roster_prompt = pp._prepare("在吗")[0][0]["content"]
+    check("群聊时注入花名册", "【群里你认得的人】" in roster_prompt)
+    check("花名册里标出了哪个是搭档", "小林（你的搭档）" in roster_prompt)
+    check("花名册里也有群里其他人", "阿伟" in roster_prompt)
+    check("花名册提醒不认识的人别乱叫", "别乱猜" in roster_prompt)
+
+    before_msgs = pp.store.count_messages(pp.instance_no)
+    before_aff = pp.current_bond().affinity
+    pp.handle("他最近怎么样呀，你们聊了什么", user_id="friend-1", scene="guest")
+    check("访客说话不写进你们的记忆",
+          pp.store.count_messages(pp.instance_no) == before_msgs,
+          f"{before_msgs} → {pp.store.count_messages(pp.instance_no)}")
+    check("访客不会替你刷亲密度", pp.current_bond().affinity == before_aff)
+
+    guest_sys = build_system_prompt(
+        pp.settings,
+        pp.status(),
+        [],
+        now=pp.clock.now(),
+        handler_name=pp.handler_name,
+        scene="guest",
+        people=pp._people_for_prompt(),
+    )
+    check("访客提示词里没有任何搭档的私事", "考驾照" not in guest_sys)
+    check("访客提示词明确要求不提私事", "私事" in guest_sys)
+    check("访客看到的是「什么都想不起来」", "什么都想不起来" in guest_sys)
 
     brain.store.close()
     brain2.store.close()

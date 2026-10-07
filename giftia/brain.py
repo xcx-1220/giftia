@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import sys
 from datetime import datetime
 
@@ -31,7 +33,7 @@ from .memory import (
     retention_of,
 )
 from .mood import Mood, MoodTracker, tone_of
-from .persona import after_recycle_line, build_system_prompt, greeting
+from .persona import after_recycle_line, build_system_prompt
 from .recycle import RecycleReport, perform_recycle
 from .store import Store
 
@@ -73,16 +75,24 @@ class Giftia:
         self.last_mood: Mood | None = None
         self.last_scene = "c2c"
 
-    # ── 称呼 ──────────────────────────────────────────────
+    # ── 称呼与「认得的人」────────────────────────────────
+    # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
+    INTRO_PATTERNS = (
+        # 「我叫小林」「我的名字叫小林」
+        re.compile(r"我(?:的名字)?叫(?:做)?([\u4e00-\u9fa5A-Za-z0-9_]{1,4})"),
+        # 「以后叫我小林吧」「就叫我阿伟」
+        re.compile(r"叫我([\u4e00-\u9fa5A-Za-z0-9_]{1,4})"),
+    )
+    # 名字后面必须是停顿/结尾/语气词，否则容易把整句话当成名字
+    NAME_TAIL = re.compile(r"^([，。！？、,.!?\s]|$|[吧啊哦呀呢就了])")
+    # 含这些字的候选不是名字
+    NOT_A_NAME = "的了是吗吧呢么你我他她它来去个事问说想要能会有在别不"
+
     @property
     def handler_name(self) -> str:
-        """她此刻怎么称呼你：运行时设定优先，其次是配置里的默认值。
-
-        称呼是**数据**，不是写死在人格里的常量——他会改口，而且改口之后
-        应该一直有效（换了一任她也该知道，终端服务的档案里有）。
-        """
+        """她此刻怎么称呼你。空串 = 她还不知道（出厂状态）。"""
         stored = str(self.store.state_get("handler_name", "") or "").strip()
-        return stored or self.settings.runtime.handler_name
+        return stored or self.settings.runtime.handler_name.strip()
 
     def set_handler_name(self, name: str) -> str:
         name = (name or "").strip().replace("\n", " ")[:16]
@@ -90,6 +100,78 @@ class Giftia:
             raise ValueError("称呼不能为空")
         self.store.state_set("handler_name", name)
         return f"已把称呼改成「{name}」。她下一条消息就会这么叫你。"
+
+    @property
+    def handler_id(self) -> str:
+        """平台上的搭档 id（适配器 /bind 时写入）。核心不关心它长什么样。"""
+        return str(self.store.state_get("handler_id", "") or "")
+
+    def set_handler_id(self, user_id: str) -> None:
+        self.store.state_set("handler_id", str(user_id or ""))
+
+    # ── 群里认得的人 ──────────────────────────────────────
+    def known_people(self) -> dict[str, str]:
+        raw = str(self.store.state_get("known_people", "") or "")
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+    def remember_person(self, user_id: str, name: str) -> bool:
+        """记住某个人的名字（群里自我介绍时用）。返回是否是新认识。"""
+        name = (name or "").strip()[:16]
+        if not user_id or not name:
+            return False
+        people = self.known_people()
+        if people.get(str(user_id)) == name:
+            return False
+        people[str(user_id)] = name
+        self.store.state_set("known_people", json.dumps(people, ensure_ascii=False))
+        return True
+
+    def learn_name(self, text: str, user_id: str, *, owner: bool) -> str:
+        """从自我介绍里学名字。保守：只认「我叫X」「叫我X」，且 X 要像个名字。
+
+        宁可漏，不可错——所以「我是……」这种歧义句式不认，
+        「别叫我X」这种否定句也跳过（那是在否掉旧称呼，不是在自我介绍）。
+        真模型那条路（整理记忆时返回 preferred_name）是更强的手段，两者互补。
+        """
+        text = text or ""
+        for pattern in self.INTRO_PATTERNS:
+            for match in pattern.finditer(text):
+                candidate = match.group(1).strip()
+                if not candidate or len(candidate) > 4:
+                    continue
+                if any(ch in candidate for ch in self.NOT_A_NAME):
+                    continue
+                tail = text[match.end() : match.end() + 1]
+                if not self.NAME_TAIL.match(tail):
+                    continue
+                if any(word in text[max(0, match.start() - 3) : match.start()] for word in ("别", "不")):
+                    continue  # 「别叫我搭档了」——那是否定，不是自我介绍
+                if owner:
+                    if candidate != self.handler_name:
+                        self.store.state_set("handler_name", candidate)
+                        self.notices.append(f"[称呼] 她自己学会了：以后叫你「{candidate}」")
+                    return candidate
+                if self.remember_person(user_id, candidate):
+                    self.notices.append(f"[认得] 她记住了群里有人叫「{candidate}」")
+                return candidate
+        return ""
+
+    def _people_for_prompt(self) -> list[tuple[str, bool]]:
+        """群聊花名册。搭档本人也算其中一员（他的名字存在 handler_name，不在名单里）。"""
+        people = self.known_people()
+        owner_id = self.handler_id
+        owner_name = self.handler_name
+        if owner_id and owner_name:
+            people = {**people, owner_id: owner_name}
+        return [
+            (name, bool(owner_id) and uid == owner_id) for uid, name in people.items()
+        ]
 
     # ── 基本属性 ──────────────────────────────────────────
     @property
@@ -109,12 +191,29 @@ class Giftia:
 
     # ── 主入口（平台无关）─────────────────────────────────
     def handle(self, text: str, user_id: str | None = None, scene: str = "c2c") -> str:
-        """平台无关入口。scene="group" 会多注入一段群聊约束（主要是隐私保护）。"""
+        """平台无关入口。
+
+        scene：
+          c2c   —— 私下（默认）
+          group —— 群里被点名：有记忆有关系，但多一段隐私约束
+          guest —— 群里的其他人：**不检索、不落库、不推进关系**，只是礼貌回一句
+        """
         self.notices = []
-        self.last_scene = scene if scene in ("c2c", "group") else "c2c"
+        self.last_scene = scene if scene in ("c2c", "group", "guest") else "c2c"
         text = (text or "").strip()
         if not text:
             return ""
+
+        if self.last_scene == "guest":
+            # 先看他有没有自我介绍（她认人靠这个）
+            if user_id:
+                self.learn_name(text, user_id, owner=False)
+            return self._guest_reply(text)
+
+        # 学名字。约定：能走到这里的 c2c/group 消息都是**搭档本人**说的
+        # （群里其他人由适配器走 guest 分支）。所以 user_id 为空也要学 ——
+        # 本地 CLI 就是这么调的，否则"我叫小林"在命令行里永远不会被记住。
+        self.learn_name(text, user_id or "handler", owner=True)
 
         # 到期：先让她说完最后一句，再走回收流程
         if self.lifespan.is_expired():
@@ -128,6 +227,31 @@ class Giftia:
         reply = self._chat(text)
         self._post_turn()
         return reply
+
+    def _guest_reply(self, text: str) -> str:
+        """访客模式：搭档以外的人在群里跟她说话。
+
+        刻意**不**检索记忆、不写消息、不推进关系与心情：
+        客人碰不到你们之间的隐私，也不会替你刷亲密度。
+        """
+        system = build_system_prompt(
+            self.settings,
+            self.status(),
+            [],
+            now=self.clock.now(),
+            bond=None,
+            mood=None,
+            handler_name=self.handler_name,
+            scene="guest",
+            people=self._people_for_prompt(),
+        )
+        try:
+            return self.llm.chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": text}]
+            )
+        except LLMError as exc:
+            self.notices.append(f"[模型请求失败] {exc}")
+            return "……（她朝你点了点头，没有多说什么。）"
 
     # ── 一次对话 ──────────────────────────────────────────
     def current_bond(self, now=None) -> Bond:
@@ -201,6 +325,7 @@ class Giftia:
             mood=self.current_mood(now),
             handler_name=self.handler_name,
             scene=self.last_scene,
+            people=self._people_for_prompt(),
         )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))
@@ -375,7 +500,8 @@ class Giftia:
         return "\n".join(
             [
                 self.lifespan.status_block(),
-                f"她怎么叫你    {self.handler_name}（改口：/name 小林）",
+                f"她怎么叫你    {self.handler_name or '（她还不知道，去问 /name）'}"
+                f"　改口：/name 小林",
                 f"关系阶段      {b.stage.label}（亲密度 {b.affinity:.0f}/100，"
                 f"认识 {b.days_known:.1f} 天）",
                 f"此刻心情      {mood.label}",
@@ -425,6 +551,19 @@ class Giftia:
                 "手动指定：/mood low（调试用，会按正常时长过期）",
             ]
         )
+
+    def people_text(self) -> str:
+        people = self.known_people()
+        if not people:
+            return ("她还谁都不认识。\n"
+                    "群里有人自我介绍（「我叫阿伟」）时她会记下来；"
+                    "你也可以直接告诉她：/name 小林")
+        owner = self.handler_id
+        lines = ["她认得这些人（她只知道谁是谁，不知道别人的底细）：", ""]
+        for uid, name in people.items():
+            mark = "　← 你" if owner and uid == owner else ""
+            lines.append(f"  · {name}{mark}")
+        return "\n".join(lines)
 
     def force_mood(self, key: str) -> str:
         key = (key or "").strip()
@@ -565,7 +704,6 @@ def handle_message(
         reply = handle_message(群里收到的文本, user_id=发送者openid, scene="group")
     """
     return get_default(settings).handle(text, user_id, scene=scene)
-
 
 def current() -> Giftia | None:
     return _default

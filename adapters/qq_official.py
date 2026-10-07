@@ -285,12 +285,23 @@ class QQBot:
 
         owner = self.owner_id()
         if owner and user_id != owner:
-            # 一个"她"只服务一个搭档：别人叫她不进记忆，也不占用她的寿命
-            if kind == "group" and not self.settings.runtime.group_stranger_reply:
-                # 群里被陌生人 @ —— 默认装作没看见，免得在群里刷屏
-                print("[跳过] 群里陌生人叫她，按配置保持安静")
+            # 一个"她"只服务一个搭档：别人说话不进你们的记忆，也不占她的寿命
+            hub = brain_mod.get_default(self.settings)
+            if kind != "group":
+                self.send(kind, target, DEFLECT, msg_id)
                 return
-            self.send(kind, target, DEFLECT, msg_id)
+            # 群里：先让她认人（这是她"认得群里的人"的唯一来源），再决定要不要出声
+            if hub.learn_name(content, user_id, owner=False):
+                print(f"[认得] 群里有人叫「{hub.known_people().get(user_id, '')}」")
+            if not self.settings.runtime.group_stranger_reply:
+                print("[跳过] 群里其他人说话，按配置保持安静")
+                return
+            # 以"客人"身份礼貌回一句：不检索记忆、不落库、不推进关系
+            guest_reply = handle_message(
+                content, user_id, settings=self.settings, scene="guest"
+            )
+            print(f"[{self.settings.persona.name}·客人] {guest_reply}")
+            self.send(kind, target, guest_reply, msg_id)
             return
 
         # ★ 整个项目的接缝：平台消息 → 她
@@ -314,12 +325,11 @@ class QQBot:
 
     # ══ 认人：官方 OpenID 与真实 QQ 号不互通，只能靠一句 /bind ══
     def owner_id(self) -> str:
-        """优先用 --owner / QQ_OWNER_OPENID；没配就读运行时绑定。"""
+        """优先用 --owner / QQ_OWNER_OPENID；没配就读运行时绑定（/bind 写进去的）。"""
         if self.owner_openid:
             return self.owner_openid
         try:
-            hub = brain_mod.get_default(self.settings)
-            return str(hub.store.state_get(OWNER_KEY, "") or "")
+            return brain_mod.get_default(self.settings).handler_id
         except Exception:
             return ""
 
@@ -346,7 +356,7 @@ class QQBot:
             if owner and owner != user_id:
                 self.send(kind, target, "……抱歉，我已经有搭档了。", msg_id)
                 return True
-            hub.store.state_set(OWNER_KEY, user_id)
+            hub.set_handler_id(user_id)
             print(f"[绑定] 搭档 = {user_id}")
             self.send(kind, target, "……嗯。我记住了。\n以后我只认你一个人说话。", msg_id)
             return True
@@ -355,7 +365,7 @@ class QQBot:
             if owner and owner != user_id:
                 self.send(kind, target, "……这个不能由你来说。", msg_id)
                 return True
-            hub.store.state_set(OWNER_KEY, "")
+            hub.set_handler_id("")
             self.send(kind, target, "……好。那我先站远一点。", msg_id)
             return True
 
