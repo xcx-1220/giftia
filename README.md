@@ -20,8 +20,12 @@ python run.py --mock
 # 一次看完她的一生（约 1 分钟，推荐先看这个）
 python tools/demo_life.py
 
-# 73 项端到端自测：寿命、分层、召回强化、置信度、退化、隔离性、回收、换代、迁移
+# 86 项端到端自测：寿命、分层、召回强化、置信度、退化、人格注入、隔离性、回收、换代、迁移
 python tools/selftest.py
+
+# 看她这一轮实际被注入了什么（人格 + 状态 + 记忆 + 规则，离线、不写库）
+# 跑两遍：清晰期 vs 终端服务迫近，对比同一个她怎么变
+python tools/show_prompt.py
 
 # 真实 API 连通性检查：鉴权 + 人格 + 真实 JSON 记忆整理（含分层）+ 查询改写 + 回忆录
 # 全程在临时目录跑，不碰 data/ 里的正式数据
@@ -63,6 +67,11 @@ python run.py --reset --yes           # 清空重来
 ---
 
 ## 2. 五个机制，分别在哪
+
+> **人格是怎么进去的？** 每一轮请求只有一条 system 消息，由 `giftia/persona.py` 的
+> `build_system_prompt()` 拼成六块：人格内核（来自 `config/persona.toml`，永不变，稳定命中缓存）
+> → 出戏提示 → 此刻状态（时间/剩余寿命/记忆阶段）→ 关于记忆 → 你现在想起的事（带置信度标记）
+> → 对话规则。想看实物，跑 `python tools/show_prompt.py`，或在会话里输入 `/prompt 一句话`。
 
 | 机制 | 文件 | 怎么实现的 |
 |---|---|---|
@@ -112,6 +121,7 @@ python run.py --reset --yes           # 清空重来
 | 指令 | 作用 |
 |---|---|
 | `/status` | 寿命、进度条、阶段、记忆与消息计数、虚拟时钟 |
+| `/prompt <一句话>` | **看她这一轮实际被注入了什么**：人格内核 + 此刻状态 + 想起的事 + 规则，原样打印 |
 | `/memories` | 她的长期记忆（**你**看到的原始版） |
 | `/recall <文本>` | 检索演示：她拿到什么、模糊成什么样、原始值是什么 |
 | `/remember` | 立刻把未整理的对话压成记忆条目 |
@@ -396,7 +406,8 @@ giftia/recycle.py       回收仪式：回忆录、封存、换代
 giftia/brain.py         编排层 + 平台无关入口 handle_message()
 giftia/cli.py           终端界面与指令
 run.py                  启动入口
-tools/selftest.py       73 项端到端自测（离线，不需要 key）
+tools/selftest.py       86 项端到端自测（离线，不需要 key）
+tools/show_prompt.py    打印她这一轮实际被注入的内容（人格审计用）
 tools/ws_selftest.py    17 项 WebSocket 协议自测（本地服务端，不联网）
 tools/qq_protocol_selftest.py  28 项 QQ 适配器协议自测（本地假网关，不需要凭据）
 tools/ws_testserver.py  两个协议测试共用的服务端帧编解码

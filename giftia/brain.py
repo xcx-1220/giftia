@@ -103,7 +103,11 @@ class Giftia:
         return reply
 
     # ── 一次对话 ──────────────────────────────────────────
-    def _chat(self, text: str) -> str:
+    def _prepare(self, text: str) -> tuple[list[dict], list[Recalled]]:
+        """组装这一轮真正会发给模型的消息。
+
+        不落库、不请求模型——所以 /prompt 可以随时查看她被注入了什么。
+        """
         life = self.status()
         now = self.clock.now()
         recent = self.store.recent_messages(
@@ -135,17 +139,40 @@ class Giftia:
                         f"{len(merged)} 条"
                     )
 
+        system = build_system_prompt(self.settings, life, recalled, now=now)
+        messages: list[dict] = [{"role": "system", "content": system}]
+        messages.extend(self._window(recent))
+        messages.append({"role": "user", "content": text})
+        return messages, recalled
+
+    def preview_prompt(self, text: str) -> str:
+        """把「这一轮实际注入给她的一切」原样打印出来，用于核对人格与记忆。"""
+        messages, recalled = self._prepare(text or "（空）")
+        self.last_recalled = recalled
+        lines = [
+            f"下面就是这一轮发给模型的完整请求（{len(messages)} 条消息）。",
+            "system 那一条 = 系统提示词 = 她的人格内核 + 此刻状态 + 想起的事 + 规则。",
+            "",
+        ]
+        for i, m in enumerate(messages):
+            role = m["role"]
+            tag = {"system": "SYSTEM（人格与状态）", "user": "USER", "assistant": "她"}.get(
+                role, role
+            )
+            lines.append(f"───── [{i}] {tag} ─────")
+            lines.append(str(m["content"]))
+            lines.append("")
+        return "\n".join(lines)
+
+    def _chat(self, text: str) -> str:
+        messages, recalled = self._prepare(text)
+        now = self.clock.now()
         self.last_recalled = recalled
         if recalled:
             # 被塞进提示词 ≠ 被想起。这里只记账，强化要等她真的说出口。
             self.store.mark_injected(
                 [r.memory["id"] for r in recalled], self.clock.iso(now)
             )
-
-        system = build_system_prompt(self.settings, life, recalled, now=now)
-        messages: list[dict] = [{"role": "system", "content": system}]
-        messages.extend(self._window(recent))
-        messages.append({"role": "user", "content": text})
 
         self.store.add_message(
             self.session_id, self.instance_no, "user", text, self.clock.iso(now)

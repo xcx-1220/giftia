@@ -342,6 +342,32 @@ def main() -> int:
           retention_of(m_rows[0], settings.memory, lay.clock.now()) > 0)
     migrated.close()
 
+    # ══ 16. 人格注入 ═══════════════════════════════════════════
+    print("\n16. 人格注入：她「是谁」这件事的唯一来源")
+    inj = Giftia(make_settings(tmp / "inject", 100.0), llm=MockLLM(settings.model))
+    inj.handle("你好")
+    inj_messages, _ = inj._prepare("你还记得我吗")
+    head = inj_messages[0]
+    check("第一条消息是 system（人格入口）", head["role"] == "system")
+    body = str(head["content"])
+    check("人格内核被注入", "Giftia 型拟人智能体" in body)
+    check("名字被注入", inj.settings.persona.name in body)
+    check("型号被注入", inj.settings.persona.model_code in body)
+    check("此刻状态被注入（剩余寿命）", "你的剩余寿命" in body)
+    check("记忆阶段说明被注入", "【关于记忆】" in body)
+    check("她此刻想起的事被注入", "【你现在想起的事】" in body)
+    check("对话规则被注入", "【本次对话的规则】" in body)
+    check("出戏处理提示被注入", "是不是程序" in body)
+    check("最后一条是这次的输入",
+          inj_messages[-1]["role"] == "user"
+          and inj_messages[-1]["content"] == "你还记得我吗")
+    check("默认人格仍是艾拉（还没被你改过）", inj.settings.persona.name == "艾拉")
+    preview = inj.preview_prompt("在吗")
+    check("preview_prompt 能原样打印注入内容（可审计）",
+          "SYSTEM（人格与状态）" in preview and "Giftia 型拟人智能体" in preview)
+    check("预览不会写库（不污染记忆）", inj.store.count_messages(1) == 2,
+          str(inj.store.count_messages(1)))
+
     brain.store.close()
     brain2.store.close()
 
