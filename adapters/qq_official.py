@@ -48,9 +48,13 @@ from giftia.config import load_env_file, load_settings  # noqa: E402
 from giftia.outreach import can_send  # noqa: E402
 from giftia.ws import WebSocket, WSClosed, WSTimeout  # noqa: E402
 
-# ── 常量（已对照官方文档）────────────────────────────────────────
+# ── 常量（鉴权、网关、identify、READY 已用真实凭据验证过）─────────
 API_BASE = "https://api.bot.qq.com"
-FALLBACK_WS = "wss://api.bot.qq.com/websocket/"
+# 注意：这**不是**文档里写的那个地址。
+# 文档示例说网关是 wss://api.bot.qq.com/websocket/，但 2026-10 用真实凭据
+# 调 GET /gateway 返回的是 wss://api.sgroup.qq.com/websocket/。
+# 所以这里始终以 /gateway 的返回为准，这个常量只是拿不到时的兜底。
+FALLBACK_WS = "wss://api.sgroup.qq.com/websocket/"
 
 OP_DISPATCH = 0
 OP_HEARTBEAT = 1
@@ -630,8 +634,11 @@ def main() -> int:
     bot = QQBot(app_id, secret, owner_openid=args.owner, api_base=args.api_base,
                 mock_llm=args.mock_llm)
     if not bot.owner_openid:
-        print("[提醒] 未设置 QQ_OWNER_OPENID：任何人找她都会共用同一份记忆和寿命。",
-              file=sys.stderr)
+        print(
+            "[提醒] 还没认人：在 QQ 里私聊她发一句 /bind，她就把你记成搭档了。\n"
+            "        （在那之前，任何人跟她说话都会共用同一份记忆和寿命。）",
+            file=sys.stderr,
+        )
     bot.run()
     return 0
 

@@ -339,10 +339,12 @@ python adapters/qq_official.py             # 真正连上 QQ
 - **协议细节逐条对照官方文档**（2026-10）：鉴权地址 `api.bot.qq.com`、`Authorization: QQBot {token}`、
   `GET /gateway` 取网关地址、op10/2/1/11/6 的消息序列、被动回复的 `msg_id` + `msg_seq`、
   事件重复推送的去重。**业务失败时 HTTP 仍是 200，必须看响应体里的 `code`**——这条已经处理了。
-- **仍然没有验证的部分**：我没有 QQ 开放平台凭据，所以**真实的连接、鉴权与收发没有跑过**。
-  首次运行如果有问题，大概率集中在两处：`--api-base`（沙箱环境地址与正式环境不同，
-  可用环境变量 `QQ_API_BASE` 覆盖）和群聊事件里 `group_openid` 的字段名。
-  这两处都留了注释和命令行开关，改起来是一行的事。
+- **仍然没有验证的部分**：真实的消息收发。**连接层已经用真实凭据验证过了**（2026-10）：
+  鉴权、`GET /gateway` 取地址、op10 hello、op2 identify、op0 READY 全部走通
+  （intents = `GROUP_AND_C2C_EVENT` 被平台接受，心跳周期 41 秒）。
+  只剩"平台推过来一条消息 → 她回过去"这一步要等你加了机器人才能验。
+  顺带一个真机才发现的事：`GET /gateway` 实际返回的是 `wss://api.sgroup.qq.com/websocket/`，
+  **不是**文档示例里写的 `api.bot.qq.com` —— 所以代码始终以 `/gateway` 的返回为准。
 
 ### 平台限制（会直接影响她的行为方式）
 
