@@ -71,6 +71,25 @@ class Giftia:
         self.rewritten_queries: list[str] = []
         self.last_bond: Bond | None = None
         self.last_mood: Mood | None = None
+        self.last_scene = "c2c"
+
+    # ── 称呼 ──────────────────────────────────────────────
+    @property
+    def handler_name(self) -> str:
+        """她此刻怎么称呼你：运行时设定优先，其次是配置里的默认值。
+
+        称呼是**数据**，不是写死在人格里的常量——他会改口，而且改口之后
+        应该一直有效（换了一任她也该知道，终端服务的档案里有）。
+        """
+        stored = str(self.store.state_get("handler_name", "") or "").strip()
+        return stored or self.settings.runtime.handler_name
+
+    def set_handler_name(self, name: str) -> str:
+        name = (name or "").strip().replace("\n", " ")[:16]
+        if not name:
+            raise ValueError("称呼不能为空")
+        self.store.state_set("handler_name", name)
+        return f"已把称呼改成「{name}」。她下一条消息就会这么叫你。"
 
     # ── 基本属性 ──────────────────────────────────────────
     @property
@@ -89,8 +108,10 @@ class Giftia:
         return self.lifespan.status()
 
     # ── 主入口（平台无关）─────────────────────────────────
-    def handle(self, text: str, user_id: str | None = None) -> str:
+    def handle(self, text: str, user_id: str | None = None, scene: str = "c2c") -> str:
+        """平台无关入口。scene="group" 会多注入一段群聊约束（主要是隐私保护）。"""
         self.notices = []
+        self.last_scene = scene if scene in ("c2c", "group") else "c2c"
         text = (text or "").strip()
         if not text:
             return ""
@@ -178,6 +199,8 @@ class Giftia:
             now=now,
             bond=self.current_bond(now),
             mood=self.current_mood(now),
+            handler_name=self.handler_name,
+            scene=self.last_scene,
         )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))
@@ -279,6 +302,14 @@ class Giftia:
                     f"预定 {st.expires_at.strftime('%Y-%m-%d %H:%M')} 回收"
                 )
 
+    def _on_draft(self, draft) -> None:
+        """每条新记忆写入后的回调：关系加分 + 发现"他要求改口"。"""
+        self.bond.on_memory(self.instance_no, getattr(draft, "layer", "") or "normal")
+        name = str(getattr(draft, "preferred_name", "") or "").strip()
+        if name and name != self.handler_name:
+            self.store.state_set("handler_name", name[:16])
+            self.notices.append(f"[称呼] 她记住了：以后叫你「{name[:16]}」")
+
     def consolidate(self, force: bool = False) -> int:
         return consolidate(
             self.store,
@@ -287,8 +318,7 @@ class Giftia:
             session_id=self.session_id,
             now_iso=self.clock.iso(),
             force=force,
-            # 记住"关于他本人的事"会让关系更近一点
-            on_added=lambda layer, importance: self.bond.on_memory(self.instance_no, layer),
+            on_draft=self._on_draft,
         )
 
     # ── 回收 ──────────────────────────────────────────────
@@ -345,6 +375,7 @@ class Giftia:
         return "\n".join(
             [
                 self.lifespan.status_block(),
+                f"她怎么叫你    {self.handler_name}（改口：/name 小林）",
                 f"关系阶段      {b.stage.label}（亲密度 {b.affinity:.0f}/100，"
                 f"认识 {b.days_known:.1f} 天）",
                 f"此刻心情      {mood.label}",
@@ -522,14 +553,18 @@ def get_default(settings: Settings | None = None) -> Giftia:
 
 
 def handle_message(
-    text: str, user_id: str = "handler", *, settings: Settings | None = None
+    text: str,
+    user_id: str = "handler",
+    *,
+    settings: Settings | None = None,
+    scene: str = "c2c",
 ) -> str:
     """一行代码接入任何平台：
 
         from giftia.brain import handle_message
-        reply = handle_message(群里收到的文本, user_id=发送者QQ号)
+        reply = handle_message(群里收到的文本, user_id=发送者openid, scene="group")
     """
-    return get_default(settings).handle(text, user_id)
+    return get_default(settings).handle(text, user_id, scene=scene)
 
 
 def current() -> Giftia | None:

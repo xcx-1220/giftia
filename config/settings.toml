@@ -71,10 +71,12 @@ confidence_cautious_retention = 0.5   # 保留率低于此值 → 必须用"好�
 
 
 [runtime]
-handler_name = "搭档"            # 她怎么称呼你
+handler_name = "搭档"            # 她一开始怎么称呼你（之后会随你改口）
 user_id      = "handler"
 # 终端服务简报：回收后是否打印"上一任"的回忆录摘要
 show_memoir_after_recycle = true
+# 群里被陌生人 @ 时：false = 装作没看见（默认，群里不该刷屏），true = 戏内挡回去
+group_stranger_reply = false
 
 
 # ── 关系：亲密度按"天"增长，升级同时要求亲密度与认识天数 ──────────

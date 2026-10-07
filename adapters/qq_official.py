@@ -74,7 +74,8 @@ DEFLECT = (
 
 COMMANDS = """\
 /bind          绑定为你的搭档（官方 OpenID 与 QQ 号不互通，只能这样认人）
-/status        她的寿命与记忆状态
+/name 小林      改口：以后她这么叫你
+/status        她的寿命、关系与记忆状态
 /unbind        解除绑定（需要当前搭档本人）
 /help          这条帮助\
 """
@@ -285,11 +286,21 @@ class QQBot:
         owner = self.owner_id()
         if owner and user_id != owner:
             # 一个"她"只服务一个搭档：别人叫她不进记忆，也不占用她的寿命
+            if kind == "group" and not self.settings.runtime.group_stranger_reply:
+                # 群里被陌生人 @ —— 默认装作没看见，免得在群里刷屏
+                print("[跳过] 群里陌生人叫她，按配置保持安静")
+                return
             self.send(kind, target, DEFLECT, msg_id)
             return
 
         # ★ 整个项目的接缝：平台消息 → 她
-        reply = handle_message(content, user_id, settings=self.settings)
+        # scene 会多注入一段群聊约束（主要是隐私：群里别人也看得到）
+        reply = handle_message(
+            content,
+            user_id,
+            settings=self.settings,
+            scene="group" if kind == "group" else "c2c",
+        )
         print(f"[{self.settings.persona.name}] {reply}")
         self.send(kind, target, reply, msg_id)
 
@@ -346,6 +357,18 @@ class QQBot:
                 return True
             hub.store.state_set(OWNER_KEY, "")
             self.send(kind, target, "……好。那我先站远一点。", msg_id)
+            return True
+
+        if cmd == "/name":
+            if owner and user_id != owner:
+                self.send(kind, target, DEFLECT, msg_id)
+                return True
+            new_name = parts[1].strip() if len(parts) > 1 else ""
+            if not new_name:
+                self.send(kind, target, f"……你现在叫我「{hub.handler_name}」。", msg_id)
+                return True
+            hub.set_handler_name(new_name)
+            self.send(kind, target, f"……好。{new_name}。我记住了。", msg_id)
             return True
 
         if cmd == "/status":

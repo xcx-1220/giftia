@@ -133,6 +133,13 @@ class FakeGateway(threading.Thread):
                     "content": "你好呀，你是谁",
                     "message_type": 0,
                 }),
+                self._event(6, "GROUP_AT_MESSAGE_CREATE", {   # 群里陌生人 @ 她
+                    "id": "MSG-4",
+                    "author": {"user_openid": "OTHER"},
+                    "group_openid": "GROUP-1",
+                    "content": "<@!999999> 你也会理我吗",
+                    "message_type": 0,
+                }),
             ):
                 send_frame(conn, OP_TEXT, blob)
 
@@ -281,6 +288,9 @@ def main() -> int:
     check("重复推送的那条事件没有导致重复回复（去重生效）", len(c2c) == 1,
           f"收到 {len(c2c)} 条回复")
     check("全流程一共只发出 3 条消息", len(sends) == 3, str([c[1] for c in sends]))
+    check("群里陌生人 @ 她 → 保持安静，不在群里刷屏（默认策略）",
+          len([c for c in sends if "GROUP-1" in c[1]]) == 1,
+          str([c[1] for c in sends]))
 
     print("\n4. 群聊 @ 标记与陌生人隔离")
     user_texts = results.get("user_texts") or []

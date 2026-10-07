@@ -26,7 +26,7 @@ for _stream in (sys.stdout, sys.stderr):
 from giftia.bond import stage_for  # noqa: E402
 from giftia.brain import FAILURE_LINES, Giftia  # noqa: E402
 from giftia.config import Settings, load_settings  # noqa: E402
-from giftia.llm import LLMError, MockLLM  # noqa: E402
+from giftia.llm import LLMError, MemoryDraft, MockLLM  # noqa: E402
 from giftia.memory import (  # noqa: E402
     confidence_of,
     effective_blur,
@@ -47,6 +47,22 @@ class SynonymLLM(MockLLM):
 
     def rewrite_query(self, text: str) -> list[str]:
         return ["驾照 紧张"] if "证件" in (text or "") else []
+
+
+class NameLLM(MockLLM):
+    """模拟模型在整理记忆时发现"他要求改口"。"""
+
+    def extract_memories(self, transcript: str, *, name: str = "Giftia"):
+        return [
+            MemoryDraft(
+                summary="搭档要求以后叫他小林。",
+                tags="称呼,约定",
+                emotion="郑重",
+                importance=0.9,
+                layer="core",
+                preferred_name="小林",
+            )
+        ]
 
 PASS, FAIL = 0, 0
 
@@ -511,6 +527,54 @@ def main() -> int:
     expect = md2.mood._roll(md2.clock.now(), md2.instance_no)
     check("心情过期后回到当日掷出来的那种",
           md2.current_mood().key == expect, f"{md2.current_mood().key} vs {expect}")
+
+    # ══ 19. 称呼 ═══════════════════════════════════════════════
+    print("\n19. 称呼：是数据，不是写死在人格里的常量")
+    nm = Giftia(make_settings(tmp / "name", 81920.0), llm=MockLLM(settings.model))
+    check("默认叫「搭档」", nm.handler_name == settings.runtime.handler_name, nm.handler_name)
+    base_prompt = nm._prepare("在吗")[0][0]["content"]
+    check("默认称呼被注入人格", "你称呼他为「搭档」" in base_prompt)
+    nm.set_handler_name("小林")
+    check("改口之后立即生效", nm.handler_name == "小林", nm.handler_name)
+    renamed = nm._prepare("在吗")[0][0]["content"]
+    check("注入的称呼跟着变",
+          "你称呼他为「小林」" in renamed and "你称呼他为「搭档」" not in renamed)
+    check("人格里不再有跟她较劲的「改不掉」",
+          "改不掉" not in renamed)
+    nm.run_recycle("测试换代")
+    check("换代后称呼仍保留（终端服务档案里有）", nm.handler_name == "小林", nm.handler_name)
+    check("但新的她不记得你们的关系", nm.current_bond().affinity == 0.0)
+
+    nm2 = Giftia(make_settings(tmp / "name2", 81920.0), llm=NameLLM(settings.model))
+    nm2.handle("以后叫我小林吧")
+    nm2.consolidate(force=True)
+    check("模型识别出改口要求时自动改口", nm2.handler_name == "小林", nm2.handler_name)
+    check("改口时会给出提示", any("称呼" in n for n in nm2.notices), str(nm2.notices))
+
+    nm3 = Giftia(make_settings(tmp / "name3", 81920.0), llm=MockLLM(settings.model))
+    nm3.handle("我叫小林，今年二十八岁")
+    nm3.consolidate(force=True)
+    check("只是自我介绍不会触发改口（避免误判）",
+          nm3.handler_name == settings.runtime.handler_name, nm3.handler_name)
+
+    # ══ 20. 群聊情境 ═══════════════════════════════════════════
+    print("\n20. 群聊：她不能把你的私事当众说出去")
+    grp = Giftia(make_settings(tmp / "scene", 100.0), llm=MockLLM(settings.model))
+    grp.handle("我下周三要考驾照，有点紧张")
+    grp.consolidate(force=True)
+    private_prompt = grp._prepare("在吗")[0][0]["content"]
+    check("私聊时没有群聊约束", "【现在的情境】" not in private_prompt)
+
+    grp.handle("我之前跟你说过什么事来着", scene="group")
+    group_prompt = grp._prepare("在吗")[0][0]["content"]
+    check("群聊时注入了情境约束", "【现在的情境】" in group_prompt)
+    check("约束里写明了不能当众说什么", "不能当众说" in group_prompt)
+    check("约束要求只回被点名的人", "只回他" in group_prompt)
+    check("约束要求群里说话更短", "更短" in group_prompt)
+
+    grp.handle("在吗", scene="c2c")
+    check("回到私聊后约束消失",
+          "【现在的情境】" not in grp._prepare("在吗")[0][0]["content"])
 
     brain.store.close()
     brain2.store.close()

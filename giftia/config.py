@@ -170,6 +170,8 @@ class RuntimeConfig:
     handler_name: str = "搭档"
     user_id: str = "handler"
     show_memoir_after_recycle: bool = True
+    # 群里被陌生人 @ 时：false = 装作没看见（默认，群聊不该刷屏），true = 戏内挡回去
+    group_stranger_reply: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,24 +184,28 @@ class Persona:
     greeting_line: str = "……你来了。"
     after_recycle_line: str = "……初次见面。"
     out_of_character_hint: str = ""
+    group_hint: str = ""
 
-    def core_text(self) -> str:
-        """把 {name} / {model_code} / {handler_title} 占位符填好。"""
-        return _fill(self.core, self)
+    def core_text(self, handler_title: str | None = None) -> str:
+        """填好占位符。handler_title 传运行时称呼（他会改口），不传则用配置里的默认值。"""
+        return _fill(self.core, self, handler_title)
 
-    def hint_text(self) -> str:
-        return _fill(self.out_of_character_hint, self)
+    def hint_text(self, handler_title: str | None = None) -> str:
+        return _fill(self.out_of_character_hint, self, handler_title)
 
     def line(self, key: str) -> str:
         return _fill(getattr(self, key, "") or "", self)
 
+    def group_text(self, handler_title: str | None = None) -> str:
+        return _fill(self.group_hint, self, handler_title)
 
-def _fill(text: str, p: "Persona") -> str:
+
+def _fill(text: str, p: "Persona", handler_title: str | None = None) -> str:
     return (
         (text or "")
         .replace("{name}", p.name)
         .replace("{model_code}", p.model_code)
-        .replace("{handler_title}", p.handler_title)
+        .replace("{handler_title}", (handler_title or "").strip() or p.handler_title)
     )
 
 

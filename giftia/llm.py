@@ -33,6 +33,7 @@ class MemoryDraft:
     emotion: str = ""
     importance: float = 0.5
     layer: str = ""          # core | important | normal（空 = 由程序按重要性判定）
+    preferred_name: str = ""  # 他明确要求改称呼时才填（例如"以后叫我小林"）
 
 
 LAYERS = ("core", "important", "normal")
@@ -46,14 +47,18 @@ CONSOLIDATE_SYSTEM = """你是 Giftia 的记忆整理模块（她本人看不到
 不要记寒暄、天气、以及没有信息量的闲聊。宁少勿多；确实没有值得记的，就返回空数组。
 
 严格输出 JSON，不要任何解释文字：
-{{"memories":[{{"summary":"一句话，不超过60字，用第三人称，用「搭档」指代对方","tags":"逗号分隔的2-4个关键词","emotion":"当时的情绪，2-6字","importance":0.0到1.0之间的小数,"layer":"core|important|normal"}}]}}
+{{"memories":[{{"summary":"一句话，不超过60字，用第三人称，用「搭档」指代对方","tags":"逗号分隔的2-4个关键词","emotion":"当时的情绪，2-6字","importance":0.0到1.0之间的小数,"layer":"core|important|normal","preferred_name":""}}]}}
 
 importance 参考：0.9 以上=非常重要的约定或心事；0.5=日常但有意义；0.2 以下=可记可不记。
 layer 判定（很重要，决定这条记忆会不会随时间变模糊）：
 - core：**关于这个人本身的核心事实**——名字/称呼、身份、你们的关系、郑重的约定、他明确说过的偏好或禁忌。
   她会一直记得这些，哪怕到了生命尽头。
 - important：重要的事件、情绪波动、他正在经历的重要事情（考试、生病、搬家）。
-- normal：其余日常。"""
+- normal：其余日常。
+
+preferred_name 的判定（**只在这一种情况下填**）：
+他**明确要求你换个称呼**才填，例如"以后叫我小林""别叫我搭档了"→ 填 "小林"。
+只是自我介绍（"我叫小林"）**不要填**，闲聊里提到别人的名字也不要填。绝大多数情况下这里是空字符串。"""
 
 REWRITE_SYSTEM = """你是记忆检索的查询改写模块。
 把搭档的这句话改写成 2～3 个**用于检索长期记忆**的短查询：补上同义词、上位词、可能的说法。
@@ -235,6 +240,7 @@ def parse_memory_drafts(raw: str) -> list[MemoryDraft]:
                 emotion=emotion,
                 importance=importance,
                 layer=layer,
+                preferred_name=str(it.get("preferred_name", "") or "").strip()[:16],
             )
         )
     return drafts

@@ -53,19 +53,26 @@ def build_system_prompt(
     now: datetime | None = None,
     bond=None,
     mood=None,
+    handler_name: str = "",
+    scene: str = "c2c",
 ) -> str:
-    """一次请求的 system 消息：人格 → 关系 → 心情 → 状态 → 记忆 → 规则。
+    """一次请求的 system 消息：人格 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
 
     注意**不给模型看数字**（亲密度、保留率、天数都不给），只给阶段名和行为指引——
     否则她会在对话里报出"我们的亲密度是 70"，那就穿帮了。
     数字只出现在 /status、/bond 这些给你看的界面上。
+
+    handler_name 是**运行时**的称呼（他会改口），不传就用配置里的默认值。
+    scene="group" 时会多注入一段群聊约束，主要是隐私保护：
+    群里别人也看得到，她不能把你私下说的事当众讲出来。
     """
     p = settings.persona
+    name = (handler_name or "").strip()
     now = now or life.activated_at
-    blocks: list[str] = [p.core_text().strip()]
+    blocks: list[str] = [p.core_text(name).strip()]
 
-    if p.hint_text().strip():
-        blocks.append("【如果有人坚持说你是程序】\n" + p.hint_text().strip())
+    if p.hint_text(name).strip():
+        blocks.append("【如果有人坚持说你是程序】\n" + p.hint_text(name).strip())
 
     if bond is not None and (bond.stage.note or bond.stage.label):
         body = f"你们现在的关系：{bond.stage.label}"
@@ -78,6 +85,11 @@ def build_system_prompt(
         if mood.note:
             body += "\n" + mood.note
         blocks.append("【你今天的心情】\n" + body)
+
+    if scene == "group":
+        group_text = p.group_text(name).strip()
+        if group_text:
+            blocks.append("【现在的情境】\n" + group_text)
 
     state = [
         f"当前时间：{now.strftime('%Y年%m月%d日 %H:%M')}",
