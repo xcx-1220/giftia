@@ -183,12 +183,19 @@ def _scene_line(scene: str, is_handler: bool) -> str:
 
 
 def _render_people(people: list[tuple[str, bool]]) -> str:
-    """群里的花名册。她只知道谁是谁，不知道别人的底细。"""
+    """群里的花名册。她只知道谁是谁，不知道别人的底细。
+
+    搭档那一行的名字可能已经写明了"群里叫某某，是同一个人"，
+    所以这里不重复追加"（你的搭档）"。
+    """
     if not people:
         return ""
     lines = ["你在群里认得这些人，别叫错："]
     for person, is_owner in people:
-        lines.append(f"- {person}（你的搭档）" if is_owner else f"- {person}")
+        if is_owner and "你的搭档" not in person:
+            lines.append(f"- {person}（你的搭档）")
+        else:
+            lines.append(f"- {person}")
     lines.append("其他人你还不认识——等他们自我介绍，别乱猜、也别乱叫。")
     return "\n".join(lines)
 

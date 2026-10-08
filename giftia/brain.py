@@ -213,15 +213,27 @@ class Giftia:
         return ""
 
     def _people_for_prompt(self) -> list[tuple[str, bool]]:
-        """群聊花名册。搭档本人也算其中一员（他的名字存在 handler_name，不在名单里）。"""
+        """群聊花名册。搭档本人也算其中一员（他的名字存在 handler_name，不在名单里）。
+
+        **搭档在群里显示的是 QQ 昵称，而她叫他的是另一个名字**——两个都要给她，
+        并且说明是同一个人。真机数据里她正是因为这个写过
+        "搭档与群友习惯微笑i相识满一天"（把同一个人当成了两个）。
+        """
         people = self.known_people()
         owner_id = self.handler_id
         owner_name = self.handler_name
-        if owner_id and owner_name:
-            people = {**people, owner_id: owner_name}
-        return [
-            (name, bool(owner_id) and uid == owner_id) for uid, name in people.items()
-        ]
+        rows: list[tuple[str, bool]] = []
+        for uid, name in people.items():
+            if uid == owner_id and owner_name:
+                if name and name != owner_name:
+                    rows.append((f"{owner_name}（群里叫「{name}」，是同一个人）", True))
+                else:
+                    rows.append((owner_name, True))
+            else:
+                rows.append((name, bool(owner_id) and uid == owner_id))
+        if owner_id and owner_name and all(not is_owner for _n, is_owner in rows):
+            rows.append((owner_name, True))
+        return rows
 
     # ── 基本属性 ──────────────────────────────────────────
     @property

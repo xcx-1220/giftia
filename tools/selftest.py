@@ -1096,6 +1096,20 @@ def main() -> int:
     check("她能把名字和人对上号（下一个说话的人）", "阿伟" in p2)
     check("花名册里也标出了搭档", "小林（你的搭档）" in p2)
 
+    # 搭档在群里的昵称与称呼对不上时，必须告诉她是同一个人
+    al = Giftia(make_settings(tmp / "alias", 81920.0), llm=MockLLM(settings.model))
+    al.set_handler_id("OWNER")
+    al.handle("以后叫我椎名就好", user_id="OWNER")
+    al.handle("大家好啊", user_id="OWNER", scene="group", group_id="G-1",
+              speaker_name="习惯微笑i")
+    al_roster = al._prepare("在吗")[0][0]["content"]
+    check("★ 搭档的群昵称会标注成同一个人（否则她会当成两个人）",
+          "习惯微笑i" in al_roster
+          and ("是同一个人" in al_roster or "椎名" in al_roster),
+          al_roster[al_roster.find("【群里你认得的人】") :][:120].replace("\n", " / "))
+    check("而且不会重复追加「你的搭档」", al_roster.count("（你的搭档）") <= 1,
+          str(al_roster.count("（你的搭档）")))
+
     brain.store.close()
     brain2.store.close()
 
