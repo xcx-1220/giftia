@@ -55,7 +55,12 @@ CREATE TABLE IF NOT EXISTS memories (
     scope            TEXT    NOT NULL DEFAULT 'private',
     subject_id       TEXT    NOT NULL DEFAULT '',
     -- 原话是谁说的（群里分清谁是谁）
-    speaker_id       TEXT    NOT NULL DEFAULT ''
+    speaker_id       TEXT    NOT NULL DEFAULT '',
+    -- 这条记忆是关于谁的（搭档 / 某人的名字 / 群里）。
+    -- 决定她能不能分清"这是谁的事"——真机数据里她曾把 A 的课记成 B 的。
+    about            TEXT    NOT NULL DEFAULT '',
+    -- 被合并进哪一条（>0 = 这条是重复的，已经并进那条了，不再参与检索）
+    merged_into      INTEGER NOT NULL DEFAULT 0
 );
 
 -- 她做过的梦。梦不是记忆：不进检索、不参与退化，只在第二天讲给你听。
@@ -102,6 +107,8 @@ class Store:
             "scope": "TEXT NOT NULL DEFAULT 'private'",
             "subject_id": "TEXT NOT NULL DEFAULT ''",
             "speaker_id": "TEXT NOT NULL DEFAULT ''",
+            "about": "TEXT NOT NULL DEFAULT ''",
+            "merged_into": "INTEGER NOT NULL DEFAULT 0",
         },
         "messages": {
             "speaker_id": "TEXT NOT NULL DEFAULT ''",
@@ -285,12 +292,13 @@ class Store:
         scope: str = "private",
         subject_id: str = "",
         speaker_id: str = "",
+        about: str = "",
     ) -> int:
         cur = self.conn.execute(
             "INSERT INTO memories(instance_no, created_ts, happened_ts, summary, tags, "
             "emotion, importance, source_session, layer, strength, event_date, "
-            "scope, subject_id, speaker_id) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "scope, subject_id, speaker_id, about) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 instance_no,
                 created_ts,
@@ -306,10 +314,40 @@ class Store:
                 scope,
                 subject_id,
                 speaker_id,
+                about,
             ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def update_memory(
+        self,
+        memory_id: int,
+        *,
+        summary: str | None = None,
+        tags: str | None = None,
+        importance: float | None = None,
+        layer: str | None = None,
+        about: str | None = None,
+    ) -> None:
+        """让已经记下的那条长大（记忆演进），而不是再记一条重复的。"""
+        sets: list[str] = []
+        args: list = []
+        for col, val in (
+            ("summary", summary),
+            ("tags", tags),
+            ("importance", importance),
+            ("layer", layer),
+            ("about", about),
+        ):
+            if val is not None:
+                sets.append(f"{col} = ?")
+                args.append(val)
+        if not sets:
+            return
+        args.append(memory_id)
+        self.conn.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", tuple(args))
+        self.conn.commit()
 
     # ── dreams ────────────────────────────────────────────
     def add_dream(
@@ -400,11 +438,21 @@ class Store:
         """
         extra, args = self._view_clause(view)
         return self._rows(
-            "SELECT * FROM memories WHERE instance_no = ? AND sealed = 0"
+            "SELECT * FROM memories WHERE instance_no = ? AND sealed = 0 AND merged_into = 0"
             + extra
             + " ORDER BY id ASC",
             (instance_no, *args),
         )
+
+    def mark_merged(self, ids: list[int], into: int) -> None:
+        """把这些重复条目并进 into（不删数据，只是不再参与检索——可回溯）。"""
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        self.conn.execute(
+            f"UPDATE memories SET merged_into = ? WHERE id IN ({marks})", (into, *ids)
+        )
+        self.conn.commit()
 
     def all_memories(self, instance_no: int | None = None) -> list[dict[str, Any]]:
         if instance_no is None:

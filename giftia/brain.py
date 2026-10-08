@@ -32,6 +32,7 @@ from .memory import (
     is_weak,
     mark_cited,
     recall,
+    reconcile,
     retention_of,
 )
 from .mood import Mood, MoodTracker, tone_of
@@ -714,9 +715,20 @@ class Giftia:
 
     # ── 每轮之后 ──────────────────────────────────────────
     def _post_turn(self) -> None:
-        added = self.consolidate(force=False)
+        stats: dict = {}
+        added = self.consolidate(force=False, stats=stats)
         if added:
             self.notices.append(f"[记忆整理] 新增 {added} 条长期记忆")
+        if stats.get("skipped"):
+            self.notices.append(f"[记忆整理] 跳过 {stats['skipped']} 条已经记过的")
+        if stats.get("merged"):
+            self.notices.append(f"[记忆整理] {stats['merged']} 条旧记忆被更详细的版本更新")
+        if added or stats.get("skipped"):
+            rec = self.reconcile_memories()
+            if rec.get("merged"):
+                self.notices.append(
+                    f"[记忆整理] 合并了 {rec['merged']} 条重复的记忆（换个说法记了两遍的）"
+                )
         if self.lifespan.is_terminal_warning():
             flag = f"warned_i{self.instance_no}"
             if not self.store.meta_get_int(flag, 0):
@@ -735,7 +747,7 @@ class Giftia:
             self.store.state_set("handler_name", name[:16])
             self.notices.append(f"[称呼] 她记住了：以后叫你「{name[:16]}」")
 
-    def consolidate(self, force: bool = False) -> int:
+    def consolidate(self, force: bool = False, stats: dict | None = None) -> int:
         scope, subject = self.memory_scope
         return consolidate(
             self.store,
@@ -747,6 +759,7 @@ class Giftia:
             scope=scope,
             subject_id=subject,
             speaker_id=self.speaker_id if scope != "private" else "",
+            stats=stats,
             # 只有**私聊里**跟搭档的对话才推进关系、才能改她的称呼。
             # 群聊再热闹也不给亲密度加分——关系奖励的是"你来了"，不是"你说了多少"。
             on_draft=(
@@ -755,6 +768,35 @@ class Giftia:
                 else None
             ),
         )
+
+    def reconcile_memories(self, *, force: bool = False) -> dict:
+        """整理记忆：把"换个说法记了两遍"的合并掉。
+
+        模型负责判断哪些是同一件事（实测词面相似度切不开这两个情况），
+        程序负责合并。默认同一个归属每 reconcile_hours 才做一次，免得白花调用。
+        """
+        scope, subject = self.memory_scope
+        key = f"reconciled:{scope}:{subject}"
+        now = self.clock.now()
+        if not force:
+            last = str(self.store.state_get(key, "") or "")
+            if last:
+                try:
+                    hours = (now - datetime.fromisoformat(last)).total_seconds() / 3600.0
+                    if hours < self.settings.memory.reconcile_hours:
+                        return {"merged": 0, "groups": 0, "kept": []}
+                except ValueError:
+                    pass
+        result = reconcile(
+            self.store,
+            self.llm,
+            self.settings,
+            instance_no=self.instance_no,
+            scope=scope,
+            subject_id=subject,
+        )
+        self.store.state_set(key, self.clock.iso(now))
+        return result
 
     # ── 回收 ──────────────────────────────────────────────
     def run_recycle(self, reason: str = "手动触发") -> str:

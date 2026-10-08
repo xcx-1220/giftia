@@ -245,7 +245,31 @@ class Recalled:
 
 
 def memory_text(mem: dict) -> str:
-    return f"{mem.get('summary','')} {mem.get('tags','')} {mem.get('emotion','')}"
+    """检索用的文本。把"这是谁的事"也放进去 —— 问谁的事时才能对上号。"""
+    return (
+        f"{mem.get('summary','')} {mem.get('tags','')} "
+        f"{mem.get('emotion','')} {mem.get('about','')}"
+    )
+
+
+def similarity(a: str, b: str) -> float:
+    """两句话有多像：加权词元交集 ÷ 较短那句的总权重（"被包含"也算像）。
+
+    用来抓"同一件事被记了两遍"——真机数据里 9 条私聊记忆有 4 条是同一件事，
+    白白挤掉了其他记忆的位置。
+    """
+    ca, cb = tokenize_weighted(a), tokenize_weighted(b)
+    if not ca or not cb:
+        return 0.0
+    inter = sum(min(w, cb.get(t, 0)) for t, w in ca.items())
+    return inter / min(sum(ca.values()), sum(cb.values()))
+
+
+def known_block(memories: list[dict], limit: int = 14) -> str:
+    """她已经记得的事（最近若干条），喂给模型让它别再记一遍。"""
+    recent = memories[-limit:]
+    lines = [f"- {str(m.get('summary','')).strip()}" for m in recent if str(m.get('summary','')).strip()]
+    return "\n".join(lines)
 
 
 def recall(
@@ -447,6 +471,7 @@ def consolidate(
     subject_id: str = "",
     speaker_id: str = "",
     on_draft=None,
+    stats: dict | None = None,
 ) -> int:
     """把未整理的对话压成记忆条目。返回新增条数。
 
@@ -463,6 +488,11 @@ def consolidate(
     if not force and len(pending) < settings.memory.consolidate_every:
         return 0
 
+    # 她在这个归属下已经记得的事 —— 既是给模型的"别重复记"清单，
+    # 也是下面程序化兜底去重的比较对象。
+    view = [("private", "")] if scope == "private" else [(scope, subject_id)]
+    existing = store.active_memories(instance_no, view=view)
+
     drafts: list[MemoryDraft] = []
     try:
         drafts = llm.extract_memories(
@@ -471,6 +501,7 @@ def consolidate(
             today=now_iso[:10],
             # 群聊和私聊要用不同的措辞规则，否则群里的话会被写成"搭档的事"
             scene="group" if scope == "group" else ("person" if scope == "person" else "c2c"),
+            known=known_block(existing, settings.memory.known_hint_limit),
         )
     except Exception as exc:  # 网络/解析失败都不能丢记忆
         drafts = _fallback_drafts(pending, settings)
@@ -482,6 +513,8 @@ def consolidate(
         )
 
     added = 0
+    merged = 0
+    skipped = 0
     for d in drafts:
         if not d.summary.strip():
             continue
@@ -490,7 +523,31 @@ def consolidate(
         layer = d.layer if d.layer in ("core", "important", "normal") else infer_layer(
             d.importance, d.emotion
         )
-        store.add_memory(
+
+        # 去重：这件事她已经记过了吗？
+        dup = None
+        for old in existing:
+            if similarity(d.summary, str(old.get("summary", ""))) >= settings.memory.dedupe_ratio:
+                dup = old
+                break
+        if dup is not None:
+            old_summary = str(dup.get("summary", ""))
+            if len(d.summary.strip()) > len(old_summary) + 8:
+                # 新版本更详细 → 让旧那条长大（记忆演进），而不是再记一条
+                store.update_memory(
+                    int(dup["id"]),
+                    summary=d.summary.strip(),
+                    tags=d.tags.strip(),
+                    importance=float(d.importance),
+                    layer=layer,
+                )
+                dup["summary"] = d.summary.strip()
+                merged += 1
+            else:
+                skipped += 1
+            continue
+
+        new_id = store.add_memory(
             instance_no=instance_no,
             created_ts=now_iso,
             happened_ts=pending[0]["ts"],
@@ -505,8 +562,11 @@ def consolidate(
             scope=scope,
             subject_id=subject_id,
             speaker_id=speaker_id,
+            about=d.about,
         )
         added += 1
+        # 同一批里后面的条目也要跟刚写进去的做去重
+        existing = [*existing, {"id": new_id, "summary": d.summary.strip()}]
         if on_draft is not None:
             try:
                 on_draft(d)
@@ -517,7 +577,146 @@ def consolidate(
     store.mark_consolidated(ids)
     store.meta_set(f"last_consolidated:{session_id}", ids[-1])
     store.meta_set("last_consolidated_msg_id", max(ids[-1], store.meta_get_int("last_consolidated_msg_id", 0)))
+    if stats is not None:
+        stats.update(added=added, merged=merged, skipped=skipped)
     return added
+
+
+def _layer_rank(mem: dict) -> int:
+    return {"core": 0, "important": 1, "normal": 2}.get(str(mem.get("layer")), 3)
+
+
+def reconcile(
+    store: Store,
+    llm: BaseLLM,
+    settings: Settings,
+    *,
+    instance_no: int,
+    scope: str = "private",
+    subject_id: str = "",
+    limit: int = 40,
+    dry_run: bool = False,
+) -> dict:
+    """把"换个说法记了两遍"的记忆合并掉。返回 {"merged": n, "groups": k, "kept": [...]}。
+
+    为什么必须让模型来做：实测真实的重复记忆
+    （「他让我叫他椎名」vs「他自我介绍叫椎名」）词面相似度只有 0.26~0.54，
+    而**不同的事**也有 0.16~0.34 —— 两者挤在一起，程序化阈值切不开。
+    模型认得这种同义改写，程序只按它的指示合并。
+
+    合并是**可回溯**的：重复的那些只是被标记 merged_into，数据还在。
+    dry_run=True 只报告、不落库。
+    """
+    view = [("private", "")] if scope == "private" else [(scope, subject_id)]
+    memories = store.active_memories(instance_no, view=view)
+    if len(memories) < 4:
+        return {"merged": 0, "groups": 0, "kept": []}
+    picked = memories[-limit:]
+    numbered = "\n".join(f"{i + 1}. {str(m.get('summary', '')).strip()}"
+                         for i, m in enumerate(picked))
+
+    # ── 候选来源 A：程序按词面相似度挑对（便宜、确定、不会漏掉明显的重复）──
+    # 只当"候选"，合不合由模型逐对确认。
+    # 实测：真实的重复对 0.43~0.54，不同的事 0.16~0.34 —— 阈值取 0.35 卡在中间，
+    # 宁可多问几次，也不要漏掉"他让我叫他椎名"这种改写。
+    pairs: list[tuple[float, int, int]] = []
+    for i in range(len(picked)):
+        for j in range(i + 1, len(picked)):
+            sim = similarity(
+                str(picked[i].get("summary", "")), str(picked[j].get("summary", ""))
+            )
+            if sim >= settings.memory.dedupe_candidate_ratio:
+                pairs.append((sim, i, j))
+    pairs.sort(reverse=True)
+
+    groups: list[list[int]] = [[i + 1, j + 1] for _s, i, j in pairs[:8]]
+
+    # ── 候选来源 B：让模型通读一遍（能发现词面不像、但确实是同一件事的）──
+    try:
+        groups.extend(llm.find_duplicate_groups(numbered))
+    except Exception:
+        pass
+
+    merged = 0
+    kept: list[str] = []
+    detail: list[dict] = []
+    # 先把候选对逐对确认，再按"连通分量"合并。
+    # 否则会出现 A~B、B~C 各自成对的情况，B 被合并进两处、A 被当成两个不同的保留者。
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    checked: set[tuple[int, ...]] = set()
+    confirmed_pairs = 0
+    for group in groups:
+        idxs = sorted({i for i in group if 1 <= i <= len(picked)})
+        for a_pos in range(len(idxs)):
+            for b_pos in range(a_pos + 1, len(idxs)):
+                ia, ib = idxs[a_pos], idxs[b_pos]
+                ma, mb = picked[ia - 1], picked[ib - 1]
+                key = (int(ma["id"]), int(mb["id"]))
+                if key in checked:
+                    continue
+                checked.add(key)
+                # 程序闸门：说"不同人的事"的绝不合并（不花调用）
+                aa = str(ma.get("about") or "").strip()
+                ab = str(mb.get("about") or "").strip()
+                if aa and ab and aa != ab:
+                    continue
+                try:
+                    ok = llm.confirm_duplicate(
+                        f"- {str(ma.get('summary', '')).strip()}\n"
+                        f"- {str(mb.get('summary', '')).strip()}"
+                    )
+                except Exception:
+                    ok = False
+                if ok:
+                    union(ia, ib)
+                    confirmed_pairs += 1
+
+    components: dict[int, list[int]] = {}
+    for i in range(1, len(picked) + 1):
+        if i in parent:
+            components.setdefault(find(i), []).append(i)
+
+    for idxs in components.values():
+        items = [picked[i - 1] for i in idxs]
+        if len(items) < 2:
+            continue
+        # 留"最该留的那条"：内核层优先，其次最详细的（详版包含略版的信息）
+        items.sort(key=lambda m: (_layer_rank(m), -len(str(m.get("summary", "")))))
+        keeper, rest = items[0], items[1:]
+        detail.append({
+            "keep": str(keeper.get("summary", "")),
+            "drop": [str(m.get("summary", "")) for m in rest],
+        })
+        if dry_run:
+            merged += len(rest)
+            kept.append(str(keeper.get("summary", "")))
+            continue
+        tags = sorted({
+            t.strip() for m in items for t in str(m.get("tags", "")).split(",") if t.strip()
+        })
+        store.update_memory(
+            int(keeper["id"]),
+            tags=",".join(tags)[:120],
+            importance=max(float(m.get("importance") or 0.5) for m in items),
+            about=str(keeper.get("about") or "") or str(rest[0].get("about") or ""),
+        )
+        store.mark_merged([int(m["id"]) for m in rest], into=int(keeper["id"]))
+        merged += len(rest)
+        kept.append(str(keeper.get("summary", "")))
+    return {"merged": merged, "groups": len(groups), "kept": kept, "detail": detail}
 
 
 def _fallback_drafts(messages: list[dict], settings: Settings) -> list[MemoryDraft]:

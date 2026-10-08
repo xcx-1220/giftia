@@ -45,14 +45,20 @@ SCENE_LINES = {
 
 
 def render_memories(recalled: list[Recalled]) -> str:
-    """用 ◆ 开头，和人格内核里的普通项目符号区分开；每条带一个置信度标记。"""
+    """用 ◆ 开头，和人格内核里的普通项目符号区分开；每条带一个置信度标记。
+
+    还会标出"这是谁的事"——真机数据里她曾把 A 的课记成 B 的，
+    标上归属之后她才分得清。
+    """
     if not recalled:
         return "（关于这个话题，你什么都想不起来了。）"
     lines = []
     for r in recalled:
         mark = CONFIDENCE_MARK.get(r.confidence, CONFIDENCE_MARK["cite"])
         layer = {"core": "（这是关于他本人的事）", "important": ""}.get(r.layer, "")
-        lines.append(f"◆ {mark}{layer} {r.happened}｜{r.text}")
+        about = str(r.memory.get("about") or "").strip()
+        who = f"（关于{about}）" if about and about != "搭档" else ""
+        lines.append(f"◆ {mark}{layer}{who} {r.happened}｜{r.text}")
     return "\n".join(lines)
 
 

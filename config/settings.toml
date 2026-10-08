@@ -29,9 +29,11 @@ terminal_warning_hours = 72
 
 
 [memory]
-consolidate_every    = 8        # 每积累多少条消息，就把这段对话压缩成"记忆条目"
-session_window       = 24       # 每次请求带上的最近消息条数（工作记忆）
-session_char_budget  = 6000     # 工作记忆的字符上限，超出就从最旧的开始丢
+# 每积累多少条消息，就把这段对话压缩成"记忆条目"。
+# 6 比 8 更勤：一天聊下来不会有一大段"还没变成记忆"的空白。
+consolidate_every    = 6
+session_window       = 40       # 每次请求带上的最近消息条数（工作记忆）
+session_char_budget  = 9000     # 工作记忆的字符上限，超出就从最旧的开始丢
 recall_candidates    = 40       # 检索时先粗筛多少条候选（语料小，全量也行）
 # 混合打分权重：关键词 1.0 + 重要性 + 保留率（时间项）+ 记忆层级
 w_bm25            = 1.0
@@ -44,7 +46,12 @@ min_importance    = 0.15        # 低于这个重要性的记忆条目不写入�
 # 记忆强度 S = retention_unit_hours × (出厂强度 + 被真正想起的次数)
 # 保留率 retention = exp(-Δt / S)，Δt 是距上次"说出口"的小时数。
 # 调大 retention_unit_hours = 整体记得更牢；调小 = 忘得更快。
-retention_unit_hours = 120
+#
+# 120 小时（5 天）太短了：一天之后只剩 0.82，一周之后 0.37 ——
+# 真机上表现成"她记不住昨天说过的事"。调到 720（一个月）：
+# 一周后仍有 0.79，一个月后 0.37。真正的"遗忘"由寿命阶段推进，
+# 不再靠"记不住昨天"来体现。
+retention_unit_hours = 720
 cite_min_shared      = 3        # 回复与记忆至少共享这么多个词，才算"真的被说出口"
 cite_min_chars       = 6        # 或者一段连续重合达到这么多字
 retention_relief     = 0.6      # 保留率对模糊度的减免力度（0=不减免，1=完全不糊）

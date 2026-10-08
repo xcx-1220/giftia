@@ -35,6 +35,7 @@ from giftia.memory import (  # noqa: E402
     recall,
     retention_of,
 )
+from giftia import memory as memory_mod  # noqa: E402
 from giftia.persona import build_system_prompt  # noqa: E402
 from giftia.store import Store  # noqa: E402
 
@@ -53,7 +54,13 @@ class NameLLM(MockLLM):
     """模拟模型在整理记忆时发现"他要求改口"。"""
 
     def extract_memories(
-        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
+        self,
+        transcript: str,
+        *,
+        name: str = "Giftia",
+        today: str = "",
+        scene: str = "c2c",
+        known: str = "",
     ):
         return [
             MemoryDraft(
@@ -97,7 +104,12 @@ def main() -> int:
 
     # ══ 1. 出厂状态 ═══════════════════════════════════════════
     print("1. 出厂状态（寿命 100 小时）")
-    settings = make_settings(tmp, 100.0)
+    # 这一段要验"到阈值才整理"，所以把阈值钉在 8 ——
+    # 出厂值是可以调的，测试不该跟着漂。
+    settings = dataclasses.replace(
+        make_settings(tmp, 100.0),
+        memory=dataclasses.replace(make_settings(tmp, 100.0).memory, consolidate_every=8),
+    )
     brain = Giftia(settings, llm=MockLLM(settings.model))
     st = brain.status()
     check("实例编号为 #1", st.instance_no == 1, str(st.instance_no))
@@ -981,12 +993,76 @@ def main() -> int:
 
     for sc, must in (("c2c", "一对一私聊"), ("group", "群聊记录"), ("person", "某一个人")):
         text = CONSOLIDATE_SYSTEM.format(
-            name="艾拉", today="2026-10-07", scene_rule=SCENE_RULES[sc].format(name="艾拉")
+            name="艾拉",
+            today="2026-10-07",
+            scene_rule=SCENE_RULES[sc].format(name="艾拉"),
+            known="（测试）",
         )
         check(f"整理提示词认得出「{sc}」场景", must in text, text[:0] or "")
     check("群聊规则明确要求用名字指代、不许写「搭档们」",
           "不要用「搭档」统称" in SCENE_RULES["group"]
           and "搭档们" in SCENE_RULES["group"])
+
+    # ══ 27. 去重与整理：她不该把一件事记两遍，也不该把两件事合成一件 ══
+    print("\n27. 记忆去重与整理")
+    from giftia.memory import reconcile, similarity
+
+    dup_a = "搭档让艾拉称呼自己为「椎名就好」，艾拉记住了这个称呼。"
+    dup_b = "搭档自我介绍叫椎名，并明确要求艾拉称呼自己为椎名。"
+    diff = "搭档提到自己明天有早八，艾拉劝他早点休息。"
+    check("换个说法的同一件事，词面相似度确实很低（所以程序切不开）",
+          similarity(dup_a, dup_b) < 0.7, f"{similarity(dup_a, dup_b):.2f}")
+    check("不同的事相似度也不会更高（两者挤在一起）",
+          abs(similarity(dup_a, dup_b) - similarity(dup_a, diff)) < 0.5,
+          f"{similarity(dup_a, dup_b):.2f} vs {similarity(dup_a, diff):.2f}")
+
+    class ReconLLM(MockLLM):
+        """脚本化的整理模型：一律说"是"，专门用来验证程序闸门挡不挡得住。"""
+
+        def find_duplicate_groups(self, numbered):
+            return [[1, 2], [3, 4], [5, 6]]
+
+        def confirm_duplicate(self, block):
+            return True     # 故意全都确认，看程序闸门能不能拦住"不同人的事"
+
+    rc = Giftia(make_settings(tmp / "recon", 81920.0), llm=ReconLLM(settings.model))
+    for summary, about, tags in (
+        (dup_a, "搭档", "称呼,椎名"), (dup_b, "搭档", "名字,称呼"),          # 1,2 真重复
+        ("椎名让艾拉明早8点提醒北铃上课", "北铃", "提醒,上课"),               # 3
+        ("椎名说自己明天有早八", "搭档", "早八,作息"),                        # 4 不同人
+        ("艾拉答应周六下午三点帮小雨占场地", "小雨", "约定,场地"),            # 5,6 真重复
+        ("艾拉答应帮小雨占场地，三点", "小雨", "约定,占场"),
+    ):
+        rc.store.add_memory(
+            instance_no=rc.instance_no,
+            created_ts=rc.clock.iso(),
+            happened_ts=rc.clock.iso(),
+            summary=summary,
+            tags=tags,
+            importance=0.6,
+            layer="normal",
+            about=about,
+        )
+    probe = memory_mod.reconcile(
+        rc.store, rc.llm, rc.settings, instance_no=rc.instance_no, scope="private", dry_run=True
+    )
+    check("整理能找到重复的组", probe["groups"] >= 1, str(probe["groups"]))
+    applied = memory_mod.reconcile(
+        rc.store, rc.llm, rc.settings, instance_no=rc.instance_no, scope="private"
+    )
+    check("确认过的重复会被合并（两组 → 少 2 条）", applied["merged"] == 2, str(applied["merged"]))
+    joined = " ".join(d["keep"] + " ".join(d["drop"]) for d in applied["detail"])
+    check("★ 不同人的事没被合并（程序闸门：about 不同就拒）",
+          not ("北铃上课" in joined and "早八" in joined), joined[:60])
+    left = rc.store.active_memories(rc.instance_no, view=[("private", "")])
+    check("合并后重复的那条不再参与检索", len(left) == 4, f"{len(left)} 条")
+    check("被合并的数据还在（可回溯，不是删掉）",
+          len(rc.store.all_memories(rc.instance_no)) == 6)
+    keeper = [m for m in left if "椎名" in str(m["summary"])][0]
+    check("留下的那条吃到了两条的标签（称呼 + 名字）",
+          "称呼" in str(keeper["tags"]) and "名字" in str(keeper["tags"])
+          or "椎名" in str(keeper["tags"]),
+          str(keeper["tags"]))
 
     # 会话分区 + 跨天历史
     sessions = {

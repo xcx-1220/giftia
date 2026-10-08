@@ -156,6 +156,16 @@ class MemoryConfig:
     consolidate_every: int = 8
     session_window: int = 24
     session_char_budget: int = 6000
+    # 去重：新记忆和已有的像到这个程度，就当成"同一件事"（不再重复记）
+    # 真机数据里 9 条私聊记忆有 4 条是同一件事，白白挤掉了别的位置
+    dedupe_ratio: float = 0.7
+    # 整理时"词面像到这个程度"就送去问模型（实测真实重复 0.43~0.54，不同的事 0.16~0.34）
+    dedupe_candidate_ratio: float = 0.35
+    # 整理时把"她已经记得的事"喂给模型，让它别再记一遍
+    known_hint_limit: int = 14
+    # 定期做一次"整理记忆"（把换个说法记了两遍的合并掉）：同一个归属多久做一次
+    reconcile_hours: float = 6.0
+    reconcile_min_memories: int = 4
     recall_candidates: int = 40
     w_bm25: float = 1.0
     w_importance: float = 0.35

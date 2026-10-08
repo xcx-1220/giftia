@@ -36,6 +36,7 @@ class MemoryDraft:
     layer: str = ""          # core | important | normal（空 = 由程序按重要性判定）
     preferred_name: str = ""  # 他明确要求改称呼时才填（例如"以后叫我小林"）
     event_date: str = ""      # 他说过的"将来某一天"（YYYY-MM-DD），没有就留空
+    about: str = ""           # 这条记忆是关于谁的（搭档 / 某人的名字 / 群里）
 
 
 LAYERS = ("core", "important", "normal")
@@ -43,16 +44,33 @@ LAYERS = ("core", "important", "normal")
 
 # ── 提示词（属于模型任务，不属于人格）────────────────────────────
 CONSOLIDATE_SYSTEM = """你是 Giftia 的记忆整理模块（她本人看不到这段指令）。
-把下面这段对话，压缩成 0～3 条长期记忆条目。
+把下面这段对话，压缩成 0～5 条长期记忆条目。
 {scene_rule}
 
-只记对长期关系有意义的东西：发生的事、对方的偏好与习惯、情绪变化、约定、说过的要紧话。
-不要记寒暄、天气、以及没有信息量的闲聊。宁少勿多；确实没有值得记的，就返回空数组。
+只记对长期关系有意义的东西：**发生的事、约定、对方的偏好与习惯、情绪变化、说过的要紧话、
+提到过的计划与日期、关于某个人本身的事实**。
+纯寒暄（"在吗""嗯""哈哈"）和没有信息量的应答不用记。
+
+**宁可多记一条，也不要漏掉有信息量的事。** 一天聊下来通常能留下好几条；
+但**同一条事实不要拆成多条**，也不要换个说法重复记。
+
+{known}
 
 严格输出 JSON，不要任何解释文字：
-{{"memories":[{{"summary":"一句话，不超过60字，用第三人称，用「搭档」指代对方","tags":"逗号分隔的2-4个关键词","emotion":"当时的情绪，2-6字","importance":0.0到1.0之间的小数,"layer":"core|important|normal","preferred_name":"","event_date":""}}]}}
+{{"memories":[{{"summary":"一到两句，不超过120字，**必须写清是谁的事**","about":"这条记忆是关于谁的","tags":"逗号分隔的2-5个关键词","emotion":"当时的情绪，2-6字","importance":0.0到1.0之间的小数,"layer":"core|important|normal","preferred_name":"","event_date":""}}]}}
 
 今天是 {today}。
+
+**summary 的写法（最重要，决定她以后会不会记混）**：
+- **必须点名是谁**：写「椎名说周六下午要去医院拿报告」，不要写「有人要去医院」。
+  人名用对话里出现过的称呼；指代搭档时写「搭档」。
+- **带上能对得上号的具体信息**：时间、地点、东西的名字、数字。
+- 一到两句、120 字以内。**绝不要把不同人的事揉进同一条**。
+
+about 的判定（这一条决定她能不能分清"这是谁的事"，别省）：
+- 关于搭档本人的 → "搭档"
+- 关于某个具体的人 → 那个人的名字
+- 关于群里大家的公共话题 → "群里"
 
 importance 参考：0.9 以上=非常重要的约定或心事；0.5=日常但有意义；0.2 以下=可记可不记。
 layer 判定（很重要，决定这条记忆会不会随时间变模糊）：
@@ -71,12 +89,36 @@ event_date 的判定（**只在这一种情况下填**）：
 并且这个日期**能推算出确切的一天**（"下周三要考驾照"→ 按今天 {today} 推算）。
 填 YYYY-MM-DD。其余情况（"最近""以后""经常会"）一律留空；推算不确定也留空。"""
 
-REWRITE_SYSTEM = """你是记忆检索的查询改写模块。
-把搭档的这句话改写成 2～3 个**用于检索长期记忆**的短查询：补上同义词、上位词、可能的说法。
+REWRITE_SYSTEM = """你是记忆检索的查询改写模块。把搭档的这句话改写成 2～3 个**用于检索长期记忆**的短查询：补上同义词、上位词、可能的说法。
 例如「今天面试砸了」→ ["面试", "找工作 求职", "紧张 失败 心情"]。
 
 只输出 JSON，不要解释：{{"queries":["...","..."]}}
 每个查询 2～8 个字，不要整句照抄。"""
+
+DUPLICATE_CHECK_SYSTEM = """下面几条记忆，说的是**同一件事**吗？
+
+判定标准是"**事实是否相同**"，不是"话题是否相近"：
+- 涉及**不同的人** → 不是同一件事
+  （「提醒北铃上课」和「椎名自己明天有早八」→ 不是）
+- 涉及**不同的时间、不同的东西、不同的承诺** → 不是同一件事
+- 只是同一个话题的两个侧面 → 不是同一件事
+- 换个说法说同一件事实、或详略不同的两个版本 → 是同一件事
+
+宁可回答 NO。说错了会让她真的忘掉一件事。
+只回答一个词：YES 或 NO"""
+
+RECONCILE_SYSTEM = """你是 Giftia 的记忆整理模块。下面是她已经记下的一批记忆，前面带编号。
+
+请找出其中**在说同一件事**的条目，把它们分好组。
+判定标准是"**事实是否相同**"，不是"话题是否相近"：
+- 「搭档让我叫他椎名」「搭档自我介绍叫椎名」「他要求以后称呼他为椎名」→ **同一件事**
+- 「椎名的早八」和「北铃要上的课」→ **不是同一件事**（人不同）
+- 「明早8点提醒北铃上课」和「椎名自己明天有早八」→ **不是同一件事**（人不同）
+- 同一件事的详略两个版本 → **同一件事**（留详细的那个）
+
+只输出 JSON，不要解释：{{"groups": [[1, 5, 8], [3, 9]]}}
+- 每组至少 2 条，用编号。
+- 没有重复就输出 {{"groups": []}}"""
 
 MEMOIR_SYSTEM = """你是「终端服务」的记录员。Giftia 的寿命已经结束，即将被回收、记忆将被清除。
 请根据她的记忆条目，写一份简短的回收记录（回忆录），交给她的人类搭档留存。
@@ -98,8 +140,7 @@ DREAM_SYSTEM = """你是 Giftia 的睡眠整理模块（她本人看不到这段
 - 不要解释"这是梦"，不要提到记忆、遗忘、系统、数据库。
 - 不要写"我梦见"开头，直接进入场景。结尾可以停在半句话上。"""
 
-SCENE_RULES = {
-    "c2c": "这段是「搭档」和「{name}」的一对一私聊：用「搭档」指代对方。",
+SCENE_RULES = {    "c2c": "这段是「搭档」和「{name}」的一对一私聊：用「搭档」指代对方。",
     "person": "这段是「{name}」和**某一个人**的私聊：用那个人的名字指代他，不要用「搭档」。",
     "group": (
         "这段是**群聊记录**：说话的人不止一个，稿子每行开头的名字就是发言人。"
@@ -109,7 +150,6 @@ SCENE_RULES = {
 }
 
 NAME_SYSTEM = """判断下面这句话里，说话人是不是在**介绍自己的名字**。
-
 - 是自我介绍 → **只输出那个名字**（2～16 个字），不要标点、不要解释、不要加引号。
 - 只是描述身份或状态 → 输出 NONE。
   例：「我是学生」「我是来问你个事的」「我是新来的」「我是说……」「我是那种人」都是 NONE。
@@ -131,7 +171,13 @@ class BaseLLM:
         raise NotImplementedError
 
     def extract_memories(
-        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
+        self,
+        transcript: str,
+        *,
+        name: str = "Giftia",
+        today: str = "",
+        scene: str = "c2c",
+        known: str = "",
     ) -> list[MemoryDraft]:
         raise NotImplementedError
 
@@ -146,6 +192,19 @@ class BaseLLM:
         正则分不清，但这两者搞错的代价差很多（把"来问你个事"当成名字会很难看）。
         """
         return ""
+
+    def find_duplicate_groups(self, numbered: str) -> list[list[int]]:
+        """在一批记忆里找出"说同一件事"的编号分组。
+
+        为什么要模型来做：实测真实的重复记忆（"他让我叫他椎名" vs
+        "他自我介绍叫椎名"）词面相似度只有 0.26~0.54，而不同的事也有 0.16~0.34，
+        程序化阈值根本切不开——只有模型认得这种同义改写。
+        """
+        return []
+
+    def confirm_duplicate(self, block: str) -> bool:
+        """二次确认："这几条真的是同一件事吗"。默认不敢合。"""
+        return False
 
     def rewrite_query(self, text: str) -> list[str]:
         """把一句话改写成 2～3 个检索查询。返回空列表 = 不改写。"""
@@ -224,8 +283,21 @@ class DeepSeekLLM(BaseLLM):
         return text
 
     def extract_memories(
-        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
+        self,
+        transcript: str,
+        *,
+        name: str = "Giftia",
+        today: str = "",
+        scene: str = "c2c",
+        known: str = "",
     ) -> list[MemoryDraft]:
+        """known = 她已经记得的事（原样喂给模型，让它别再记一遍）。"""
+        if known:
+            known_block = (
+                "她已经记得下面这些事——**不要重复记，也不要换个说法再记一遍**：\n" + known
+            )
+        else:
+            known_block = "（她还没有任何长期记忆，这一段是白纸。）"
         raw = self.chat(
             [
                 {
@@ -234,12 +306,13 @@ class DeepSeekLLM(BaseLLM):
                         name=name,
                         today=today or "（未提供）",
                         scene_rule=SCENE_RULES.get(scene, SCENE_RULES["c2c"]).format(name=name),
+                        known=known_block,
                     ),
                 },
                 {"role": "user", "content": transcript},
             ],
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=1400,
         )
         return parse_memory_drafts(raw)
 
@@ -289,6 +362,39 @@ class DeepSeekLLM(BaseLLM):
             max_tokens=40,
         )
         return clean_name(raw)
+
+    def find_duplicate_groups(self, numbered: str) -> list[list[int]]:
+        raw = self.chat(
+            [
+                {"role": "system", "content": RECONCILE_SYSTEM},
+                {"role": "user", "content": numbered},
+            ],
+            temperature=0.0,
+            max_tokens=400,
+        )
+        data = _parse_json_loose(raw)
+        groups = data.get("groups") if isinstance(data, dict) else None
+        if not isinstance(groups, list):
+            return []
+        out: list[list[int]] = []
+        for g in groups:
+            if not isinstance(g, list):
+                continue
+            ids = [int(x) for x in g if isinstance(x, (int, float, str)) and str(x).isdigit()]
+            if len(ids) >= 2:
+                out.append(ids)
+        return out
+
+    def confirm_duplicate(self, block: str) -> bool:
+        raw = self.chat(
+            [
+                {"role": "system", "content": DUPLICATE_CHECK_SYSTEM},
+                {"role": "user", "content": block},
+            ],
+            temperature=0.0,
+            max_tokens=8,
+        )
+        return str(raw or "").strip().upper().startswith("Y")
 
 
 def clean_name(raw: str) -> str:
@@ -345,6 +451,7 @@ def parse_memory_drafts(raw: str) -> list[MemoryDraft]:
                 layer=layer,
                 preferred_name=str(it.get("preferred_name", "") or "").strip()[:16],
                 event_date=event_date,
+                about=str(it.get("about", "") or "").strip()[:20],
             )
         )
     return drafts
@@ -432,7 +539,13 @@ class MockLLM(BaseLLM):
         return "".join(parts)
 
     def extract_memories(
-        self, transcript: str, *, name: str = "Giftia", today: str = "", scene: str = "c2c"
+        self,
+        transcript: str,
+        *,
+        name: str = "Giftia",
+        today: str = "",
+        scene: str = "c2c",
+        known: str = "",
     ) -> list[MemoryDraft]:
         """启发式兜底：从别人说过的话里挑两条最长的留下来（提问不算记忆）。
 
