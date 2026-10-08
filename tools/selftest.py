@@ -1064,6 +1064,42 @@ def main() -> int:
           or "椎名" in str(keeper["tags"]),
           str(keeper["tags"]))
 
+    # ══ 28. 补整理：聊到一半停下的会话不会永远变不成记忆 ═══════
+    print("\n28. 补整理：卡住的会话")
+    fs = Giftia(make_settings(tmp / "flush", 81920.0), llm=MockLLM(settings.model))
+    fs.set_handler_id("OWNER")
+    fs.handle("我叫小林", user_id="OWNER")
+    for line, who in (("周六下午三点在体育馆打球，我会早点到占场地", "阿伟"),
+                      ("我带水过去，你别又忘了带球拍", "小雨")):
+        fs.handle(line, f"F-{who}", scene="group", group_id="G-7",
+                  speaker_name=who, log_only=True)
+    stuck = fs.store.sessions_with_pending(fs.instance_no)
+    check("没攒够阈值的会话确实卡着", len(stuck) >= 1, str([r["session_id"] for r in stuck]))
+    added = memory_mod.flush_sessions(
+        fs.store, fs.llm, fs.settings, now_iso=fs.clock.iso()
+    )
+    check("补整理把它们变成了记忆", added >= 1, f"added={added}")
+    check("补整理之后不再有卡住的消息",
+          fs.store.sessions_with_pending(fs.instance_no) == [],
+          str(fs.store.sessions_with_pending(fs.instance_no)))
+    check("补整理的记忆归属正确（群里的归群）",
+          any(str(m.get("scope")) == "group"
+              for m in fs.store.active_memories(fs.instance_no)),
+          str([(m.get("scope"), str(m["summary"])[:12])
+               for m in fs.store.active_memories(fs.instance_no)]))
+
+    # 优雅退出（systemd 重启走这条路）也要把卡着的收尾
+    fs2 = Giftia(make_settings(tmp / "flush2", 81920.0), llm=MockLLM(settings.model))
+    fs2.set_handler_id("OWNER")
+    fs2.handle("我叫小林，以后叫我小林就好", user_id="OWNER")
+    instance2 = fs2.instance_no
+    db2 = fs2.settings.db_path
+    fs2.close()
+    st2 = Store(db2)
+    check("优雅退出后没有卡住的消息", st2.open_messages(instance2) == [],
+          str(len(st2.open_messages(instance2))))
+    st2.close()
+
     # 会话分区 + 跨天历史
     sessions = {
         str(m["session_id"]).rsplit("-", 1)[0]

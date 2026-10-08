@@ -771,7 +771,14 @@ def main() -> int:
     bot = QQBot(app_id, secret, owner_openid=args.owner, api_base=args.api_base,
                 mock_llm=args.mock_llm)
     if not bot.owner_openid:
-        if bot.settings.runtime.auto_bind:
+        # owner_openid 是配置里的；也可能早就用 /bind 或自动认主写进库里了
+        try:
+            bound = brain_mod.get_default(bot.settings).handler_id
+        except Exception:
+            bound = ""
+        if bound:
+            print(f"[提示] 搭档已认：{bound[:12]}…（想换人：/unbind）", file=sys.stderr)
+        elif bot.settings.runtime.auto_bind:
             print(
                 "[提示] 还没认人：在 QQ 里私聊她说第一句话，她就把你记成搭档了。\n"
                 "        （群里需要你是群主，或者手动发 /bind。想换人：/unbind）",

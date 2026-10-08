@@ -719,6 +719,53 @@ def reconcile(
     return {"merged": merged, "groups": len(groups), "kept": kept, "detail": detail}
 
 
+def flush_sessions(
+    store: Store,
+    llm: BaseLLM,
+    settings: Settings,
+    *,
+    now_iso: str,
+    exclude_session: str = "",
+    stale_minutes: float = 0.0,
+    min_pending: int = 1,
+) -> int:
+    """把"还卡着没整理"的会话补整理掉。返回新增条数。
+
+    平时的整理是增量的、按会话攒够 N 条才做；于是聊到一半停了、
+    或者跨过零点的会话，剩下的几条会永远卡住 —— 真机数据里
+    "认识第一天"那段对话就是这样没变成记忆的。这个函数负责收尾。
+
+    exclude_session：当前会话不补（它有自己的阈值节奏）
+    stale_minutes：只补"最后一条消息已经过了这么久"的会话（避免把正聊着的截断）
+    """
+    instance_no = store.meta_get_int("instance_no", 1)
+    total = 0
+    for row in store.sessions_with_pending(instance_no):
+        session_id = str(row["session_id"])
+        if exclude_session and session_id == exclude_session:
+            continue
+        if int(row["n"]) < min_pending:
+            continue
+        if stale_minutes > 0:
+            try:
+                newest = datetime.fromisoformat(str(row["newest"]))
+                if (datetime.fromisoformat(now_iso) - newest).total_seconds() / 60.0 < stale_minutes:
+                    continue
+            except (TypeError, ValueError):
+                pass
+        total += consolidate(
+            store,
+            llm,
+            settings,
+            session_id=session_id,
+            now_iso=now_iso,
+            force=True,
+            scope=str(row["scope"] or "private"),
+            subject_id=str(row["subject_id"] or ""),
+        )
+    return total
+
+
 def _fallback_drafts(messages: list[dict], settings: Settings) -> list[MemoryDraft]:
     """模型不可用时的兜底：直接从搭档的话里挑两句留下来。"""
     user_lines = [m["content"].strip() for m in messages if m["role"] == "user"]

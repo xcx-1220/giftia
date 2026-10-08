@@ -28,6 +28,7 @@ from .llm import BaseLLM, DeepSeekLLM, LLMError, MockLLM
 from .memory import (
     Recalled,
     consolidate,
+    flush_sessions,
     is_cited,
     is_weak,
     mark_cited,
@@ -73,6 +74,11 @@ class Giftia:
         self.llm = llm or make_llm(settings)
         self.lifespan = Lifespan(settings, self.store, self.clock)
         self.lifespan.ensure_activated()
+        # 老数据的 scope 是默认值，会让群里的话被当成"你的私事"——启动时归位一次
+        try:
+            self.store.backfill_message_scopes()
+        except Exception:
+            pass
         self.bond = BondTracker(self.store, settings)
         self.mood = MoodTracker(self.store, settings)
         self.notices: list[str] = []
@@ -334,6 +340,8 @@ class Giftia:
                 self.clock.iso(),
                 self.speaker_id,
                 self.speaker_name,
+                self.memory_scope[0],
+                self.memory_scope[1],
             )
             # 攒够了就把"听见的话"整理成这个群归属的记忆 ——
             # 不然"听得见"永远只是聊天记录，不会变成会随时间模糊的记忆。
@@ -505,6 +513,8 @@ class Giftia:
             self.clock.iso(now),
             self.speaker_id,
             self.speaker_name,
+            self.memory_scope[0],
+            self.memory_scope[1],
         )
         try:
             reply = self.llm.chat(messages)
@@ -512,7 +522,15 @@ class Giftia:
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
             self.notices.append(f"[模型请求失败] {exc}")
         self.store.add_message(
-            self.session_id, self.instance_no, "assistant", reply, self.clock.iso(now)
+            self.session_id,
+            self.instance_no,
+            "assistant",
+            reply,
+            self.clock.iso(now),
+            "",
+            "",
+            self.memory_scope[0],
+            self.memory_scope[1],
         )
 
         # 召回强化：她真的把哪几条说出口了，哪几条就记得更久
@@ -729,6 +747,19 @@ class Giftia:
     def _post_turn(self) -> None:
         stats: dict = {}
         added = self.consolidate(force=False, stats=stats)
+        # 顺手收尾：别的会话里卡着的旧对话也该变成记忆
+        # （只补"已经静置 30 分钟以上"的，不打断正在聊的那个）
+        stale = flush_sessions(
+            self.store,
+            self.llm,
+            self.settings,
+            now_iso=self.clock.iso(),
+            exclude_session=self.session_id,
+            stale_minutes=30.0,
+            min_pending=2,
+        )
+        if stale:
+            self.notices.append(f"[记忆整理] 补整理了 {stale} 条之前没记下的")
         if added:
             self.notices.append(f"[记忆整理] 新增 {added} 条长期记忆")
         if stats.get("skipped"):
@@ -1034,9 +1065,21 @@ class Giftia:
 
     def close(self) -> None:
         try:
-            self.consolidate(force=True)
-        finally:
+            # 关掉之前把**所有**还卡着没整理的会话都补上（不只是当前这个）——
+            # 不然聊到一半停了、或者跨过零点的会话，那几条会永远变不成记忆。
+            flush_sessions(
+                self.store,
+                self.llm,
+                self.settings,
+                now_iso=self.clock.iso(),
+                min_pending=1,
+            )
+        except Exception:
+            pass
+        try:
             self.store.close()
+        except Exception:
+            pass
 
 
 # ── 平台适配器入口 ────────────────────────────────────────────────

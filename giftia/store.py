@@ -113,6 +113,8 @@ class Store:
         "messages": {
             "speaker_id": "TEXT NOT NULL DEFAULT ''",
             "speaker_name": "TEXT NOT NULL DEFAULT ''",
+            "scope": "TEXT NOT NULL DEFAULT 'private'",
+            "subject_id": "TEXT NOT NULL DEFAULT ''",
         },
     }
 
@@ -185,14 +187,77 @@ class Store:
         ts: str,
         speaker_id: str = "",
         speaker_name: str = "",
+        scope: str = "private",
+        subject_id: str = "",
     ) -> int:
         cur = self.conn.execute(
             "INSERT INTO messages(session_id, instance_no, role, content, ts, "
-            "speaker_id, speaker_name) VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (session_id, instance_no, role, content, ts, speaker_id, speaker_name),
+            "speaker_id, speaker_name, scope, subject_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                instance_no,
+                role,
+                content,
+                ts,
+                speaker_id,
+                speaker_name,
+                scope,
+                subject_id,
+            ),
         )
         self.conn.commit()
         return int(cur.lastrowid)
+
+    def backfill_message_scopes(self) -> int:
+        """给历史消息补 scope/subject_id。
+
+        scope 这一列是后加的，老数据全是默认值 'private' —— 于是**昨天群里的话
+        会被当成"你的私事"存进私聊记忆**。这里按会话名把它们归位：
+          i<n>-m-…  搭档私聊（不动）
+          i<n>-g-…  群聊 → subject 用最近活跃的那个群
+          i<n>-p-…  某人的私聊 → subject 用发言人的 id
+        只在库里还没有标记时做一次。
+        """
+        if self.meta_get_int("msg_scope_backfilled", 0):
+            return 0
+        group_id = str(self.state_get("last_group_openid", "") or "")
+        rows = self._rows(
+            "SELECT id, session_id, speaker_id FROM messages "
+            "WHERE scope = 'private' AND subject_id = ''"
+        )
+        updated = 0
+        for row in rows:
+            sid = str(row["session_id"])
+            if "-g" in sid and group_id:
+                self.conn.execute(
+                    "UPDATE messages SET scope = 'group', subject_id = ? WHERE id = ?",
+                    (group_id, int(row["id"])),
+                )
+                updated += 1
+            elif "-p" in sid and str(row["speaker_id"] or ""):
+                self.conn.execute(
+                    "UPDATE messages SET scope = 'person', subject_id = ? WHERE id = ?",
+                    (str(row["speaker_id"]), int(row["id"])),
+                )
+                updated += 1
+        self.conn.commit()
+        self.meta_set("msg_scope_backfilled", 1)
+        return updated
+
+    def sessions_with_pending(self, instance_no: int) -> list[dict[str, Any]]:
+        """哪些会话还有没整理成记忆的消息（带上归属，补整理时要用）。
+
+        为什么需要：整理是增量的（游标只往前走），而"攒够 N 条"是按会话算的。
+        一段对话聊到一半停了、或者跨过零点，剩下的几条会永远卡在 pending 里。
+        真机数据里"认识第一天"那段对话就是这样没变成记忆的。
+        """
+        return self._rows(
+            "SELECT session_id, scope, subject_id, COUNT(*) AS n, "
+            "MIN(ts) AS oldest, MAX(ts) AS newest, MAX(id) AS last_id "
+            "FROM messages WHERE instance_no = ? AND consolidated = 0 "
+            "GROUP BY session_id, scope, subject_id ORDER BY MIN(id) ASC",
+            (instance_no,),
+        )
 
     def recent_messages(self, session_id: str, limit: int = 24) -> list[dict[str, Any]]:
         rows = self._rows(
