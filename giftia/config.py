@@ -225,6 +225,19 @@ class RuntimeConfig:
     #   群里只有**群主** @ 她时才算（陌生人做不到这一点）。
     # 官方 openid 与 QQ 号不互通、无法预先填，所以只能靠"谁先跟她说话"来认人。
     auto_bind: bool = True
+    # 群聊响应档位 0~100（见 giftia/trigger.py）：0~19 只应 @、20~44 加关键词、
+    # 45~69 再加"按概率插嘴"、70+ 任何消息都可能接。没命中的当场标已读，零 token。
+    response_tier: int = 0
+    # 2/3 档下能叫醒她的词
+    keywords: list = field(default_factory=list)
+    # 被触发后等她说完再回：这段时间里群里追加的话算同一批，一起处理。
+    # **固定倒计时，不因为新消息重置** —— 滑动窗口在热闹的群里会让她永远等下去。
+    wake_delay_seconds: float = 2.0
+    # 发送节奏：每会话串行 + 最小间隔 + 限频（防平台风控，也防刷屏）
+    send_min_interval: float = 1.2
+    send_max_interval: float = 2.8
+    send_max_per_minute: int = 6
+    send_max_per_hour: int = 60
 
 
 @dataclass(frozen=True)

@@ -53,9 +53,21 @@ def recording_send(calls: list, *, fail: bool = False, partial: str = ""):
     return _send
 
 from giftia import brain as brain_mod  # noqa: E402
-from giftia.config import load_settings  # noqa: E402
+from giftia.config import load_settings as _raw_load_settings  # noqa: E402
 from giftia.store import Store  # noqa: E402
 from ws_testserver import accept_handshake, make_listener, read_frame, send_frame  # noqa: E402
+
+
+def load_settings(*args, **kwargs):  # noqa: F811
+    """测试专用：**关掉群聊聚批**，让"事件 → 回复"是同步的，断言才好写。
+
+    聚批（等 wake_delay 秒把一段时间里的话一起处理）本身单独测，
+    见第 9 节；这里关心的是接线对不对。
+    """
+    base = _raw_load_settings(*args, **kwargs)
+    return dataclasses.replace(
+        base, runtime=dataclasses.replace(base.runtime, wake_delay_seconds=0)
+    )
 
 OP_TEXT = 0x1
 OP_CLOSE = 0x8
@@ -596,6 +608,79 @@ def main() -> int:
     check("用户说的话不受影响，仍然完整留档",
           any(str(m["content"]) == "在忙吗"
               for m in fhub.store.all_messages(fhub.instance_no, limit=80)))
+
+    brain_mod.reset_default()
+
+    print("\n9. 聚批：她等你把话说完再回")
+    bsettings = dataclasses.replace(
+        load_settings(force_mock=True),
+        root=Path(tempfile.mkdtemp(prefix="giftia-batch-")),
+        runtime=dataclasses.replace(
+            load_settings(force_mock=True).runtime, wake_delay_seconds=0.4
+        ),
+    )
+    bbot = adapter.QQBot("X", "Y", owner_openid="ME", settings=bsettings)
+    bcalls: list[tuple[str, str, str]] = []
+    bbot.send = recording_send(bcalls)
+    bbot.handle_event(adapter.EVENT_GROUP_AT, {
+        "id": "B-1",
+        "author": {"user_openid": "ME", "username": "小林", "member_role": "owner"},
+        "group_openid": "G-B", "content": "<@!1> 在吗",
+    })
+    check("被 @ 之后先不急着回（等她把话说完）", bcalls == [], str(bcalls))
+    check("消息进了待处理批次",
+          len(bbot._batch.get("G-B", {}).get("items", [])) == 1,
+          str(bbot._batch))
+    deadline_before = bbot._batch["G-B"]["deadline"]
+    bbot.handle_event(adapter.EVENT_GROUP_MESSAGE, {
+        "id": "B-2", "author": {"user_openid": "ME", "username": "小林"},
+        "group_openid": "G-B", "content": "顺便问一下明天有空吗",
+    })
+    check("★ 窗口内追加的话并入同一批（没 @ 也算，不然会被漏掉）",
+          len(bbot._batch["G-B"]["items"]) == 2, str(bbot._batch["G-B"]["items"]))
+    check("★ 而且倒计时**不重置**（滑动窗口会让她永远等下去）",
+          bbot._batch["G-B"]["deadline"] == deadline_before)
+
+    bbot._batch["G-B"]["deadline"] = 0.0
+    bbot._flush_batches()
+    check("到点后一次性回复一条", len(bcalls) == 1, str(bcalls))
+    hub_b = brain_mod.get_default(bsettings)
+    rows_b = hub_b.store.messages_by_prefix(f"i{hub_b.instance_no}-g", 20)
+    check("这一批的每一句都落进了聊天记录（她上下文里看得到）",
+          any("明天有空吗" in str(r["content"]) for r in rows_b)
+          and any("在吗" in str(r["content"]) for r in rows_b),
+          str([str(r["content"])[:12] for r in rows_b]))
+
+    brain_mod.reset_default()
+
+    print("\n10. 发送管道：限频与去重")
+    osend = dataclasses.replace(
+        load_settings(force_mock=True), root=Path(tempfile.mkdtemp(prefix="giftia-send-"))
+    )
+    obot = adapter.QQBot("X", "Y", owner_openid="ME", settings=osend)
+    obot.dry_run = True
+    key = "group:G-X"
+    for _ in range(osend.runtime.send_max_per_minute):
+        obot._note_send(key)
+    check("超过每分钟上限就被拦下（防平台风控）",
+          "每分钟" in obot._rate_limit_wait(key), obot._rate_limit_wait(key))
+    check("没超限时畅通", obot._rate_limit_wait("group:G-Y") == "")
+
+    ocalls: list = []
+    obot._request = lambda *a, **kw: ocalls.append(a)  # type: ignore[method-assign]
+    obot.dry_run = False
+    obot._sent_recently["c2c:U-1"] = ("同一句话", time.time())
+    dedup_result = obot.send("c2c", "U-1", "同一句话", None)
+    check("★ 8 秒内发过同样的话就不再发（防重复回复）",
+          ocalls == [] and dedup_result.delivered == "同一句话", str(ocalls))
+    obot._request = lambda *a, **kw: ocalls.append(a)  # type: ignore[method-assign]
+    obot._request = lambda *a, **kw: (_ for _ in ()).throw(adapter.QQError("测试：发送失败"))
+    obot._sent_recently.clear()
+    fail_result = obot.send("c2c", "U-2", "这句话发不出去", None)
+    check("发送失败时如实上报（不再静默吞掉）",
+          fail_result.ok is False and fail_result.delivered == ""
+          and len(fail_result.failed) == 1,
+          f"ok={fail_result.ok} delivered={fail_result.delivered!r}")
 
     brain_mod.reset_default()
 

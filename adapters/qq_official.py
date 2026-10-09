@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import time
 import urllib.error
@@ -47,6 +48,7 @@ from giftia import brain as brain_mod  # noqa: E402
 from giftia.brain import handle_message  # noqa: E402
 from giftia.config import load_env_file, load_settings  # noqa: E402
 from giftia.outreach import can_send  # noqa: E402
+from giftia.trigger import decide as decide_speak  # noqa: E402
 from giftia.ws import WebSocket, WSClosed, WSTimeout  # noqa: E402
 
 # ── 常量（鉴权、网关、identify、READY 已用真实凭据验证过）─────────
@@ -174,6 +176,12 @@ def extract_content(payload: dict) -> str:
     for el in elements:
         if not isinstance(el, dict):
             continue
+        # 拍一拍：官方文档里我没找到它的正式字段名，所以按内容宽松识别；
+        # 认出来就补一个占位符，让她知道"有人在戳她"（不然这条消息是空的）。
+        blob = f"{el.get('content_type', '')}{el.get('ark_type', '')}{el.get('type', '')}"
+        if any(w in str(el).lower() for w in ("poke", "拍了拍")):
+            parts.append("[拍了拍]")
+            continue
         text = strip_mention(str(el.get("content") or ""))
         if text:
             parts.append(text)
@@ -214,6 +222,12 @@ class QQBot:
         self._stopping = False
         # 主动联系多久查一次（她真要不要开口，由 outreach 那边决定）
         self.outreach_interval = 600.0
+        # 聚批：群聊里被触发后，等 wake_delay 秒把这段时间里的话一起处理。
+        # target → {"items": [...], "deadline": float}。**固定倒计时，不因新消息重置。**
+        self._batch: dict[str, dict] = {}
+        # 发送节奏：每会话的发送时间戳（算限频用）与最近一条（同文去重用）
+        self._send_times: dict[str, list[float]] = {}
+        self._sent_recently: dict[str, tuple[str, float]] = {}
 
     # ══ 退出 ═════════════════════════════════════════════════
     def request_stop(self, *_args: object) -> None:
@@ -303,6 +317,12 @@ class QQBot:
 
         以前这里把 QQError 吞掉只打一行日志，调用方以为发送成功了：
         分段里某一段失败 → 用户看到半截；整条失败 → 她的记忆里却记着说过。
+
+        发送前还有三道闸（借鉴 QQ-agent 的sender）：
+          · 每会话限频：分钟/小时上限，超了就等（不硬丢，但要留痕）
+          · 随机间隔：连着发好几段时不要顶着平台的风控线
+          · 同文去重：8 秒内不重复发同一句话——但**只在发送成功后才记账**，
+            提前记账会把合法重试误判成重复、静默丢消息
         """
         path = (
             f"/v2/groups/{openid}/messages"
@@ -310,7 +330,29 @@ class QQBot:
             else f"/v2/users/{openid}/messages"
         )
         result = SendResult()
-        for piece in chunk_text(text):
+        pieces = chunk_text(text)
+        if not pieces:
+            return result
+        key = f"{kind}:{openid}"
+
+        # 同文去重（8 秒）
+        last_text, last_ts = self._sent_recently.get(key, ("", 0.0))
+        if pieces == [last_text] and time.time() - last_ts < 8.0:
+            print("[发送] 8 秒内发过同样的话，跳过（防重复回复）")
+            result.sent.extend(pieces)
+            return result
+
+        for index, piece in enumerate(pieces):
+            if index:  # 分段之间隔一下，别顶着风控
+                time.sleep(random.uniform(
+                    self.settings.runtime.send_min_interval,
+                    self.settings.runtime.send_max_interval,
+                ))
+            blocked = self._rate_limit_wait(key)
+            if blocked:
+                print(f"[发送] {blocked}，这句先不发了（{piece[:20]}…）", file=sys.stderr)
+                result.failed.append((piece, blocked))
+                continue
             body: dict = {"msg_type": MSG_TYPE_TEXT, "content": piece}
             if msg_id:
                 body["msg_id"] = msg_id
@@ -322,6 +364,9 @@ class QQBot:
             try:
                 self._request("POST", path, body)
                 result.sent.append(piece)
+                self._note_send(key)          # 成功才记账
+                if len(pieces) == 1:
+                    self._sent_recently[key] = (piece, time.time())
             except QQError as exc:
                 result.failed.append((piece, str(exc)))
                 print(f"[发送失败] {kind} → {openid}：{exc}", file=sys.stderr)
@@ -332,6 +377,86 @@ class QQBot:
                 file=sys.stderr,
             )
         return result
+
+    def _rate_limit_wait(self, key: str) -> str:
+        """返回非空 = 被限频拦下了（附原因）。"""
+        now = time.time()
+        stamps = [t for t in self._send_times.get(key, []) if now - t < 3600]
+        self._send_times[key] = stamps
+        runtime = self.settings.runtime
+        per_min = len([t for t in stamps if now - t < 60])
+        if per_min >= runtime.send_max_per_minute:
+            return f"每分钟最多 {runtime.send_max_per_minute} 条"
+        if len(stamps) >= runtime.send_max_per_hour:
+            return f"每小时最多 {runtime.send_max_per_hour} 条"
+        return ""
+
+    def _note_send(self, key: str) -> None:
+        self._send_times.setdefault(key, []).append(time.time())
+
+    # ══ 聚批：被触发后等她说完再一起处理 ══════════════════════
+    def _enqueue_batch(
+        self,
+        target: str,
+        user_id: str,
+        speaker: str,
+        content: str,
+        msg_id: str,
+        at_bot: bool,
+        role: str = "",
+    ) -> None:
+        """把触发消息放进批次，并（第一次时）定下截止时间。
+
+        **截止时间不因为新消息而顺延**：滑动窗口在热闹的群里会让她永远等下去，
+        等于永远不开口。
+        """
+        batch = self._batch.get(target)
+        if batch is None:
+            batch = {
+                "items": [],
+                "deadline": time.time() + max(0.2, self.settings.runtime.wake_delay_seconds),
+            }
+            self._batch[target] = batch
+        batch["items"].append({
+            "user_id": user_id,
+            "speaker": speaker,
+            "content": content,
+            "msg_id": msg_id,
+            "at_bot": at_bot,
+            "role": role,
+        })
+
+    def _next_batch_deadline(self) -> float | None:
+        return min((b["deadline"] for b in self._batch.values()), default=None)
+
+    def _flush_batches(self) -> None:
+        """到点的批次，一次性处理。"""
+        now = time.time()
+        for target, batch in list(self._batch.items()):
+            if now < batch["deadline"]:
+                continue
+            del self._batch[target]
+            self._run_batch(target, batch["items"])
+
+    def _run_batch(self, target: str, items: list[dict]) -> None:
+        if not items:
+            return
+        if len(items) > 1:
+            print(f"[聚批] 这 {len(items)} 句一起处理（{self.settings.runtime.wake_delay_seconds:.1f}s 窗口）")
+        # 前面几句只当"听见了"：落库进她的聊天记录，让她在上下文里看得到，
+        # 但只有最后一句触发回复（被动回复窗口也是按它算的）。
+        for item in items[:-1]:
+            handle_message(
+                item["content"], item["user_id"], settings=self.settings, scene="group",
+                group_id=target, speaker_name=item["speaker"], is_handler=False,
+                log_only=True, mid=item["msg_id"],
+            )
+        last = items[-1]
+        self._respond(
+            "group", target, last["user_id"], last["speaker"],
+            last["content"], last["msg_id"], at_bot=last["at_bot"],
+            role=str(last.get("role") or ""),
+        )
 
     # ══ 事件 ═════════════════════════════════════════════════
     # 同一条消息可能被推两次：
@@ -412,6 +537,7 @@ class QQBot:
 
         who = "群" if kind == "group" else "私聊"
         print(f"[收到·{who}{'' if at_bot else '·旁听'}] {user_id[:12]}…：{content[:60]}")
+        role = str(author.get("member_role") or "")
 
         # 记住最近活跃的群 —— 她主动发消息到群里时用它当目标
         if kind == "group":
@@ -422,24 +548,71 @@ class QQBot:
                 hub0 = brain_mod.get_default(self.settings)
                 if hub0.remember_person(user_id, speaker):
                     print(f"[认得] 群里有人叫「{hub0.known_people().get(user_id, '')}」")
+            # 活跃成员表：谁常来、谁好久没露面（她说话的分寸不一样）
+            brain_mod.get_default(self.settings).note_activity(user_id)
 
         # 先看是不是指令（官方 openid 与 QQ 号不互通，所以有 /bind 兜底）
         if self.handle_command(kind, target, content, user_id, msg_id):
             return
 
-        # 群里没点到她 → 只记进聊天记录，不搭话（全量模式的价值就在这里）
-        if kind == "group" and not at_bot:
-            handle_message(
-                content, user_id, settings=self.settings, scene="group",
-                group_id=target, speaker_name=speaker, log_only=True, mid=msg_id,
+        # ── 群聊：先决定这条要不要让她开口（档位见 giftia/trigger.py）──
+        if kind == "group":
+            # 这个群已经有一批在等 → 直接并入：**不再逐条判定、也不重置倒计时**。
+            # 否则"@她之后又顺口补一句"会被当成旁听漏掉，或者把倒计时越推越远。
+            if target in self._batch:
+                self._enqueue_batch(target, user_id, speaker, content, msg_id, at_bot, role)
+                print("[聚批] 并入正在等的那一批")
+                return
+            speak, why = decide_speak(
+                self.settings.runtime.response_tier,
+                at_bot=at_bot,
+                text=content,
+                keywords=tuple(self.settings.runtime.keywords or ()),
+                roll=random.random(),
+            )
+            if not speak:
+                # 没命中 → 当场标已读（只旁听）：不建会话、不调模型，零 token
+                handle_message(
+                    content, user_id, settings=self.settings, scene="group",
+                    group_id=target, speaker_name=speaker, log_only=True, mid=msg_id,
+                )
+                print(f"[旁听] {why} → 不出声")
+                return
+            if self.settings.runtime.wake_delay_seconds <= 0:
+                # 不聚批：立刻处理（想让她"听到就回"就把 wake_delay_seconds 设成 0）
+                self._respond(kind, target, user_id, speaker, content, msg_id, at_bot, role)
+                return
+            self._enqueue_batch(target, user_id, speaker, content, msg_id, at_bot, role)
+            print(
+                f"[待答] {why} → 等 {self.settings.runtime.wake_delay_seconds:.1f}s"
+                " 把这段时间里的话一起处理"
             )
             return
 
+        # 私聊：直接处理（群聊走聚批，到点了由 _run_batch 转到这里）
+        self._respond(kind, target, user_id, speaker, content, msg_id)
+
+    def _respond(
+        self,
+        kind: str,
+        target: str,
+        user_id: str,
+        speaker: str,
+        content: str,
+        msg_id: str,
+        at_bot: bool = True,
+        role: str = "",
+    ) -> None:
+        """真正处理一条消息并回复。
+
+        聚批结束后由 `_run_batch` 调用：那时"这一批"的前几句已经作为旁听落库了，
+        所以模型的工作记忆里看得到上下文，而回复是按这一批的**最后一句**发的
+        （被动回复窗口也是按它算的）。
+        """
         hub = brain_mod.get_default(self.settings)
         owner = self.owner_id()
         if not owner and self.settings.runtime.auto_bind:
             # 自动认主：省掉 /bind（官方 openid 无法预先知道，只能这样认人）
-            role = str((payload.get("author") or {}).get("member_role") or "")
             if kind == "c2c":
                 # 私聊：未认证时只有管理员/体验号能找她，第一个说话的当然是他
                 hub.set_handler_id(user_id)
@@ -692,12 +865,19 @@ class QQBot:
                     except Exception as exc:  # 主动联系出问题不该拖垮连接
                         print(f"[主动联系异常] {type(exc).__name__}: {exc}", file=sys.stderr)
                     next_outreach = now + self.outreach_interval
+                # 到点的聚批：一次处理这段时间里攒下的话
+                self._flush_batches()
                 if now >= next_beat:
                     ws.send_text(json.dumps({"op": OP_HEARTBEAT, "d": self.seq}))
                     next_beat = now + interval
                     continue
                 try:
-                    raw = ws.recv_text(timeout=max(0.5, min(next_beat - now, 5.0)))
+                    wait = max(0.5, min(next_beat - now, 5.0))
+                    due = self._next_batch_deadline()
+                    if due is not None:
+                        # 有批次在等：别睡过头，到点就得起来处理
+                        wait = max(0.2, min(wait, due - now))
+                    raw = ws.recv_text(timeout=wait)
                 except WSTimeout:
                     continue
 

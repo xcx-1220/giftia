@@ -160,6 +160,31 @@ class Giftia:
             return {}
         return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
+    def people_stats(self) -> dict[str, dict]:
+        """活跃成员表：openid → {"n": 说过几句, "last": 最后说话时间}。
+
+        花名册只记名字是不够的——群里谁常来、谁好久没露面，
+        她说话的分寸不一样（"阿伟最近天天在" vs "好久没见小雨了"）。
+        """
+        raw = str(self.store.state_get("people_stats", "") or "")
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return {str(k): dict(v) for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+    def note_activity(self, user_id: str) -> None:
+        if not user_id:
+            return
+        stats = self.people_stats()
+        row = stats.get(str(user_id)) or {"n": 0, "last": ""}
+        row["n"] = int(row.get("n") or 0) + 1
+        row["last"] = self.clock.iso()
+        stats[str(user_id)] = row
+        self.store.state_set("people_stats", json.dumps(stats, ensure_ascii=False))
+
     def remember_person(self, user_id: str, name: str) -> bool:
         """记住某个人的名字（群里自我介绍时用）。返回是否是新认识。"""
         name = (name or "").strip()[:16]
