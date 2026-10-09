@@ -27,7 +27,7 @@ for _stream in (sys.stdout, sys.stderr):
 from giftia.bond import stage_for  # noqa: E402
 from giftia.brain import FAILURE_LINES, Giftia  # noqa: E402
 from giftia.config import Settings, load_settings  # noqa: E402
-from giftia.llm import LLMError, MemoryDraft, MockLLM  # noqa: E402
+from giftia.llm import ChatReply, LLMError, MemoryDraft, MockLLM, ToolCall  # noqa: E402
 from giftia.memory import (  # noqa: E402
     confidence_of,
     effective_blur,
@@ -37,6 +37,7 @@ from giftia.memory import (  # noqa: E402
     retention_of,
 )
 from giftia import memory as memory_mod  # noqa: E402
+from giftia import agent_tools  # noqa: E402
 from giftia.persona import build_system_prompt  # noqa: E402
 from giftia.store import Store  # noqa: E402
 
@@ -1290,6 +1291,114 @@ def main() -> int:
           run_rows and "prompt_chars" in run_rows[-1] and "recalled" in run_rows[-1]
           and "content" not in run_rows[-1],
           str(sorted(run_rows[-1])[:8]))
+
+    # ══ 31. 第 3.7：她自己记一笔（记忆工具）═══════════════════
+    print("\n31. 记忆工具（她自己记一笔 / 查一下 / 放掉）")
+
+    class ToolLLM(MockLLM):
+        """先按剧本调工具，再说话。"""
+
+        is_mock = False
+
+        def __init__(self, cfg, plan):
+            super().__init__(cfg)
+            self.plan = list(plan)
+            self.saw_tools: list[bool] = []
+
+        def chat_with_tools(self, messages, *, tools=None, **kw):
+            self.saw_tools.append(bool(tools))
+            if self.plan:
+                name, args = self.plan.pop(0)
+                return ChatReply(tool_calls=[ToolCall(id="c1", name=name, arguments=args)])
+            return ChatReply(text="……嗯，我记住了。")
+
+        def chat(self, messages, **kw):
+            return "……嗯，我记住了。"
+
+    tl_settings = make_settings(tmp / "tools", 81920.0)
+    tl = Giftia(tl_settings, llm=ToolLLM(tl_settings.model, []))
+    tl.set_handler_id("OWNER")
+    tl.set_handler_name("椎名")
+    tl.handle("在吗", user_id="OWNER")          # 热身一轮（不消耗剧本）
+    check("★ 她还不认识的名字写不进去（工具会拦下来）",
+          "你不认识" in agent_tools.execute(
+              tl, "remember", json.dumps({"content": "张三喜欢钓鱼", "about": "张三"},
+                                         ensure_ascii=False)),
+          "")
+
+    tl.llm.plan = [
+        ("remember", json.dumps({"content": "椎名下周三要考驾照", "about": "椎名",
+                                 "importance": 0.9}, ensure_ascii=False)),
+    ]
+    reply = tl.handle("下周我要考驾照了，有点紧张", user_id="OWNER")
+    check("她可以先记一笔再回答", reply == "……嗯，我记住了。", reply)
+    check("★ 而且是**真的写进记忆了**（不是嘴上说说）",
+          any("考驾照" in str(m["summary"])
+              for m in tl.store.active_memories(tl.instance_no)),
+          str(tl.tool_writes))
+    check("这一轮确实带了工具", tl.llm.saw_tools and tl.llm.saw_tools[0] is True,
+          str(tl.llm.saw_tools))
+    check("用户会看到她自己记了什么",
+          any("她自己记下了一条" in n for n in tl.notices),
+          str([n for n in tl.notices if "记忆" in n][:2]))
+
+    # 轮次用满：最后一轮不给工具，保证她说得出话
+    cap_settings = make_settings(tmp / "tools_cap", 81920.0)
+    cap = Giftia(cap_settings, llm=ToolLLM(cap_settings.model, [
+        ("search", json.dumps({"query": "驾照"}, ensure_ascii=False)),
+        ("search", json.dumps({"query": "驾照"}, ensure_ascii=False)),
+        ("search", json.dumps({"query": "驾照"}, ensure_ascii=False)),
+        ("search", json.dumps({"query": "驾照"}, ensure_ascii=False)),
+    ]))
+    cap.set_handler_id("OWNER")
+    cap_reply = cap.handle("在吗", user_id="OWNER")
+    check("★ 她一直调工具也不会卡住：最后一轮拿掉工具，一定说得出话",
+          cap_reply.strip() != "", repr(cap_reply))
+
+    # 客人场景不给工具
+    guest_settings = make_settings(tmp / "tools_guest", 81920.0)
+    gt = Giftia(guest_settings, llm=ToolLLM(guest_settings.model, []))
+    gt.set_handler_id("OWNER")
+    gt.set_handler_name("椎名")
+    gt.handle("在吗", user_id="OWNER")
+    tools_seen_before = len(gt.llm.saw_tools)
+    gt.llm.plan = [
+        ("remember", json.dumps({"content": "客人说的秘密"}, ensure_ascii=False)),
+    ]
+    guest_reply = gt.handle("你好", user_id="STRANGER", scene="group",
+                            group_id="G-1", speaker_name="陌生人", is_handler=False)
+    check("客人那一轮**根本没带工具**（拿不到，就无从调用）",
+          len(gt.llm.saw_tools) == tools_seen_before, str(gt.llm.saw_tools))
+    check("客人那次也没写出任何记忆",
+          not any("秘密" in str(m["summary"])
+                  for m in gt.store.active_memories(gt.instance_no)),
+          str(gt.tool_writes))
+    check("就算硬调也会被拒（可用性只有一处判据）",
+          "不能用记忆工具" in agent_tools.execute(
+              gt, "remember", json.dumps({"content": "客人说的秘密"}, ensure_ascii=False)),
+          "")
+
+    # 参数校验：乱写人名要把可用值喂回去，而且不落库
+    ok_before = len(tl.store.active_memories(tl.instance_no))
+    bad = agent_tools.execute(tl, "remember", json.dumps(
+        {"content": "张三喜欢钓鱼", "about": "张三"}, ensure_ascii=False))
+    check("★ 写了不认识的人 → 拒绝，并把认得的人喂回去",
+          "你不认识" in bad and "椎名" in bad, bad[:70])
+    bad_json = agent_tools.execute(tl, "remember", "{这不是 JSON")
+    check("坏 JSON 不崩，让它重来", "JSON" in bad_json, bad_json)
+    missing = agent_tools.execute(tl, "没有这个工具", "{}")
+    check("没有的工具如实说", "没有" in missing and "remember" in missing, missing[:60])
+
+    # forget 只能忘掉"她此刻看得见的"
+    other = tl.store.add_memory(
+        instance_no=tl.instance_no, created_ts=tl.clock.iso(), happened_ts=tl.clock.iso(),
+        summary="别人私聊里的事", importance=0.5, scope="person", subject_id="OTHER",
+    )
+    denied = agent_tools.execute(tl, "forget", json.dumps({"memory_id": other}))
+    check("★ 忘不了她看不见的记忆（不能借工具碰别人的私事）",
+          "不在你能看到" in denied, denied)
+    check("那条记忆还在", any(int(m["id"]) == other
+                              for m in tl.store.active_memories(tl.instance_no)))
 
     brain.store.close()
     brain2.store.close()

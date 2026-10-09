@@ -165,6 +165,11 @@ class MemoryConfig:
     # 定期做一次"整理记忆"（把换个说法记了两遍的合并掉）：同一个归属多久做一次
     reconcile_hours: float = 6.0
     reconcile_min_memories: int = 4
+    # 让她能自己调工具记一笔 / 查一下（giftia/agent_tools.py）。
+    # 关掉就退回"只有后台整理一条写记忆的路"。
+    tools_enabled: bool = True
+    # 工具轮次上限（含最后一轮"不给工具、只让她说话"）。3 够用：问一次、记一笔、说话。
+    tools_max_rounds: int = 3
     w_bm25: float = 1.0
     w_importance: float = 0.35
     w_recency: float = 0.25       # 作用于"保留率"这个时间项

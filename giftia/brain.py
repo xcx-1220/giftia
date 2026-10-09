@@ -22,6 +22,7 @@ from datetime import datetime
 from .bond import Bond, BondTracker
 from .clock import Clock
 from .config import Settings, load_settings
+from . import agent_tools
 from .dream import Dream, dream_text, latest_untold, make_dream, should_dream
 from .lifespan import Lifespan, LifeStatus
 from .llm import BaseLLM, DeepSeekLLM, LLMError, MockLLM
@@ -51,6 +52,13 @@ FAILURE_LINES = [
     "……信号好像断了一下。……我还在，你继续。",
     "……唔。刚才那句话掉进什么地方去了，我没接住。",
 ]
+
+# 工具轮次用满前的最后一句系统提醒：**同时还会拿掉工具**（见 _reply_with_tools）。
+# 光靠提醒不足以保证她说得出话——她可能又去调工具，用户就永远等不到回复。
+TOOL_LAST_ROUND_NUDGE = (
+    "（不要再调用任何工具了。现在直接用一句话回答对方——"
+    "你刚才想到的、答应的事，用你自己的语气说出来。）"
+)
 
 
 def make_llm(settings: Settings) -> BaseLLM:
@@ -102,6 +110,8 @@ class Giftia:
         self.last_reply_id: int | None = None
         self.last_reply_text = ""
         self.current_mid = ""
+        # 她这一轮自己调工具写下的记忆（用于提示与测试）
+        self.tool_writes: list[str] = []
 
     # ── 称呼与「认得的人」────────────────────────────────
     # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
@@ -474,6 +484,7 @@ class Giftia:
         log_only：只把这句话记进聊天记录、不回复（群里全量模式下的"旁听"）。
         """
         self.notices = []
+        self.tool_writes = []
         # 清掉上一条回复的记账：适配器回报送达情况时只能作用在**这一轮**的回复上
         self.last_reply_id = None
         self.last_reply_text = ""
@@ -660,6 +671,7 @@ class Giftia:
             is_handler=self.is_handler,
             group_chat=self._render_group_chat() if self.group_id else "",
             impressions=self.impressions_block(text),
+            tool_rules=agent_tools.TOOL_RULES if agent_tools.specs(self) else "",
         )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))
@@ -684,6 +696,53 @@ class Giftia:
             lines.append(str(m["content"]))
             lines.append("")
         return "\n".join(lines)
+
+    def _reply_with_tools(self, messages: list[dict]) -> str:
+        """让她先调工具、再说话（记忆工具，见 giftia/agent_tools.py）。
+
+        以前她只有一条写记忆的路：对话结束后后台整理。于是她说"我记住了"
+        的时候其实什么都没发生——那句话是嘴上说的，记忆是几分钟后才补上的。
+
+        轮次预算是硬的（`tools_max_rounds`，默认 3），而且**最后一轮不给工具**：
+        光在提示词里催"请说话"是不够的，她可能又去调工具，用户就永远等不到回复。
+        拿掉工具才是真正的保证。
+        """
+        tools = agent_tools.specs(self)
+        if not tools:
+            return self.llm.chat(messages)
+        rounds = max(1, int(self.settings.memory.tools_max_rounds))
+        if rounds == 1:
+            return self.llm.chat(messages)
+
+        convo = list(messages)
+        writes = 0
+        for round_no in range(1, rounds + 1):
+            if round_no == rounds:
+                # 最后一轮：nudge + 不给工具 —— 保证她说得出一句话
+                convo.append({"role": "system", "content": TOOL_LAST_ROUND_NUDGE})
+                return self.llm.chat(convo)
+            reply = self.llm.chat_with_tools(convo, tools=tools)
+            if not reply.tool_calls:
+                return reply.text
+            convo.append(
+                reply.raw_message or {"role": "assistant", "content": reply.text or ""}
+            )
+            for call in reply.tool_calls:
+                if call.name == "remember":
+                    writes += 1
+                    if writes > agent_tools.MAX_WRITES_PER_TURN:
+                        convo.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": "（这一轮记得够多了，先把话说出来）",
+                        })
+                        continue
+                convo.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": agent_tools.execute(self, call.name, call.arguments),
+                })
+        return ""  # 走不到，最后一轮一定 return
 
     def _log_run(self, *, text: str, reply: str, recalled: list, prompt_chars: int) -> None:
         """每次处理记一行运行档案（JSONL）。
@@ -742,7 +801,7 @@ class Giftia:
             self.current_mid,
         )
         try:
-            reply = self.llm.chat(messages)
+            reply = self._reply_with_tools(messages)
         except LLMError as exc:
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
             self.notices.append(f"[模型请求失败] {exc}")

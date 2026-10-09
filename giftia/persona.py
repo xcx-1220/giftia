@@ -79,6 +79,7 @@ def build_system_prompt(
     is_handler: bool = True,
     group_chat: str = "",
     impressions: str = "",
+    tool_rules: str = "",
 ) -> str:
     """一次请求的 system 消息：人格 → 称呼 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
 
@@ -154,6 +155,11 @@ def build_system_prompt(
 
     if impressions.strip():
         blocks.append("【你对他们的印象】\n" + impressions.strip())
+
+    # 工具协议必须在系统提示词里。**只把 tools 传给 API 是不够的**——
+    # 实测：不告诉她"你有这些能力"，她会把"我记住了"当台词说出来，一个工具都不调。
+    if tool_rules.strip():
+        blocks.append(tool_rules.strip())
 
     if group_chat:
         blocks.append(

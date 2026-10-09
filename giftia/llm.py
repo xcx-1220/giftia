@@ -17,7 +17,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 from .config import ModelConfig
@@ -25,6 +25,26 @@ from .config import ModelConfig
 
 class LLMError(RuntimeError):
     pass
+
+
+@dataclass
+class ToolCall:
+    """模型要求调用一个工具。`arguments` 保留原始字符串——
+    模型经常给出坏 JSON，解析失败要如实回报、让它重来，而不是在这里崩掉。"""
+
+    id: str
+    name: str
+    arguments: str = "{}"
+
+
+@dataclass
+class ChatReply:
+    """一轮回复：可能是话，可能是工具调用，也可能两者都有。"""
+
+    text: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    # 原样的 assistant 消息（带 tool_calls），要原封不动回填进 messages
+    raw_message: dict | None = None
 
 
 @dataclass
@@ -170,6 +190,22 @@ class BaseLLM:
     ) -> str:
         raise NotImplementedError
 
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> "ChatReply":
+        """带工具的一轮对话。**默认实现 = 没有工具**（回退成普通对话）。
+
+        这样 MockLLM 和任何新写的实现都不用管工具，接口往下兼容：
+        上层只管"我要一轮回复"，能调工具的实现自己去调。
+        """
+        text = self.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        return ChatReply(text=text)
+
     def extract_memories(
         self,
         transcript: str,
@@ -281,6 +317,64 @@ class DeepSeekLLM(BaseLLM):
         if not text:
             raise LLMError("模型返回了空内容")
         return text
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> ChatReply:
+        """带工具的一轮对话。
+
+        没有工具时直接走 `chat()`；**带工具时必须另走一条**——那条路有
+        "空内容就算错"的检查，而带工具时内容为空是正常的（模型这一轮只想调工具）。
+        """
+        if not tools:
+            return ChatReply(
+                text=self.chat(messages, temperature=temperature, max_tokens=max_tokens)
+            )
+        payload: dict = {
+            "model": self.cfg.name,
+            "messages": messages,
+            "max_tokens": max_tokens or self.cfg.max_tokens,
+            "stream": False,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+        if self.cfg.thinking:
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = self.cfg.reasoning_effort
+        else:
+            payload["thinking"] = {"type": "disabled"}
+            payload["temperature"] = (
+                self.cfg.temperature if temperature is None else temperature
+            )
+        data = self._post(payload)
+        try:
+            message = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"返回结构异常：{str(data)[:300]}") from exc
+        calls: list[ToolCall] = []
+        for index, raw in enumerate(message.get("tool_calls") or []):
+            if not isinstance(raw, dict):
+                continue
+            fn = raw.get("function") or {}
+            name = str(fn.get("name") or "").strip()
+            if not name:
+                continue
+            calls.append(
+                ToolCall(
+                    id=str(raw.get("id") or f"call_{index}"),
+                    name=name,
+                    arguments=str(fn.get("arguments") or "{}"),
+                )
+            )
+        text = str(message.get("content") or "").strip()
+        if not text and not calls:
+            raise LLMError("模型既没说话也没调工具")
+        return ChatReply(text=text, tool_calls=calls, raw_message=message)
 
     def extract_memories(
         self,
