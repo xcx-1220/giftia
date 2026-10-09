@@ -685,6 +685,33 @@ class Giftia:
             lines.append("")
         return "\n".join(lines)
 
+    def _log_run(self, *, text: str, reply: str, recalled: list, prompt_chars: int) -> None:
+        """每次处理记一行运行档案（JSONL）。
+
+        排障时最常问的两个问题——"她当时到底看到了什么""记忆注入吃了多少 token"——
+        靠聊天记录答不出来，靠这一行能答。只记数字和长度，**不记对话内容**
+        （内容已经在数据库里了，不用抄第二份）。
+        """
+        try:
+            path = self.settings.db_path.parent / "runs.jsonl"
+            row = {
+                "ts": self.clock.iso(),
+                "instance": self.instance_no,
+                "session": self.session_id,
+                "scene": self.last_scene,
+                "speaker": self.speaker_id[:12] if self.speaker_id else "",
+                "is_handler": self.is_handler,
+                "in_chars": len(text),
+                "out_chars": len(reply),
+                "prompt_chars": prompt_chars,      # 提示词有多大（记忆注入的代价）
+                "recalled": len(recalled),         # 想起来几条
+                "said": len(self.last_cited),      # 真的说出口几条（→ 记得更久）
+            }
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # 记账失败不该影响对话
+
     def _chat(self, text: str) -> str:
         now = self.clock.now()
         # 只有跟搭档说话才推进关系与心情 —— 别人刷不动你们的亲密度
@@ -747,6 +774,8 @@ class Giftia:
         ):
             self.store.mark_dream_told(self.last_dream.id)
             self.notices.append("[做梦] 她把那个梦讲给你听了")
+        # 运行档案：这一轮她看到了什么、想了多少、提示词多大
+        self._log_run(text=text, reply=reply, recalled=recalled, prompt_chars=len(messages[0]["content"]))
         return reply
 
     # ── 做梦 ──────────────────────────────────────────────

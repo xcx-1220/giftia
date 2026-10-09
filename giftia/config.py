@@ -49,7 +49,6 @@ class Stage:
 class LifespanConfig:
     total_hours: float = 81920.0
     demo_total_hours: float = 0.0
-    unit_label: str = "小时"
     terminal_warning_hours: float = 72.0
 
     def effective_hours(self, override: float | None = None) -> float:
@@ -166,7 +165,6 @@ class MemoryConfig:
     # 定期做一次"整理记忆"（把换个说法记了两遍的合并掉）：同一个归属多久做一次
     reconcile_hours: float = 6.0
     reconcile_min_memories: int = 4
-    recall_candidates: int = 40
     w_bm25: float = 1.0
     w_importance: float = 0.35
     w_recency: float = 0.25       # 作用于"保留率"这个时间项
@@ -248,7 +246,6 @@ class Persona:
     handler_title: str = "他"
     core: str = ""
     opening_line: str = "……请问，我该怎么称呼你？"
-    greeting_line: str = "……你来了。"
     after_recycle_line: str = "……初次见面。"
     out_of_character_hint: str = ""
     group_hint: str = ""

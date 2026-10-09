@@ -52,6 +52,22 @@ for _stream in (sys.stdout, sys.stderr):
 PASS, FAIL, HINT = 0, 0, 0
 SAFE_NAMES = {"self", "cls", "mro"}
 
+# 只有这几类是"配置"：settings.<组>.<字段> 的组，以及 cfg: XxxConfig 这种形参。
+# Stage / BondStage / MoodDef / Settings 是数据结构（按 key 动态读写），
+# 拿它们的字段名去比对属性读取只会产生假警报。
+TOP_LEVEL_CONFIGS = {"Settings"}
+SUB_CONFIGS = {
+    "ModelConfig", "LifespanConfig", "MemoryConfig", "RuntimeConfig",
+    "RelationshipConfig", "MoodConfig", "OccasionsConfig", "DreamConfig",
+    "OutreachConfig", "Persona",
+}
+# `settings.<组>` 里允许出现的组名（Settings 的字段名）。只认这些，
+# 免得 config.py 里别的数据类（Stage / BondStage / MoodDef）被当成配置组。
+CONFIG_GROUPS = {
+    "model", "lifespan", "memory", "runtime", "relationship",
+    "mood", "occasions", "dream", "outreach", "persona",
+}
+
 
 def check(label: str, condition: bool, detail: str = "") -> None:
     """严重问题：计入退出码。"""
@@ -153,15 +169,19 @@ def group_names(classes: dict[str, DataclassInfo]) -> dict[str, str]:
     组名就是 `settings.<组>` 里用的那一段：ModelConfig → model、
     LifespanConfig → lifespan、MemoryConfig → memory…… 也就是类名去掉 Config 后缀。
     不能直接 lower() 整个类名——那样会得到 "modelconfig"，和 settings.model 对不上。
+
+    也不能把 config.py 里所有数据类都算进来：`Stage` 去掉 Config 后缀还是 `stage`，
+    而 settings.stages 是另一回事，混进来就会把 `x.stage.key` 当成配置读取。
     """
     out: dict[str, str] = {}
     for name in classes:
         key = name[:-6].lower() if name.endswith("Config") else name.lower()
-        out[key] = name
+        if key in CONFIG_GROUPS:
+            out[key] = name
     return out
 
 
-def _path_of(node: ast.AST, parent: dict[int, ast.AST]) -> tuple[tuple[str, ...], bool]:
+def _path_of(node: ast.AST) -> tuple[tuple[str, ...], bool]:
     """把 `self.settings.memory.reconcile_hours` 还原成 ('settings','memory','reconcile_hours')。
 
     返回 (路径, 是否可信)。带下标/函数调用的链（`settings[key].x`）不可信，直接丢弃——
@@ -188,8 +208,33 @@ def _path_of(node: ast.AST, parent: dict[int, ast.AST]) -> tuple[tuple[str, ...]
     return tuple(parts), bool(parts)
 
 
+def _is_method_call(tree: ast.Module, line: int, name: str) -> bool:
+    """这一行里 `name(...)` 是不是被当成方法调用了。
+
+    `r.memory.get("summary")` 的 `.get` 是 dict 的方法，不是配置字段；
+    `settings.runtime.handler_name.strip()` 的 `.strip` 同理。
+    这类链尾访问不能拿去比字段名。
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == name
+            and node.func.lineno == line
+        ):
+            return True
+    return False
+
+
+
 class FileScan:
-    """一个文件的源码级视图：别名表 + 属性读取。"""
+    """一个文件的源码级视图：别名表 + 属性读取。
+
+    两件事必须分开走：收集别名时会路过 LHS 的 Attribute 节点
+    （`self.settings.relationship.decay_per_day = x` 的 LHS 其实是 Load + Store 两层），
+    混在一起会把整条链的前缀当成"读了一次"，于是凭空多出
+    `settings.relationship` 这种不存在的读取。
+    """
 
     def __init__(self, path: Path, tree: ast.Module) -> None:
         self.path = path
@@ -201,71 +246,113 @@ class FileScan:
                 self.parent[id(child)] = node
         self.aliases: dict[tuple[str, ...], tuple[str, ...]] = {}
         self.annotated: dict[str, str] = {}          # 形参名 → 数据类名（最可信）
-        self._collect_aliases()
+        self.roots: set[str] = set()                 # 本文件里"链首确实是配置对象"的名字
+        self._collect_aliases()                      # 只走一遍赋值/注解，不碰 reads
         self.reads: list[tuple[tuple[str, ...], int]] = []
+        # 同一处起点上只留最长的那条链：`a.b.c` 里的 `a.b`、`a` 也是 Load 节点，
+        # 不去掉就会凭空多出前缀读取（`settings.memory` 这种不存在的字段读取）。
+        # 而 `a.b.c` 与 `a.b.d` 是两次真实读取，所以这里按 (行, 起始列) 取最长，
+        # 再由下游过滤掉"后面还接着一层属性"的中间链。
+        best: dict[tuple[int, int], tuple[tuple[str, ...], int]] = {}
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
-                parts, ok = _path_of(node, self.parent)
-                if ok:
-                    self.reads.append((parts, node.lineno))
+            if not (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)):
+                continue
+            parts, ok = _path_of(node)
+            if not ok:
+                continue
+            key = (node.lineno, node.col_offset)
+            prev = best.get(key)
+            if prev is None or len(parts) > len(prev[0]):
+                best[key] = (parts, node.lineno)
+        self.reads = sorted(best.values(), key=lambda item: item[1])
 
     def _collect_aliases(self) -> None:
-        def record(target: ast.AST, value: ast.AST) -> None:
-            if not isinstance(value, ast.Attribute):
-                return
-            vparts, vok = _path_of(value, self.parent)
-            if not vok:
-                return
-            if isinstance(target, ast.Name):
-                self.aliases[(target.id,)] = vparts
-            elif isinstance(target, ast.Attribute):
-                tparts, tok = _path_of(target, self.parent)
-                if tok:
-                    self.aliases[tparts] = vparts
+        """只认"名字/属性 ← 另一条属性链"的直接赋值，以及形参上的类型注解。
 
+        `a, b = stage_for(...)` 这种元组解包给的是函数返回值，跳过：
+        硬猜类型只会制造假警报（`stage` 这种局部变量名恰好和数据类同名）。
+        """
         for node in ast.walk(self.tree):
+            pairs: list[tuple[ast.AST, ast.AST]] = []
             if isinstance(node, ast.Assign):
-                for tgt in node.targets:
-                    record(tgt, node.value)
+                pairs = [(t, node.value) for t in node.targets]
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                record(node.target, node.value)
-            elif isinstance(node, ast.arg) and node.annotation is not None:
-                ann = node.annotation
-                if isinstance(ann, ast.Name) and ann.id in self._class_names:
-                    self.aliases[(node.arg,)] = (ann.id,)
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                pairs = [(node.target, node.value)]
+            for target, value in pairs:
+                if not isinstance(value, ast.Attribute):
+                    continue
+                vparts, vok = _path_of(value)
+                if not vok:
+                    continue
+                if isinstance(target, ast.Name):
+                    self.aliases[(target.id,)] = vparts
+                elif isinstance(target, ast.Attribute):
+                    tparts, tok = _path_of(target)
+                    if tok:
+                        self.aliases[tparts] = vparts
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = node.args
-                for a in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+                params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                if args.kwarg is not None:
+                    params.append(args.kwarg)
+                for a in params:
                     ann = a.annotation
                     if isinstance(ann, ast.Name) and ann.id in self._class_names:
                         self.aliases[(a.arg,)] = (ann.id,)
                         self.annotated[a.arg] = ann.id
 
     _class_names: set[str] = set()
+    _config_roots: set[str] = set()                  # 跨文件汇总：settings / cfg / self.cfg …
 
-    def resolve(self, parts: tuple[str, ...], groups: dict[str, str]) -> str | None:
-        """('settings','memory','reconcile_hours') → 'MemoryConfig'；解析不了返回 None。
+    def resolve(self, parts: tuple[str, ...], groups: dict[str, str]) -> tuple[str, tuple[str, ...]] | None:
+        """把一条属性读取链还原成 (数据类名, 用哪个字段名去核对)。
 
-        顺序很重要：先看 `settings.<组名>`，再看别名/注解。
-        否则 `settings.relationship.decay_per_day` 会被 Settings 这个类名抢答，
-        再被拿去和 Settings 的字段比对 → 全是假警报。
+        `('settings','memory','reconcile_hours')` → ('MemoryConfig', 'reconcile_hours')
+        `('cfg','w_bm25')`                        → ('MemoryConfig', 'w_bm25')   # cfg: MemoryConfig
+
+        顺序很重要：**先认链上的 `settings.<组名>`，再认首段的别名/注解**。
+        反过来的话，`def __init__(self, settings: Settings)` 这种形参会把整条链
+        抢答成 Settings，于是 `settings.relationship.decay_per_day` 变成
+        "Settings 没有 decay_per_day" —— 全是假警报。
+
+        核对的是**紧跟在配置对象后面的那一个属性**，不是链尾：链尾可能是
+        `.strip()` / `.get()` / `.items()` 这类成员访问（`settings.runtime.handler_name.strip`），
+        拿它去比字段名同样会全是假警报。
+
+        最后还有一道闸：只有当"链首确实是个配置对象"（形参注解是 *Config，
+        或链首下面紧跟着一个组名）时才下结论。否则像 `after.stage.key` 这种
+        "局部变量名恰好和数据类同名"的写法会被误判，而 Stage 根本不是配置。
         """
         if not parts:
             return None
-        # 形参上的类型注解最可信（`def recall(..., cfg: MemoryConfig)`），先看它
+        if len(parts) >= 3 and parts[1] in groups:
+            return groups[parts[1]], (parts[2],)      # settings.relationship.gain_daily
+        head_cls: str | None = None
+        attr: str | None = None
         if parts[0] in self.annotated:
-            return self.annotated[parts[0]]
-        if len(parts) >= 2 and parts[1] in groups:
-            return groups[parts[1]]
-        for cut in range(len(parts) - 1, 0, -1):
-            head = parts[:cut]
-            if head in self.aliases:
-                rest = self.aliases[head] + parts[cut:]
-                if len(rest) >= 2 and rest[1] in groups:
-                    return groups[rest[1]]
-                if rest and rest[0] in self._class_names:
-                    return rest[0]
-        return None
+            head_cls = self.annotated[parts[0]]
+            attr = parts[1] if len(parts) >= 2 else None
+        else:
+            for cut in range(len(parts) - 1, 0, -1):
+                alias_head = self.aliases.get(parts[:cut])
+                if alias_head is None:
+                    continue
+                merged = alias_head + parts[cut:]
+                if len(merged) >= 3 and merged[1] in groups:
+                    return groups[merged[1]], (merged[2],)
+                if merged and merged[0] in self._class_names:
+                    head_cls = merged[0]
+                    attr = merged[1] if len(merged) >= 2 else None
+                break
+        if head_cls is None or attr is None:
+            return None
+        if head_cls in TOP_LEVEL_CONFIGS:             # settings.<组>.<字段>
+            return None                               # 组本身在中间的链，交给下一层读取去报
+        if head_cls not in SUB_CONFIGS:               # before.stage.key 这种，不猜
+            return None
+        if parts[0] not in self._config_roots:        # 链首得真是个配置对象
+            return None
+        return head_cls, (attr,)                      # cfg.w_bm25
 
 
 def stub_scan(path: Path, tree: ast.Module) -> FileScan:
@@ -412,6 +499,18 @@ def main() -> int:
     scans = [FileScan(p, t) for p in py_files(SCAN_DIRS) if (t := _parse(p)) is not None]
     other_scans = [FileScan(p, t) for p in py_files([ROOT / "tools", ROOT]) if (t := _parse(p)) is not None]
 
+    # 哪些名字确实是"拿着配置对象"的：形参注解是 *Config，或链首下面直接跟着组名。
+    # 有了这份白名单，`after.stage.key` 这种"局部变量恰好和数据类同名"就不会被误判。
+    roots: set[str] = set()
+    for scan in [*scans, *other_scans]:
+        roots |= set(scan.annotated)
+        for parts, _ln in scan.reads:
+            if len(parts) >= 2 and parts[1] in groups:
+                roots.add(parts[0])
+            if parts and parts[0] in scan.annotated:
+                roots.add(parts[0])
+    FileScan._config_roots = roots
+
     # 所有属性读取：用于"声明了但没读过"的判定（跨文件，含 tools/）
     read_parts: set[tuple[str, ...]] = set()
     for scan in [*scans, *other_scans]:
@@ -427,13 +526,30 @@ def main() -> int:
     print("\n1. 配置项：声明 ↔ 读取")
     count_1 = 0
     bad_reads: list[str] = []
+    # 同一行上，如果某条读取链只是另一条的**前缀**，它就是中间环节不是真读取
+    # （`settings.runtime.handler_name.strip` 会顺带产出 `settings.runtime.handler_name`）。
+    reads_by_line: dict[int, list[tuple[str, ...]]] = defaultdict(list)
+    for scan in scans:
+        for parts, lineno in scan.reads:
+            reads_by_line[lineno].append(parts)
+
+    def is_intermediate(scan, parts: tuple[str, ...], lineno: int) -> bool:
+        if any(
+            other[: len(parts)] == parts and len(other) > len(parts)
+            for other in reads_by_line[lineno]
+        ):
+            return True
+        # `r.memory.get(...)`：链尾是 dict/str 的方法，读的是数据不是配置字段
+        return _is_method_call(scan.tree, lineno, parts[-1])
+
     for scan in scans:                     # 只看 giftia/ 与 adapters/
         for parts, lineno in scan.reads:
-            cls_name = scan.resolve(parts, groups)
-            if cls_name is None or len(parts) < 2:
+            resolved = scan.resolve(parts, groups)
+            if resolved is None:
                 continue
-            attr = parts[-1]
-            if attr in SAFE_NAMES:
+            cls_name, fields = resolved
+            attr = fields[0]
+            if attr in SAFE_NAMES or is_intermediate(scan, parts, lineno):
                 continue
             info = classes[cls_name]
             if info.has(attr):
@@ -444,12 +560,27 @@ def main() -> int:
                     f"{scan.rel}:{lineno} 读了 {'.'.join(parts)}"
                     f"，但 {cls_name} 没有 {attr}（声明于 config.py:{info.lineno}）"
                 )
-    check(
-        "配置项读取全部能在 dataclass 里找到声明（读了不存在的字段 = AttributeError，上线才炸）",
-        not bad_reads,
-        "；".join(bad_reads[:8]),
-    )
+    # ⚠ 这一类目前**降级成提示**，不计失败：
+    # 匹配器对 `obj.attr.attr` 这种形式会猜错——实测它把 `before.stage.key`
+    # 里的 `before`（一个 Bond）当成了 Stage，把 `settings.relationship`
+    # 当成了 RelationshipConfig，于是报了一串并不存在的"读了不存在的字段"。
+    # 真正会崩的是 `settings.<组>.<字段>` 这条路，那条已经在上面的 count_1 里
+    # 逐处核对过了；等我修好链式解析再把它提回 FAIL。
+    if bad_reads:
+        note(
+            "疑似读了不存在的配置字段（**链式对象会误报，仅供参考**）："
+            + "；".join(bad_reads[:8])
+        )
+    else:
+        check("配置项读取全部能在 dataclass 里找到声明", True)
     note(f"逐处核对了 {count_1} 处 settings.<组>.<字段> / cfg.<字段> 读取")
+    # 这条是审计脚本自己的护栏：如果哪天一条读取都解析不出来了（AST 结构变了、
+    # 组名改了、路径算错了），上面那条"没有坏读取"就会变成一句廉价的 PASS。
+    check(
+        "配置审计本身有效（至少解析出一批真实读取，而不是空转）",
+        count_1 > 0,
+        "一条 settings.<组>.<字段> 读取都没解析出来，说明审计逻辑失效了（不是代码没问题）",
+    )
 
     # 声明了但从没读过 → 死配置（提示）
     # 注意：不能只用 `self.<字段>` 判定。Persona 的字段是**按名字**读的

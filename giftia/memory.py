@@ -609,7 +609,7 @@ def reconcile(
     """
     view = [("private", "")] if scope == "private" else [(scope, subject_id)]
     memories = store.active_memories(instance_no, view=view)
-    if len(memories) < 4:
+    if len(memories) < settings.memory.reconcile_min_memories:
         return {"merged": 0, "groups": 0, "kept": []}
     picked = memories[-limit:]
     numbered = "\n".join(f"{i + 1}. {str(m.get('summary', '')).strip()}"

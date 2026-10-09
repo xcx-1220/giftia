@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 import sys
 import tempfile
@@ -1280,6 +1281,15 @@ def main() -> int:
     imp2 = im.impressions_block("你好", per_person=3, max_people=1)
     check("全局也封顶（最多带几个人）",
           imp2.count("\n- ") <= 1, f"带了 {imp2.count(chr(10) + '- ')} 个人")
+
+    # 运行档案：排障时回答"她当时到底看到了什么"
+    runs_file = im.settings.db_path.parent / "runs.jsonl"
+    check("每次处理都记一行运行档案", runs_file.exists(), str(runs_file))
+    run_rows = [json.loads(ln) for ln in runs_file.read_text(encoding="utf-8").splitlines()]
+    check("档案里有提示词大小与想起几条（不记对话内容）",
+          run_rows and "prompt_chars" in run_rows[-1] and "recalled" in run_rows[-1]
+          and "content" not in run_rows[-1],
+          str(sorted(run_rows[-1])[:8]))
 
     brain.store.close()
     brain2.store.close()

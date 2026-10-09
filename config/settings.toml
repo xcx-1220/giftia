@@ -22,7 +22,6 @@ reasoning_effort = "low"                         # 仅在 thinking = true 时有
 total_hours      = 81920
 # 想一次性看完她的一生？把这里设成 48（小时），再配合 /time +N 快进虚拟时钟
 demo_total_hours = 0
-unit_label       = "小时"
 # 剩余寿命低于这个小时数时，进入"终端服务迫近"的倒计时提醒
 # （实际阈值会再取一次 min(本值, 总寿命的 5%)，避免短寿命演示时一开机就报警）
 terminal_warning_hours = 72
@@ -34,7 +33,7 @@ terminal_warning_hours = 72
 consolidate_every    = 6
 session_window       = 40       # 每次请求带上的最近消息条数（工作记忆）
 session_char_budget  = 9000     # 工作记忆的字符上限，超出就从最旧的开始丢
-recall_candidates    = 40       # 检索时先粗筛多少条候选（语料小，全量也行）
+
 # 混合打分权重：关键词 1.0 + 重要性 + 保留率（时间项）+ 记忆层级
 w_bm25            = 1.0
 w_importance      = 0.35
