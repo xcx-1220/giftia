@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +26,10 @@ CREATE TABLE IF NOT EXISTS messages (
     role         TEXT    NOT NULL,
     content      TEXT    NOT NULL,
     ts           TEXT    NOT NULL,
-    consolidated INTEGER NOT NULL DEFAULT 0
+    consolidated INTEGER NOT NULL DEFAULT 0,
+    -- 平台消息 id：撤回要按它找，调试和引用回复也用得上
+    mid          TEXT    NOT NULL DEFAULT '',
+    recalled     INTEGER NOT NULL DEFAULT 0
 );
 
 -- 长期记忆条目：由一段对话压缩而来
@@ -115,8 +120,92 @@ class Store:
             "speaker_name": "TEXT NOT NULL DEFAULT ''",
             "scope": "TEXT NOT NULL DEFAULT 'private'",
             "subject_id": "TEXT NOT NULL DEFAULT ''",
+            "recalled": "INTEGER NOT NULL DEFAULT 0",
+            "mid": "TEXT NOT NULL DEFAULT ''",
         },
     }
+
+    # ── 记忆快照：合并是半破坏性的，要能回滚 ────────────────
+    def snapshot_memories(self, tag: str = "auto", keep: int = 5) -> Path:
+        """把记忆表整表拍一份 JSON 快照，只保留最近 keep 份。
+
+        为什么需要：`reconcile` 的合并会把她记忆里的重复条目藏起来
+        （mark_merged 虽然不删数据，但一旦模型判错、把两件事合成一件，
+        她是真的会忘掉一件事）。拍照是唯一能让人放心的兜底。
+        """
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = self.path.parent / "snapshots"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        target = out_dir / f"memories-{stamp}-{tag}.json"
+        payload = {
+            "taken_at": datetime.now().isoformat(timespec="seconds"),
+            "db": str(self.path),
+            "memories": self._rows("SELECT * FROM memories ORDER BY id ASC"),
+        }
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        # 只留最近 keep 份，别把磁盘塞满
+        snaps = sorted(out_dir.glob("memories-*.json"))
+        for old in snaps[:-keep] if keep > 0 else []:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return target
+
+    def restore_memories(self, snapshot: Path | str) -> int:
+        """从快照整表恢复记忆。返回恢复的条数。
+
+        整表替换（不是"取消合并"）——语义简单、可预期，出事时能一键回到拍照那一刻。
+        """
+        data = json.loads(Path(snapshot).read_text(encoding="utf-8"))
+        rows = data.get("memories") or []
+        if not rows:
+            return 0
+        cols = [
+            "id", "instance_no", "created_ts", "happened_ts", "summary", "tags",
+            "emotion", "importance", "source_session", "layer", "strength",
+            "recall_count", "last_recalled_at", "injected_at", "sealed", "event_date",
+            "scope", "subject_id", "speaker_id", "about", "merged_into",
+        ]
+        self.conn.execute("DELETE FROM memories")
+        for row in rows:
+            present = [c for c in cols if c in row]
+            marks = ",".join("?" * len(present))
+            self.conn.execute(
+                f"INSERT INTO memories({','.join(present)}) VALUES({marks})",
+                tuple(row[c] for c in present),
+            )
+        self.conn.commit()
+        return len(rows)
+
+    def list_snapshots(self) -> list[Path]:
+        out_dir = self.path.parent / "snapshots"
+        return sorted(out_dir.glob("memories-*.json")) if out_dir.exists() else []
+
+    # ── 备注名：你给群友起的名字，展示时覆盖昵称 ─────────────
+    # 归属主键仍是 openid（昵称会变、会重名，openid 不会）——
+    # 真机数据里她曾把"椎名"和群昵称"习惯微笑i"当成两个人。
+    def all_notes(self) -> dict[str, str]:
+        raw = str(self.state_get("member_notes", "") or "")
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+    def person_note(self, user_id: str) -> str:
+        return self.all_notes().get(str(user_id), "")
+
+    def set_person_note(self, user_id: str, note: str) -> None:
+        notes = self.all_notes()
+        note = (note or "").strip()[:24]
+        if note:
+            notes[str(user_id)] = note
+        else:
+            notes.pop(str(user_id), None)
+        self.state_set("member_notes", json.dumps(notes, ensure_ascii=False))
 
     def __init__(self, db_path: Path | str) -> None:
         self.path = Path(db_path)
@@ -189,10 +278,12 @@ class Store:
         speaker_name: str = "",
         scope: str = "private",
         subject_id: str = "",
+        mid: str = "",
     ) -> int:
         cur = self.conn.execute(
             "INSERT INTO messages(session_id, instance_no, role, content, ts, "
-            "speaker_id, speaker_name, scope, subject_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "speaker_id, speaker_name, scope, subject_id, mid) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 instance_no,
@@ -203,6 +294,7 @@ class Store:
                 speaker_name,
                 scope,
                 subject_id,
+                str(mid or ""),
             ),
         )
         self.conn.commit()
@@ -276,8 +368,10 @@ class Store:
         )
 
     def recent_messages(self, session_id: str, limit: int = 24) -> list[dict[str, Any]]:
+        """工作记忆。**被撤回的消息不算**——那是从没发生过的话。"""
         rows = self._rows(
-            "SELECT * FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM messages WHERE session_id = ? AND recalled = 0 "
+            "ORDER BY id DESC LIMIT ?",
             (session_id, limit),
         )
         return list(reversed(rows))
@@ -290,7 +384,8 @@ class Store:
         """
         safe = prefix.replace("%", "").replace("_", "")
         rows = self._rows(
-            "SELECT * FROM messages WHERE session_id LIKE ? ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM messages WHERE session_id LIKE ? AND recalled = 0 "
+            "ORDER BY id DESC LIMIT ?",
             (safe + "%", limit),
         )
         return list(reversed(rows))
@@ -301,15 +396,30 @@ class Store:
         """还没被整理成记忆条目的消息（按会话分开整理，别把别人的对话混进来）。"""
         if session_id is None:
             return self._rows(
-                "SELECT * FROM messages WHERE instance_no = ? AND consolidated = 0 AND id > ? "
-                "ORDER BY id ASC",
+                "SELECT * FROM messages WHERE instance_no = ? AND consolidated = 0 "
+                "AND recalled = 0 AND id > ? ORDER BY id ASC",
                 (instance_no, after_id),
             )
         return self._rows(
             "SELECT * FROM messages WHERE instance_no = ? AND session_id = ? "
-            "AND consolidated = 0 AND id > ? ORDER BY id ASC",
+            "AND consolidated = 0 AND recalled = 0 AND id > ? ORDER BY id ASC",
             (instance_no, session_id, after_id),
         )
+
+    def mark_recalled(self, msg_id: str) -> int:
+        """标记一条消息被撤回了。返回标记了几条。
+
+        撤回的消息**再也不发给模型**（工作记忆、群聊记录、记忆整理三条路都不带它）——
+        否则她会记住一句从没发生过的话。
+        """
+        if not msg_id:
+            return 0
+        cur = self.conn.execute(
+            "UPDATE messages SET recalled = 1, consolidated = 1 WHERE mid = ?",
+            (str(msg_id),),
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
 
     def mark_consolidated(self, ids: list[int]) -> None:
         if not ids:

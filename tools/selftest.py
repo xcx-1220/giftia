@@ -1146,6 +1146,95 @@ def main() -> int:
     check("而且不会重复追加「你的搭档」", al_roster.count("（你的搭档）") <= 1,
           str(al_roster.count("（你的搭档）")))
 
+    # ══ 29. 第 1 批改进：在场过滤 / 快照 / 备注名 / 撤回 ═══════
+    print("\n29. 记忆分区加固（在场过滤 / 快照回滚 / 备注名 / 撤回）")
+    pr = Giftia(make_settings(tmp / "presence", 81920.0), llm=MockLLM(settings.model))
+    pr.set_handler_id("OWNER")
+    pr.handle("我叫小林", user_id="OWNER")
+    for summary, about in (
+        ("阿伟周六下午要去体育馆打球", "阿伟"),
+        ("小雨最近在准备考研，压力很大", "小雨"),
+        ("搭档下周三要考驾照，有点紧张", "搭档"),
+    ):
+        pr.store.add_memory(
+            instance_no=pr.instance_no,
+            created_ts=pr.clock.iso(),
+            happened_ts=pr.clock.iso(),
+            summary=summary,
+            importance=0.7,
+            layer="important",
+            about=about,
+        )
+    pr.handle("阿伟", user_id="F1", scene="group", group_id="G-1", speaker_name="阿伟")
+    pr._prepare("周六打球的事")
+    kept_about = {str(r.memory.get("about")) for r in pr.last_recalled}
+    check("★ 群里只想起「在场的人」的事，不会想起不在场的小雨",
+          "小雨" not in kept_about, str(kept_about))
+
+    pr2 = Giftia(make_settings(tmp / "presence2", 81920.0), llm=MockLLM(settings.model))
+    pr2.set_handler_id("OWNER")
+    pr2.store.add_memory(
+        instance_no=pr2.instance_no,
+        created_ts=pr2.clock.iso(),
+        happened_ts=pr2.clock.iso(),
+        summary="小雨最近在准备考研，压力很大",
+        importance=0.8,
+        layer="important",
+        about="小雨",
+        # 这条是"群里公开发生过的事"，所以用群归属（私聊记忆在群里本来就看不到）
+        scope="group",
+        subject_id="G-1",
+    )
+    pr2.handle("小雨最近怎么样", user_id="F1", scene="group", group_id="G-1",
+               speaker_name="阿伟")
+    check("但消息里点到谁，谁的事就能想起来（问「小雨最近怎么样」）",
+          any("考研" in r.text for r in pr2.last_recalled),
+          str([r.text[:16] for r in pr2.last_recalled]))
+
+    priv = Giftia(make_settings(tmp / "presence3", 81920.0), llm=MockLLM(settings.model))
+    priv.set_handler_id("OWNER")
+    priv.store.add_memory(
+        instance_no=priv.instance_no,
+        created_ts=priv.clock.iso(),
+        happened_ts=priv.clock.iso(),
+        summary="小雨最近在准备考研，压力很大",
+        importance=0.8,
+        layer="important",
+        about="小雨",
+    )
+    priv.handle("小雨最近怎么样", user_id="OWNER")
+    check("私聊不设这道闸门（你本来就有权知道所有人的事）",
+          any("考研" in r.text for r in priv.last_recalled),
+          str([r.text[:16] for r in priv.last_recalled]))
+
+    pr.store.set_person_note("F1", "老王")
+    pr.handle("你好", user_id="F1", scene="group", group_id="G-1", speaker_name="阿伟")
+    roster = pr._prepare("你好")[0][0]["content"]
+    check("备注名覆盖平台昵称（昵称会变、会重名，备注不会）",
+          "老王" in roster and "【群里你认得的人】" in roster,
+          roster[roster.find("【群里你认得的人】") :][:70].replace("\n", " / "))
+
+    snap = pr.store.snapshot_memories("test")
+    check("记忆能拍快照（合并是半破坏性的，要能回滚）", snap.exists(), str(snap))
+    before_rows = len(pr.store.all_memories(pr.instance_no))
+    pr.store.mark_merged(
+        [int(m["id"]) for m in pr.store.active_memories(pr.instance_no)[-1:]], into=1
+    )
+    check("合并后检索里少了一条",
+          len(pr.store.active_memories(pr.instance_no)) == before_rows - 1)
+    pr.store.restore_memories(snap)
+    check("★ 快照能一键回滚到拍照那一刻",
+          len(pr.store.active_memories(pr.instance_no)) == before_rows
+          and len(pr.store.all_memories(pr.instance_no)) == before_rows,
+          f"{len(pr.store.active_memories(pr.instance_no))}/{before_rows}")
+
+    pr.store.add_message("s", pr.instance_no, "user", "这句会被撤回", pr.clock.iso(),
+                         mid="MID-X")
+    check("撤回前那句话在", len(pr.store.recent_messages("s")) == 1)
+    check("按平台消息 id 标记撤回", pr.store.mark_recalled("MID-X") == 1)
+    check("★ 撤回后再也不进工作记忆", pr.store.recent_messages("s") == [])
+    check("也不进记忆整理", pr.store.open_messages(pr.instance_no, 0, "s") == [])
+
     brain.store.close()
     brain2.store.close()
 

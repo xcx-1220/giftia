@@ -101,6 +101,7 @@ class Giftia:
         # 上一条回复写进了哪一行 —— 适配器回报"到底送出去没有"时要改它
         self.last_reply_id: int | None = None
         self.last_reply_text = ""
+        self.current_mid = ""
 
     # ── 称呼与「认得的人」────────────────────────────────
     # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
@@ -221,25 +222,63 @@ class Giftia:
                 return name
         return ""
 
+    def _present_names(self, text: str) -> set[str]:
+        """本轮"在场"的人：说话的这位、搭档本人、这条消息里点到的人，以及泛指。"""
+        names = {"", "群里", "大家", "搭档", "群友"}
+        if self.speaker_name:
+            names.add(self.speaker_name)
+        if self.handler_name:
+            names.add(self.handler_name)
+        for uid, name in self.known_people().items():
+            display = self.store.person_note(uid) or name
+            if display and display in text:
+                names.add(display)
+                names.add(name)
+        return names
+
+    def _filter_by_presence(self, recalled: list[Recalled], text: str) -> list[Recalled]:
+        """群聊里只留下"关于在场的人"的记忆。
+
+        专治"把 A 的事说给 B 听"：记忆里明明有 `about` 字段，但检索时没有用它。
+        私聊不设这道闸门——你本来就有权知道所有人的事。
+        """
+        if self.last_scene not in ("group", "guest"):
+            return recalled
+        present = self._present_names(text)
+        # 这条消息里点到的名字也要算在场——他可能还没自我介绍，
+        # 所以花名册里没有，但记忆的 about 里有（"小雨最近怎么样"）。
+        for r in recalled:
+            about = str(r.memory.get("about") or "").strip()
+            if about and about in text:
+                present.add(about)
+        return [
+            r for r in recalled
+            if str(r.memory.get("about") or "").strip() in present
+        ]
+
     def _people_for_prompt(self) -> list[tuple[str, bool]]:
         """群聊花名册。搭档本人也算其中一员（他的名字存在 handler_name，不在名单里）。
 
         **搭档在群里显示的是 QQ 昵称，而她叫他的是另一个名字**——两个都要给她，
         并且说明是同一个人。真机数据里她正是因为这个写过
         "搭档与群友习惯微笑i相识满一天"（把同一个人当成了两个）。
+
+        备注名（你给群友起的名字）优先于平台昵称——昵称会变、会重名，备注不会。
         """
         people = self.known_people()
+        notes = self.store.all_notes()
         owner_id = self.handler_id
         owner_name = self.handler_name
         rows: list[tuple[str, bool]] = []
         for uid, name in people.items():
+            display = notes.get(uid) or name
             if uid == owner_id and owner_name:
-                if name and name != owner_name:
-                    rows.append((f"{owner_name}（群里叫「{name}」，是同一个人）", True))
+                if display and display != owner_name:
+                    rows.append((f"{owner_name}（群里叫「{display}」，是同一个人）", True))
                 else:
                     rows.append((owner_name, True))
             else:
-                rows.append((name, bool(owner_id) and uid == owner_id))
+                rows.append((display, bool(owner_id) and uid == owner_id))
         if owner_id and owner_name and all(not is_owner for _n, is_owner in rows):
             rows.append((owner_name, True))
         return rows
@@ -285,6 +324,7 @@ class Giftia:
         speaker_name: str = "",
         is_handler: bool | None = None,
         log_only: bool = False,
+        mid: str = "",
     ) -> str:
         """平台无关入口。
 
@@ -302,6 +342,7 @@ class Giftia:
         # 清掉上一条回复的记账：适配器回报送达情况时只能作用在**这一轮**的回复上
         self.last_reply_id = None
         self.last_reply_text = ""
+        self.current_mid = str(mid or "")   # 平台消息 id：撤回时要按它找
         self.last_scene = scene if scene in ("c2c", "group", "guest") else "c2c"
         text = (text or "").strip()
         if not text:
@@ -315,6 +356,10 @@ class Giftia:
         self.speaker_id = uid
         self.speaker_name = speaker_name or self.known_people().get(uid, "")
         self.group_id = group_id
+        # 平台每条消息都带昵称 —— 顺手记进花名册（适配器也做，这里兜底：
+        # 直接调 core 的路径没有适配器，不记的话她永远认不出人）
+        if speaker_name and uid:
+            self.remember_person(uid, speaker_name)
 
         # ★ 隐私的闸门：谁在说话，决定她此刻能想起谁的事。
         #   群里 → 只有"这个群里公开发生过的事"（别人的私聊记忆根本查不出来）
@@ -348,6 +393,7 @@ class Giftia:
                 self.speaker_name,
                 self.memory_scope[0],
                 self.memory_scope[1],
+                self.current_mid,
             )
             # 攒够了就把"听见的话"整理成这个群归属的记忆 ——
             # 不然"听得见"永远只是聊天记录，不会变成会随时间模糊的记忆。
@@ -436,6 +482,15 @@ class Giftia:
                         f"{len(merged)} 条"
                     )
 
+        # ★ 只在"在场的人"的记忆里留下 —— 群聊里不能把 A 的事说给 B 听
+        before_presence = len(recalled)
+        recalled = self._filter_by_presence(recalled, text)
+        if len(recalled) < before_presence:
+            self.notices.append(
+                f"[记忆分区] 滤掉 {before_presence - len(recalled)} 条"
+                "关于不在场的人的记忆（不在群里说别人的事）"
+            )
+
         # 今天是不是特别的日子 / 有没有还没讲过的梦
         self.last_occasions = find_occasions(
             self.settings,
@@ -521,6 +576,7 @@ class Giftia:
             self.speaker_name,
             self.memory_scope[0],
             self.memory_scope[1],
+            self.current_mid,
         )
         try:
             reply = self.llm.chat(messages)
@@ -874,6 +930,10 @@ class Giftia:
                         return {"merged": 0, "groups": 0, "kept": []}
                 except ValueError:
                     pass
+        # 合并是半破坏性的（模型判错 = 她真的忘掉一件事）——先拍照再动手
+        view = [("private", "")] if scope == "private" else [(scope, subject)]
+        before = len(self.store.active_memories(self.instance_no, view=view))
+        snapshot = self.store.snapshot_memories(tag=f"reconcile-{scope}")
         result = reconcile(
             self.store,
             self.llm,
@@ -882,6 +942,14 @@ class Giftia:
             scope=scope,
             subject_id=subject,
         )
+        # 闸门：合并**只会让条数变少**。真变多了说明出了岔子，回滚到整理前。
+        after = len(self.store.active_memories(self.instance_no, view=view))
+        if after > before:
+            self.store.restore_memories(snapshot)
+            self.notices.append(
+                f"[记忆整理] 合并结果异常（{before} → {after} 条），已回滚到整理前"
+            )
+            result = {"merged": 0, "groups": 0, "kept": [], "rolled_back": True}
         self.store.state_set(key, self.clock.iso(now))
         return result
 
@@ -1152,6 +1220,7 @@ def handle_message(
     speaker_name: str = "",
     is_handler: bool | None = None,
     log_only: bool = False,
+    mid: str = "",
 ) -> str:
     """一行代码接入任何平台：
 
@@ -1171,6 +1240,7 @@ def handle_message(
         speaker_name=speaker_name,
         is_handler=is_handler,
         log_only=log_only,
+        mid=mid,
     )
 
 def current() -> Giftia | None:

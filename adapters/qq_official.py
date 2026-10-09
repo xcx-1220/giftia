@@ -372,6 +372,18 @@ class QQBot:
             )
             return
         if event_type not in (EVENT_GROUP_AT, EVENT_GROUP_MESSAGE, EVENT_C2C):
+            # 撤回：被撤回的消息**再也不发给模型**（工作记忆、群聊记录、记忆整理都不带它）
+            # ⚠ 官方 v2 文档里我没有找到撤回事件的正式名字，所以这里按名字宽松匹配：
+            #   平台真推了就用得上，不推也无害（这条路径不会影响其它事件）。
+            if "RECALL" in event_type.upper():
+                mid = str(
+                    payload.get("message_id")
+                    or payload.get("msg_id")
+                    or payload.get("id")
+                    or ""
+                )
+                hit = brain_mod.get_default(self.settings).store.mark_recalled(mid)
+                print(f"[撤回] {mid[:16]}… 已标记 {hit} 条（不再进入她的记忆）")
             return
 
         msg_id = str(payload.get("id") or "")
@@ -419,7 +431,7 @@ class QQBot:
         if kind == "group" and not at_bot:
             handle_message(
                 content, user_id, settings=self.settings, scene="group",
-                group_id=target, speaker_name=speaker, log_only=True,
+                group_id=target, speaker_name=speaker, log_only=True, mid=msg_id,
             )
             return
 
@@ -453,7 +465,8 @@ class QQBot:
                 # 名字记下了，话也留个记录：她"听得见"，只是不搭话
                 handle_message(
                     content, user_id, settings=self.settings, scene="group",
-                    group_id=target, speaker_name=speaker, is_handler=False, log_only=True,
+                    group_id=target, speaker_name=speaker, is_handler=False,
+                    log_only=True, mid=msg_id,
                 )
                 print("[跳过] 群里其他人说话，按配置保持安静")
                 return
@@ -461,7 +474,7 @@ class QQBot:
             # 碰不到你和她之间的私聊记忆，也不会推进你们的关系
             guest_reply = handle_message(
                 content, user_id, settings=self.settings, scene="group",
-                group_id=target, speaker_name=speaker, is_handler=False,
+                group_id=target, speaker_name=speaker, is_handler=False, mid=msg_id,
             )
             print(f"[{self.settings.persona.name}·客人] {guest_reply}")
             gresult = self.send(kind, target, guest_reply, msg_id)
@@ -487,6 +500,7 @@ class QQBot:
             group_id=target if kind == "group" else "",
             speaker_name=speaker,
             is_handler=True,
+            mid=msg_id,
         )
         print(f"[{self.settings.persona.name}] {reply}")
         result = self.send(kind, target, reply, msg_id)
