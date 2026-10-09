@@ -801,21 +801,25 @@ def main() -> int:
           plan_.reason if plan_ else "None")
 
     used, left, _ = quota_state(on, out2.store, out2.clock.now())
-    check("额度是 4 条 / 30 天", on.outreach.max_per_30_days == 4 and used == 0 and left == 4)
+    quota = on.outreach.max_per_30_days
+    check(f"额度是 {quota} 条 / 30 天（跟配置走，不写死）",
+          used == 0 and left == quota, f"used={used} left={left}")
 
     _, text = out2.compose_outreach(record=True, force=True)
     check("她写出了一句想说的话", bool(text.strip()), text[:40])
     used2, left2, _ = quota_state(on, out2.store, out2.clock.now())
-    check("发出去会扣额度", used2 == 1 and left2 == 3, f"{used2}/{left2}")
+    check("发出去会扣额度", used2 == 1 and left2 == quota - 1, f"{used2}/{left2}")
     check("刚发过就发不了第二条（间隔限制）",
           not can_send(on, out2.store, out2.clock.now()))
 
-    for _ in range(4):
-        out2.clock.advance(24 * 8)
+    for _ in range(int(quota * 12) + 20):
+        out2.clock.advance(6)     # 每 6 小时试一次：跳跃太大会让旧的记录滑出 30 天窗口
         if can_send(on, out2.store, out2.clock.now()):
             record_sent(out2.store, out2.clock.now())
+        if quota_state(on, out2.store, out2.clock.now())[1] == 0:
+            break
     used3, left3, _ = quota_state(on, out2.store, out2.clock.now())
-    check("用满 4 条之后额度耗尽", left3 == 0, f"used={used3} left={left3}")
+    check(f"用满 {quota} 条之后额度耗尽", left3 == 0, f"used={used3} left={left3}")
     check("额度耗尽后不再主动", not can_send(on, out2.store, out2.clock.now()))
 
     # 快到终端服务时优先级最高（用独立目录，免得共用时钟）
@@ -1399,6 +1403,110 @@ def main() -> int:
           "不在你能看到" in denied, denied)
     check("那条记忆还在", any(int(m["id"]) == other
                               for m in tl.store.active_memories(tl.instance_no)))
+
+    # ══ 32. 让她主动一点：事后回访 / 日上限 / 主动分享自己 ═════
+    print("\n32. 让她主动一点（回访 / 日上限 / 分享自己 / 插嘴上限）")
+    from giftia import outreach as outreach_mod
+    from giftia.occasions import find_occasions as _find_occ
+
+    pro = Giftia(make_settings(tmp / "proactive", 81920.0), llm=MockLLM(settings.model))
+    pro.set_handler_id("OWNER")
+    pro.set_handler_name("椎名")
+    pro.handle("我叫椎名", user_id="OWNER")
+    clock_now = pro.clock.now()
+    yesterday = (clock_now.date() - _td(days=1)).isoformat()
+    tomorrow = (clock_now.date() + _td(days=1)).isoformat()
+    pro.store.add_memory(
+        instance_no=pro.instance_no, created_ts=pro.clock.iso(), happened_ts=pro.clock.iso(),
+        summary="椎名昨天考驾照", importance=0.8, layer="important", about="椎名",
+        event_date=yesterday,
+    )
+    owner_view = [("private", ""), ("person", "OWNER"), ("group", "*")]
+    occs = _find_occ(pro.settings, pro.store, now=clock_now, instance_no=pro.instance_no,
+                     days_known=3, mark=False, view=owner_view)
+    check("★ 昨天办的事会变成「事后回访」",
+          "follow_up" in {o.kind for o in occs}, str({o.kind for o in occs}))
+
+    planned = outreach_mod.plan(
+        pro.settings, pro.store, pro.clock, life=pro.status(), occasions=occs,
+        instance_no=pro.instance_no, force=True,
+    )
+    check("★ 有回访可问时，她就主动开口问那件事",
+          planned is not None and planned.reason == "follow_up",
+          planned.reason if planned else "None")
+
+    # 优先级：当天/明天的事（时间敏感）压过事后回访
+    pro.store.add_memory(
+        instance_no=pro.instance_no, created_ts=pro.clock.iso(), happened_ts=pro.clock.iso(),
+        summary="椎名明天要面试", importance=0.8, layer="important", about="椎名",
+        event_date=tomorrow,
+    )
+    both = _find_occ(pro.settings, pro.store, now=clock_now, instance_no=pro.instance_no,
+                     days_known=3, mark=False, view=owner_view)
+    check("两件都有时：『明天要办的事』优先（提醒比回访更等不起）",
+          "big_day" in {o.kind for o in both} and "follow_up" in {o.kind for o in both},
+          str(sorted({o.kind for o in both})))
+    mixed = outreach_mod.plan(
+        pro.settings, pro.store, pro.clock, life=pro.status(), occasions=both,
+        instance_no=pro.instance_no, force=True,
+    )
+    check("而且先开口说的是明天那件事",
+          mixed is not None and mixed.reason == "big_day",
+          mixed.reason if mixed else "None")
+
+    # 同一次回访只问一次
+    _find_occ(pro.settings, pro.store, now=clock_now, instance_no=pro.instance_no,
+              days_known=3, mark=True, view=owner_view)
+    again = _find_occ(pro.settings, pro.store, now=clock_now, instance_no=pro.instance_no,
+                      days_known=3, mark=False, view=owner_view)
+    check("问过一次就不再问（不会变成复读机）",
+          "follow_up" not in {o.kind for o in again},
+          str({o.kind for o in again}))
+
+    # 日上限
+    fresh = dataclasses.replace(pro.settings, outreach=dataclasses.replace(
+        pro.settings.outreach, max_per_day=2, max_per_30_days=99, min_gap_hours=0.0))
+    check("空账本时可以主动", outreach_mod.can_send(fresh, pro.store, clock_now))
+    for _ in range(2):
+        outreach_mod.record_sent(pro.store, clock_now)
+    check("★ 发满每天的上限就不再主动（防打扰的第一道闸）",
+          not outreach_mod.can_send(fresh, pro.store, clock_now),
+          f"今天已发 {outreach_mod.sent_today(pro.store, clock_now)} 条")
+    later = clock_now + _td(days=1)
+    check("第二天额度重置", outreach_mod.can_send(fresh, pro.store, later))
+
+    # 主动分享自己（心情）
+    from types import SimpleNamespace
+    quiet = Giftia(make_settings(tmp / "moodshare", 81920.0), llm=MockLLM(settings.model))
+    quiet.set_handler_id("OWNER")
+    quiet.handle("我叫椎名", user_id="OWNER")
+    happy = SimpleNamespace(key="happy", label="开心")
+    share = outreach_mod.plan(
+        quiet.settings, quiet.store, quiet.clock, life=quiet.status(),
+        occasions=[], mood=happy, instance_no=quiet.instance_no, force=True,
+    )
+    check("★ 她心情不一样时会主动分享自己",
+          share is not None and share.reason == "mood_share",
+          share.reason if share else "None")
+    quiet.last_outreach_plan = share      # 走 hub 时这一步是 outreach_plan 做的
+    quiet.note_outreach_sent("……今天有点不一样。")
+    repeat = outreach_mod.plan(
+        quiet.settings, quiet.store, quiet.clock, life=quiet.status(),
+        occasions=[], mood=happy, instance_no=quiet.instance_no, force=True,
+    )
+    check("同一天同一种心情不会反复「分享」",
+          repeat is None or repeat.reason != "mood_share",
+          repeat.reason if repeat else "None（正好）")
+    check("平静的时候不会为心情专门发一条",
+          outreach_mod.plan(
+              quiet.settings, quiet.store, quiet.clock, life=quiet.status(),
+              occasions=[], mood=SimpleNamespace(key="calm", label="平静"),
+              instance_no=quiet.instance_no, force=True) is None)
+    check("不安那种心情不往外说（那是终端服务迫近，只在 near_end 那条路）",
+          outreach_mod.plan(
+              quiet.settings, quiet.store, quiet.clock, life=quiet.status(),
+              occasions=[], mood=SimpleNamespace(key="uneasy", label="不安"),
+              instance_no=quiet.instance_no, force=True) is None)
 
     brain.store.close()
     brain2.store.close()

@@ -399,6 +399,20 @@ class QQBot:
         self._send_times.setdefault(key, []).append(time.time())
 
     # ══ 聚批：被触发后等她说完再一起处理 ══════════════════════
+    def _may_speak_up(self, group: str) -> bool:
+        """她自己插嘴的日上限（每个群单独算）。用掉一次就 +1。
+
+        在**决定要说**的时候就记账，而不是等发送成功——宁可少说一句，
+        也不要因为发送失败而变成"额度没扣、下条还说"。
+        """
+        hub = brain_mod.get_default(self.settings)
+        key = f"speak_up:{group}:{hub.clock.now().date().isoformat()}"
+        used = int(hub.store.state_get(key, 0) or 0)
+        if used >= max(0, int(self.settings.runtime.speak_max_per_day)):
+            return False
+        hub.store.state_set(key, used + 1)
+        return True
+
     def _enqueue_batch(
         self,
         target: str,
@@ -581,6 +595,16 @@ class QQBot:
                     group_id=target, speaker_name=speaker, log_only=True, mid=msg_id,
                 )
                 print(f"[旁听] {why} → 不出声")
+                return
+            # 不是被 @ 的（她自己想插一句）→ 受"每个群每天最多几次"限制。
+            # 3 档是按**每条消息**掷骰子的，热闹的群里一天能掷出几十次，
+            # 不封顶就是刷屏。
+            if not at_bot and not self._may_speak_up(target):
+                handle_message(
+                    content, user_id, settings=self.settings, scene="group",
+                    group_id=target, speaker_name=speaker, log_only=True, mid=msg_id,
+                )
+                print("[闭嘴] 今天自己插嘴的次数用完了，先听着")
                 return
             if self.settings.runtime.wake_delay_seconds <= 0:
                 # 不聚批：立刻处理（想让她"听到就回"就把 wake_delay_seconds 设成 0）

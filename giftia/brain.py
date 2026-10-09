@@ -112,6 +112,8 @@ class Giftia:
         self.current_mid = ""
         # 她这一轮自己调工具写下的记忆（用于提示与测试）
         self.tool_writes: list[str] = []
+        # 最近一次"她想主动说什么"的计划（心情分享要靠它去重）
+        self.last_outreach_plan = None
 
     # ── 称呼与「认得的人」────────────────────────────────
     # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
@@ -896,17 +898,20 @@ class Giftia:
             mark=False,
             view=view,
         )
-        return outreach_plan(
+        result = outreach_plan(
             self.settings,
             self.store,
             self.clock,
             life=self.status(),
             occasions=occasions,
             dream=latest_untold(self.settings, self.store, self.clock, self.instance_no),
+            mood=None if for_group else self.current_mood(now),
             instance_no=self.instance_no,
             force=force,
             for_group=for_group,
         )
+        self.last_outreach_plan = result
+        return result
 
     def compose_outreach(
         self, *, record: bool = False, force: bool = False, target: str = "owner"
@@ -1002,6 +1007,14 @@ class Giftia:
         if keep_in_history:
             self.store.add_message(
                 self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
+            )
+        # 心情分享一天只发一次：记下来，免得同一种心情一天里反复"分享"。
+        # 用**计划里记下的**心情 key，不重新取一次——中间心情可能已经变了。
+        plan_ = getattr(self, "last_outreach_plan", None)
+        if plan_ is not None and getattr(plan_, "reason", "") == "mood_share":
+            self.store.state_set(
+                f"mood_shared:{now.date().isoformat()}",
+                str(getattr(plan_, "mood_key", "") or ""),
             )
         record_sent(self.store, now)
 

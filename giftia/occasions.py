@@ -136,6 +136,38 @@ def find_occasions(
     if mark and found:
         store.state_set(bkey, json.dumps(sorted(told), ensure_ascii=False))
 
+    # ── 3) 事后回访：他昨天/前天办的那件事，办得怎么样 ──────
+    # 「今天要考驾照」只是提醒，「昨天考得怎么样」才像真的在惦记。
+    # 这是"她主动一点"里最动人的一块，而且数据早就有（记忆的 event_date）。
+    for mem in store.active_memories(instance_no, view=view):
+        when = _parse_event_date(mem.get("event_date") or "")
+        if when is None:
+            continue
+        back = (today - when).days
+        if back <= 0 or back > settings.occasions.follow_up_days:
+            continue
+        token = f"back:{mem['id']}:{when.isoformat()}"
+        if token in told:
+            continue
+        what = str(mem.get("summary", "")).strip()
+        when_word = "昨天" if back == 1 else f"{back} 天前"
+        found.append(
+            Occasion(
+                kind="follow_up",
+                title=f"{when_word}那件事：{what}",
+                hint=(
+                    f"他{when_word}办了这件事：{what}\n"
+                    "你可以问一句结果怎么样——但要像真的关心，不是来验收的。"
+                    "他要是没接话，就不要再追。"
+                ),
+                memory_id=int(mem["id"]),
+            )
+        )
+        if mark:
+            told.add(token)
+    if mark and found:
+        store.state_set(bkey, json.dumps(sorted(told), ensure_ascii=False))
+
     return found
 
 

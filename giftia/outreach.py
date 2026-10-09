@@ -29,10 +29,13 @@ LOG_KEY = "outreach:log"
 
 @dataclass
 class OutreachPlan:
-    reason: str          # near_end | big_day | milestone | dream | missing_you
+    reason: str          # near_end | big_day | follow_up | mood_share | milestone | dream | missing_you
     title: str
     hint: str            # 给模型的写作方向
     urgency: float = 0.0
+    # 心情分享用：**计划时**的心情 key。不能等到真发出去时再取一次——
+    # 中间这段时间心情可能已经变了，去重就对不上了。
+    mood_key: str = ""
 
     @property
     def reason_label(self) -> str:
@@ -75,8 +78,24 @@ def quota_state(settings: Settings, store: Store, now: datetime) -> tuple[int, i
     return used, left, next_ok
 
 
+def sent_today(store: Store, now: datetime) -> int:
+    """今天已经主动发了几条。"""
+    today = now.date()
+    count = 0
+    for raw in _log(store):
+        try:
+            if datetime.fromisoformat(raw).date() == today:
+                count += 1
+        except ValueError:
+            continue
+    return count
+
+
 def can_send(settings: Settings, store: Store, now: datetime) -> bool:
     if not settings.outreach.enabled:
+        return False
+    # 先看日上限：这是防打扰的第一道闸（30 天总额度是第二道）
+    if sent_today(store, now) >= max(1, settings.outreach.max_per_day):
         return False
     used, left, next_ok = quota_state(settings, store, now)
     if left <= 0:
@@ -90,7 +109,14 @@ def can_send(settings: Settings, store: Store, now: datetime) -> bool:
     return True
 
 
-def record_sent(store: Store, now: datetime, keep: int = 20) -> None:
+def record_sent(store: Store, now: datetime, keep: int = 400) -> None:
+    """记一条"主动发出去了"。
+
+    `keep` 必须**远大于 max_per_30_days**：账本被截断的话，
+    `quota_state` 就算不出真实的 30 天用量，额度会静默失效
+    （把额度从 4 提到 60 之后才发现的——日志只留 20 条，永远凑不满 60）。
+    一条记录才 20 字节，留 400 条也就 8KB。
+    """
     log = _log(store)
     log.append(now.isoformat(timespec="seconds"))
     store.state_set(LOG_KEY, json.dumps(log[-keep:], ensure_ascii=False))
@@ -105,6 +131,7 @@ def plan(
     life,
     occasions: list | None = None,
     dream=None,
+    mood=None,
     instance_no: int = 1,
     force: bool = False,
     for_group: bool = False,
@@ -141,7 +168,37 @@ def plan(
                 urgency=0.8,
             )
 
-    # 3) 纪念日 —— 只认"今天正好是"的那一个。
+    # 2) 昨天/前天那件事办得怎么样（"她记得的事到点主动问"）
+    for occ in occasions or []:
+        if occ.kind == "follow_up":
+            return OutreachPlan(
+                reason="follow_up",
+                title=occ.title,
+                hint=f"{occ.hint}\n你想开口问一句。问完就等他说，别连着问第二个问题。",
+                urgency=0.75,
+            )
+
+    # 3) 她自己的心情（"主动分享自己"）
+    #    不安那种心情不往外说——那是终端服务迫近，只在私聊、且走 near_end 那条路。
+    if mood is not None and getattr(mood, "key", "") not in ("", "calm", "uneasy"):
+        day_key = f"mood_shared:{now.date().isoformat()}"
+        if str(store.state_get(day_key, "") or "") != str(mood.key):
+            if not for_group:
+                return OutreachPlan(
+                    reason="mood_share",
+                    mood_key=str(mood.key),
+                    title=f"她今天心情{mood.label}",
+                    hint=(
+                        f"你今天的心情是「{mood.label}」。你没有具体的事要说，"
+                        "只是想让他知道你现在的样子。\n"
+                        "**这条消息只关于你自己**——不要提他之前说过的任何事、"
+                        "不要问他任何问题、也不要说「我今天心情不错」这种句式。\n"
+                        "写一句像自言自语的话，一到两句就停。"
+                    ),
+                    urgency=0.55,
+                )
+
+    # 4) 纪念日 —— 只认"今天正好是"的那一个。
     #    错过了几天再补一句"我们认识第 3 天了"很怪；补记留给当面说。
     for occ in occasions or []:
         if occ.kind != "milestone":

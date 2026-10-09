@@ -122,6 +122,10 @@ class OccasionsConfig:
     enabled: bool = True
     milestones: list = field(default_factory=lambda: list(DEFAULT_MILESTONES))
     big_day_lookahead_days: int = 1   # 今天 + 明天的大日子都会提醒
+    # 事情办完之后的几天内，她还可以主动问一句结果（"昨天考得怎么样"）。
+    # 这是"她主动一点"里最像"真的在惦记你"的一块：只是提醒还不算什么，
+    # 记得回头问才算。0 = 不问。
+    follow_up_days: int = 2
 
 
 @dataclass(frozen=True)
@@ -139,7 +143,10 @@ class OutreachConfig:
     # 默认关闭：真要让她主动找你，得先配好平台凭据再打开
     enabled: bool = False
     idle_days: float = 3.0            # 多久没说话就算"想你了"
-    max_per_30_days: int = 4          # 对齐官方互动召回的额度
+    max_per_30_days: int = 4          # 30 天的总上限
+    # **每天最多主动几次** —— 防打扰的真正闸门。调大之前先想清楚：
+    # 她主动的每一条都是一次 API 调用，而且主动消息比回复更容易让人烦。
+    max_per_day: int = 3
     min_gap_hours: float = 6.0
     # True = 用官方的「互动召回消息」（is_wakeup），额度更紧但更合规；
     # False = 普通主动消息（有频控，没有 30 天 4 条的硬限制）
@@ -231,6 +238,10 @@ class RuntimeConfig:
     # 群聊响应档位 0~100（见 giftia/trigger.py）：0~19 只应 @、20~44 加关键词、
     # 45~69 再加"按概率插嘴"、70+ 任何消息都可能接。没命中的当场标已读，零 token。
     response_tier: int = 0
+    # **每个群每天最多自己插几次嘴**（不含被 @ 的）。
+    # 这一条是必须的：3 档是按"每条消息"掷骰子的，热闹的群里一天能掷出几十次，
+    # 不封顶会变成刷屏。
+    speak_max_per_day: int = 3
     # 2/3 档下能叫醒她的词
     keywords: list = field(default_factory=list)
     # 被触发后等她说完再回：这段时间里群里追加的话算同一批，一起处理。

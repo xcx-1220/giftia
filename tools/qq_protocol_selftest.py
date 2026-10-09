@@ -684,6 +684,24 @@ def main() -> int:
 
     brain_mod.reset_default()
 
+    print("\n11. 自己插嘴的日上限")
+    spk = dataclasses.replace(
+        load_settings(force_mock=True),
+        root=Path(tempfile.mkdtemp(prefix="giftia-speak-")),
+        runtime=dataclasses.replace(
+            load_settings(force_mock=True).runtime, response_tier=100, speak_max_per_day=3
+        ),
+    )
+    spbot = adapter.QQBot("X", "Y", owner_openid="ME", settings=spk)
+    allowed = [spbot._may_speak_up("G-S") for _ in range(5)]
+    check("★ 自己插嘴有每日上限（3 档是按每条消息掷骰子的，不封顶就是刷屏）",
+          allowed == [True, True, True, False, False], str(allowed))
+    check("换个群是另一本账", spbot._may_speak_up("G-T") is True)
+    check("被 @ 的不占这个额度（那是回应，不是插嘴）",
+          spbot._may_speak_up("G-S") is False)
+
+    brain_mod.reset_default()
+
     print("\n" + "═" * 52)
     print(f"通过 {PASS} 项，失败 {FAIL} 项")
     print("═" * 52)
