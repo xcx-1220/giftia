@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS memories (
     -- 决定她能不能分清"这是谁的事"——真机数据里她曾把 A 的课记成 B 的。
     about            TEXT    NOT NULL DEFAULT '',
     -- 被合并进哪一条（>0 = 这条是重复的，已经并进那条了，不再参与检索）
-    merged_into      INTEGER NOT NULL DEFAULT 0
+    merged_into      INTEGER NOT NULL DEFAULT 0,
+    -- 被明确要求忘掉的（1 = 不再参与检索，但数据还在、可回溯）
+    forgotten        INTEGER NOT NULL DEFAULT 0
 );
 
 -- 她做过的梦。梦不是记忆：不进检索、不参与退化，只在第二天讲给你听。
@@ -114,6 +116,7 @@ class Store:
             "speaker_id": "TEXT NOT NULL DEFAULT ''",
             "about": "TEXT NOT NULL DEFAULT ''",
             "merged_into": "INTEGER NOT NULL DEFAULT 0",
+            "forgotten": "INTEGER NOT NULL DEFAULT 0",
         },
         "messages": {
             "speaker_id": "TEXT NOT NULL DEFAULT ''",
@@ -629,11 +632,38 @@ class Store:
         """
         extra, args = self._view_clause(view)
         return self._rows(
-            "SELECT * FROM memories WHERE instance_no = ? AND sealed = 0 AND merged_into = 0"
+            "SELECT * FROM memories WHERE instance_no = ? AND sealed = 0 "
+            "AND merged_into = 0 AND forgotten = 0"
             + extra
             + " ORDER BY id ASC",
             (instance_no, *args),
         )
+
+    def memories_by_person(
+        self, instance_no: int, view: list[tuple[str, str]] | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """按"关于谁"分组 —— **每人一份档案**（她对这个人的长期印象）。
+
+        不用另立一张表：记忆本来就有 `about` 字段，分组就是档案。
+        这样"她记得你什么"和"她记得你的事"是同一份数据，不会两处打架。
+        """
+        out: dict[str, list[dict[str, Any]]] = {}
+        for mem in self.active_memories(instance_no, view=view):
+            about = str(mem.get("about") or "").strip()
+            if about:
+                out.setdefault(about, []).append(mem)
+        return out
+
+    def forget_memory(self, memory_id: int) -> bool:
+        """让她忘掉一条（你发现她记错了，可以直接抹掉）。
+
+        不是删除：打上 forgotten 标记就不再参与检索，但数据还在、可回溯。
+        """
+        cur = self.conn.execute(
+            "UPDATE memories SET forgotten = 1 WHERE id = ?", (memory_id,)
+        )
+        self.conn.commit()
+        return bool(cur.rowcount)
 
     def mark_merged(self, ids: list[int], into: int) -> None:
         """把这些重复条目并进 into（不删数据，只是不再参与检索——可回溯）。"""

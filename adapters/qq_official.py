@@ -748,6 +748,41 @@ class QQBot:
             self.send(kind, target, f"……好。{new_name}。我记住了。", msg_id)
             return True
 
+        if cmd in ("/profile", "/impress", "/forget", "/reconcile"):
+            if owner and user_id != owner:
+                self.send(kind, target, DEFLECT, msg_id)
+                return True
+            if cmd == "/profile":
+                who = parts[1].strip() if len(parts) > 1 else ""
+                text = hub.profile_text(who)
+            elif cmd == "/impress":
+                bits = " ".join(parts[1:]).strip().split(maxsplit=1)
+                if len(bits) < 2:
+                    text = "……用法是「/impress 名字 你要我记住的话」。"
+                else:
+                    mid = hub.add_impression(bits[0], bits[1])
+                    text = (
+                        f"……嗯，我记下了：{bits[0]}——{bits[1]}" if mid
+                        else "……名字和内容都得有，我才记得住。"
+                    )
+            elif cmd == "/forget":
+                if not (len(parts) > 1 and parts[1].strip().isdigit()):
+                    text = "……用法是「/forget 编号」，编号在 /profile 里能看到。"
+                elif hub.forget_memory(int(parts[1].strip())):
+                    text = f"……好，#{parts[1].strip()} 那件事，我不再想了。"
+                else:
+                    text = f"……我这儿没有 #{parts[1].strip()} 这条。"
+            else:
+                # 整理可能要几十秒：**先把话说出去**，再去干活，别让她"卡住不回"
+                self.send(kind, target, "……好，我去把这阵子的记忆理一理。", msg_id)
+                res = hub.reconcile_memories(force=True)
+                text = (
+                    f"理完了。有 {res['merged']} 条是同一件事，我并在一起了。"
+                    if res.get("merged") else "理完了——没有重复的，我记性还行。"
+                )
+            self.send(kind, target, text, msg_id)
+            return True
+
         if cmd == "/status":
             if owner and user_id != owner:
                 self.send(kind, target, DEFLECT, msg_id)

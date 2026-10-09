@@ -281,6 +281,116 @@ class Giftia:
             if str(r.memory.get("about") or "").strip() in present
         ]
 
+    def impressions_block(
+        self, text: str = "", *, per_person: int = 3, max_people: int = 15, line_chars: int = 44
+    ) -> str:
+        """【你对他们的印象】——每人一份档案的紧凑版，随提示词注入。
+
+        和"检索式的记忆"不同：这一块**不靠 query 命中**，而是"在场的人"各带几条。
+        这样她不会因为这次没问到就把人忘干净，也天然封顶（每人 3 条、最多 15 人），
+        不会把上下文吃光。
+
+        借鉴 QQ-agent 的注入策略：只带本轮真的出现过的人。
+        """
+        view = self.memory_view
+        by_person = self.store.memories_by_person(self.instance_no, view=view)
+        if not by_person:
+            return ""
+        present: list[tuple[str, list[dict]]] = []
+        # 在场的人优先（说话的这位、搭档、这条消息里点到的人）
+        for name, mems in by_person.items():
+            if name in self._present_names(text) or name in (
+                self.speaker_name, self.handler_name, "搭档", "群里",
+            ):
+                present.append((name, mems))
+        for name, mems in by_person.items():
+            if not any(name == n for n, _ in present):
+                present.append((name, mems))
+        lines: list[str] = []
+        for name, mems in present[:max_people]:
+            picked = sorted(
+                mems, key=lambda m: -float(m.get("importance") or 0.5)
+            )[:per_person]
+            notes = []
+            for m in picked:
+                text = " ".join(str(m.get("summary", "")).split())
+                notes.append(text[:line_chars] + ("…" if len(text) > line_chars else ""))
+            lines.append(f"- {name}：" + "；".join(notes))
+        if not lines:
+            return ""
+        # 还没形成印象的人：明说"你还不了解他"，免得她硬编
+        known = {name for name, _ in present[:max_people]}
+        unknown = [
+            n for n in (self.speaker_name, self.handler_name)
+            if n and n not in known and n not in by_person
+        ]
+        tail = ""
+        if unknown:
+            tail = (
+                "\n（" + "、".join(dict.fromkeys(unknown))
+                + " 你还没有印象——你还不了解他，别装作很熟。）"
+            )
+        return (
+            "你在心里给每个人留了一份印象（这不是台词，是你的底子）：\n"
+            + "\n".join(lines)
+            + "\n（提到谁的时候照着这份印象说话；没有印象的人，说明你还不了解他。）"
+            + tail
+        )
+
+    def profile_text(self, name: str = "") -> str:
+        """给 `/profile` 用：她对某个人（或所有人）的印象全貌。
+
+        用**搭档视角**（私聊 + 你自己 + 所有群）——这是你看她的记忆，
+        不是在群里当众念。
+        """
+        owner_view = [
+            ("private", ""),
+            ("person", self.handler_id or "handler"),
+            ("group", "*"),
+        ]
+        by_person = self.store.memories_by_person(self.instance_no, view=owner_view)
+        if not by_person:
+            return "她还没对谁形成印象（多聊几次就有了）。"
+        if name:
+            hit = next((k for k in by_person if name in k), "")
+            if not hit:
+                return f"她没有关于「{name}」的印象。认得的人：{'、'.join(by_person)}"
+            by_person = {hit: by_person[hit]}
+        lines: list[str] = []
+        for person, mems in by_person.items():
+            lines.append(f"── {person}（{len(mems)} 条）──")
+            for m in sorted(mems, key=lambda x: -float(x.get("importance") or 0.5)):
+                layer = {"core": "内核", "important": "重要"}.get(str(m.get("layer")), "日常")
+                lines.append(f"  #{m['id']}　[{layer}]　{m['summary']}")
+            lines.append("")
+        lines.append("（记错了可以让她忘掉：/forget <编号>；想补一条：/impress <名字> <内容>）")
+        return "\n".join(lines).strip()
+
+    def add_impression(self, name: str, content: str) -> int:
+        """手动给她补一条关于某人的印象。"""
+        name = (name or "").strip()[:16]
+        content = (content or "").strip()
+        if not name or not content:
+            return 0
+        scope, subject = self.memory_scope
+        return self.store.add_memory(
+            instance_no=self.instance_no,
+            created_ts=self.clock.iso(),
+            happened_ts=self.clock.iso(),
+            summary=content[:200],
+            tags="手动,印象",
+            emotion="平静",
+            importance=0.8,
+            layer="important",
+            scope=scope if scope != "private" else "private",
+            subject_id=subject,
+            about=name,
+            source_session="manual",
+        )
+
+    def forget_memory(self, memory_id: int) -> bool:
+        return self.store.forget_memory(int(memory_id))
+
     def _people_for_prompt(self) -> list[tuple[str, bool]]:
         """群聊花名册。搭档本人也算其中一员（他的名字存在 handler_name，不在名单里）。
 
@@ -549,6 +659,7 @@ class Giftia:
             speaker_name=self.speaker_name,
             is_handler=self.is_handler,
             group_chat=self._render_group_chat() if self.group_id else "",
+            impressions=self.impressions_block(text),
         )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))

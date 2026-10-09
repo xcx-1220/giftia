@@ -15,6 +15,10 @@ HELP = """\
   /status            寿命、关系、心情、记忆、时钟的完整状态
   /name [称呼]        改口：以后她这么叫你（第一次见面她也会问你）
   /people            看她认得群里哪些人
+  /profile [名字]     她对每个人的印象（每人一份档案），可看单个人
+  /impress <名字> <话> 手动给她补一条关于某人的印象
+  /forget <编号>      让她忘掉某条记错的（数据还在，只是不再想起来）
+  /reconcile         手动整理记忆：合并"换个说法记了两遍"的（合并前自动拍快照）
   /bond              关系阶段、亲密度进度、还差什么才能升级
   /mood [名字]        看她此刻的心情；带名字则手动指定（调试用）
   /days              你们认识多久了、下一个纪念日、她记得的「大日子」
@@ -143,6 +147,37 @@ def _handle_command(brain: Giftia, text: str) -> bool:
 
     elif cmd == "/people":
         print(brain.people_text())
+
+    elif cmd == "/profile":
+        print(brain.profile_text(arg.strip()))
+
+    elif cmd == "/impress":
+        bits = arg.strip().split(maxsplit=1)
+        if len(bits) < 2:
+            print("用法：/impress <名字> <她该记住的一句话>")
+        else:
+            mid = brain.add_impression(bits[0], bits[1])
+            print(f"记下了（记忆 #{mid}）：{bits[0]} —— {bits[1]}" if mid else "没记上：名字和内容都要有")
+
+    elif cmd == "/forget":
+        if not arg.strip().isdigit():
+            print("用法：/forget <记忆编号>（编号见 /profile 或 /memories）")
+        elif brain.forget_memory(int(arg.strip())):
+            print(f"让她忘掉 #{arg.strip()} 了（数据还在，只是不再想起来）")
+        else:
+            print(f"没有 #{arg.strip()} 这条记忆")
+
+    elif cmd == "/reconcile":
+        print("整理记忆…")
+        res = brain.reconcile_memories(force=True)
+        if res.get("merged"):
+            print(f"合并了 {res['merged']} 条重复的（合并前拍了快照，可回滚）")
+            for item in res.get("detail", [])[:5]:
+                print(f"  保留：{item['keep']}")
+                for drop in item["drop"]:
+                    print(f"    合并 ← {drop}")
+        else:
+            print("没有发现重复")
 
     elif cmd == "/days":
         print(brain.days_text())

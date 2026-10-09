@@ -1235,6 +1235,52 @@ def main() -> int:
     check("★ 撤回后再也不进工作记忆", pr.store.recent_messages("s") == [])
     check("也不进记忆整理", pr.store.open_messages(pr.instance_no, 0, "s") == [])
 
+    # ══ 30. 第 3 批：每人一份档案 + 注入上限 + 手动管理 ═════════
+    print("\n30. 每人一份档案（印象 / 封顶 / 手动增删）")
+    im = Giftia(make_settings(tmp / "impress", 81920.0), llm=MockLLM(settings.model))
+    im.set_handler_id("OWNER")
+    im.handle("我叫小林", user_id="OWNER")
+    for summary, about, importance in (
+        ("阿伟爱打球，周末常约人", "阿伟", 0.7),
+        ("阿伟不太会用电脑，问过好几次", "阿伟", 0.4),
+        ("阿伟说过他不吃辣", "阿伟", 0.5),
+        ("阿伟最近换了工作", "阿伟", 0.6),
+        ("小雨在准备考研，压力大", "小雨", 0.8),
+    ):
+        im.store.add_memory(
+            instance_no=im.instance_no, created_ts=im.clock.iso(),
+            happened_ts=im.clock.iso(), summary=summary, importance=importance,
+            layer="important", about=about, scope="group", subject_id="G-1",
+        )
+    im.handle("你好", user_id="F1", scene="group", group_id="G-1", speaker_name="阿伟")
+    imp = im.impressions_block("你好", per_person=3, max_people=15)
+    check("印象块按人分组", "阿伟：" in imp and "小雨：" in imp, imp[:120].replace("\n", " / "))
+    awei_line = next((ln for ln in imp.splitlines() if ln.startswith("- 阿伟：")), "")
+    check("★ 每人封顶（阿伟 4 条只带 3 条）",
+          awei_line.count("；") == 2, awei_line)
+    by_person = im.store.memories_by_person(im.instance_no, view=[("group", "G-1")])
+    check("档案按人分组，条数对得上",
+          len(by_person.get("阿伟", [])) == 4 and len(by_person.get("小雨", [])) == 1,
+          str({k: len(v) for k, v in by_person.items()}))
+    check("搭档视角能看到全部档案", "阿伟（4 条）" in im.profile_text(), "")
+    check("能按名字看单个人的档案", "考研" in im.profile_text("小雨"))
+    check("不认识的名字会老实说没有", "没有关于" in im.profile_text("张三"))
+
+    mid = im.add_impression("小雨", "她不太喜欢别人催她")
+    check("能手动补一条印象", mid > 0 and "别人催" in im.profile_text("小雨"),
+          f"mid={mid}")
+    check("忘了之后的条数归零", im.forget_memory(mid)
+          and not any("别人催" in str(m["summary"])
+                      for m in im.store.active_memories(im.instance_no,
+                                                        view=[("group", "G-1")])))
+    check("忘掉的数据还在库里（可回溯）",
+          any("别人催" in str(m["summary"]) for m in im.store.all_memories(im.instance_no)),
+          str(len(im.store.all_memories(im.instance_no))))
+
+    imp2 = im.impressions_block("你好", per_person=3, max_people=1)
+    check("全局也封顶（最多带几个人）",
+          imp2.count("\n- ") <= 1, f"带了 {imp2.count(chr(10) + '- ')} 个人")
+
     brain.store.close()
     brain2.store.close()
 

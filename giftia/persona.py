@@ -78,6 +78,7 @@ def build_system_prompt(
     speaker_name: str = "",
     is_handler: bool = True,
     group_chat: str = "",
+    impressions: str = "",
 ) -> str:
     """一次请求的 system 消息：人格 → 称呼 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
 
@@ -150,6 +151,9 @@ def build_system_prompt(
                 "你跟他说话时是客气、有分寸的：可以聊，但别把搭档的私事说出来，"
                 "也别对他用你对搭档的那种亲近。他要是还没说过名字，你可以问一次。"
             )
+
+    if impressions.strip():
+        blocks.append("【你对他们的印象】\n" + impressions.strip())
 
     if group_chat:
         blocks.append(
