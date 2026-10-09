@@ -32,6 +32,26 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 import adapters.qq_official as adapter  # noqa: E402
+
+
+def recording_send(calls: list, *, fail: bool = False, partial: str = ""):
+    """假的发送实现：记录调用，并按要求返回 SendResult。
+
+    新接口要求 send() 回报"哪几段真的送达了"——测试桩也得跟上，
+    否则调用方拿不到结果。（这个接口本身就是为了修
+    "发送失败被吞掉、她却以为自己说过"这个 bug。）
+    """
+
+    def _send(kind, target, text, msg_id):
+        calls.append((kind, target, text))
+        if fail:
+            return adapter.SendResult(sent=[], failed=[(text, "测试：整条发送失败")])
+        if partial:
+            return adapter.SendResult(sent=[partial], failed=[(text, "测试：后半段失败")])
+        return adapter.SendResult(sent=[text])
+
+    return _send
+
 from giftia import brain as brain_mod  # noqa: E402
 from giftia.config import load_settings  # noqa: E402
 from giftia.store import Store  # noqa: E402
@@ -160,6 +180,11 @@ class FakeGateway(threading.Thread):
                         conn, OP_TEXT,
                         json.dumps({"op": QQ_OP_HEARTBEAT_ACK}).encode(),
                     )
+        except ConnectionError:
+            # 客户端断开是**正常收尾**，不是网关出错。
+            # （以前这里一概记成 error，Windows 上偶发 ConnectionAborted
+            #   会让"假网关没有报错"这条随机失败——测试偶尔假报错就不可信了。）
+            pass
         except Exception as exc:
             if not self.error:
                 self.error = f"{type(exc).__name__}: {exc}"
@@ -322,7 +347,7 @@ def main() -> int:
     brain_mod.reset_default()
     quiet = adapter.QQBot("X", "Y", owner_openid="", settings=quiet_settings)
     quiet_calls: list[tuple[str, str, str]] = []
-    quiet.send = lambda kind, target, text, msg_id: quiet_calls.append((kind, target, text))  # type: ignore[method-assign]
+    quiet.send = recording_send(quiet_calls)  # type: ignore[method-assign]
     quiet.handle_event(adapter.EVENT_C2C, {
         "id": "Q-1", "author": {"user_openid": "ME"}, "content": "你好",
     })  # 私聊自动认主
@@ -344,7 +369,7 @@ def main() -> int:
     )
     loud = adapter.QQBot("X", "Y", owner_openid="", settings=loud_settings)
     loud_calls: list[tuple[str, str, str]] = []
-    loud.send = lambda kind, target, text, msg_id: loud_calls.append((kind, target, text))  # type: ignore[method-assign]
+    loud.send = recording_send(loud_calls)  # type: ignore[method-assign]
     loud.handle_event(adapter.EVENT_C2C, {
         "id": "L-1", "author": {"user_openid": "ME"}, "content": "我叫小林",
     })
@@ -382,7 +407,7 @@ def main() -> int:
     )
     auto = adapter.QQBot("X", "Y", owner_openid="", settings=auto_settings)
     auto_calls: list[tuple[str, str, str]] = []
-    auto.send = lambda kind, target, text, msg_id: auto_calls.append((kind, target, text))  # type: ignore[method-assign]
+    auto.send = recording_send(auto_calls)  # type: ignore[method-assign]
 
     auto.handle_event(adapter.EVENT_C2C, {
         "id": "AUTO-1", "author": {"user_openid": "ME"}, "content": "你好",
@@ -405,7 +430,7 @@ def main() -> int:
     )
     grp_auto = adapter.QQBot("X", "Y", owner_openid="", settings=group_settings)
     grp_calls: list[tuple[str, str, str]] = []
-    grp_auto.send = lambda kind, target, text, msg_id: grp_calls.append((kind, target, text))  # type: ignore[method-assign]
+    grp_auto.send = recording_send(grp_calls)  # type: ignore[method-assign]
     grp_auto.handle_event(adapter.EVENT_GROUP_AT, {
         "id": "AUTO-3", "author": {"user_openid": "SOMEONE", "member_role": "member"},
         "group_openid": "G", "content": "<@!1> 你好",
@@ -431,7 +456,7 @@ def main() -> int:
     )
     strict = adapter.QQBot("X", "Y", owner_openid="", settings=strict_settings)
     strict_calls: list[tuple[str, str, str]] = []
-    strict.send = lambda kind, target, text, msg_id: strict_calls.append((kind, target, text))  # type: ignore[method-assign]
+    strict.send = recording_send(strict_calls)  # type: ignore[method-assign]
     strict.handle_event(adapter.EVENT_C2C, {
         "id": "AUTO-5", "author": {"user_openid": "ME"}, "content": "你好",
     })
@@ -450,7 +475,7 @@ def main() -> int:
     )
     full = adapter.QQBot("X", "Y", owner_openid="", settings=full_settings)
     full_calls: list[tuple[str, str, str]] = []
-    full.send = lambda kind, target, text, msg_id: full_calls.append((kind, target, text))  # type: ignore[method-assign]
+    full.send = recording_send(full_calls)  # type: ignore[method-assign]
     full.handle_event(adapter.EVENT_C2C, {
         "id": "F-1", "author": {"user_openid": "ME", "username": "小林"}, "content": "你好",
     })
@@ -522,6 +547,55 @@ def main() -> int:
     })
     check("引用消息时，引用内容也一起读得到（message_type=103）",
           "被引用的原话" in quoted and "他说的这句" in quoted, quoted)
+
+    brain_mod.reset_default()
+
+    print("\n8. 发送失败：她不该以为自己说过")
+    fail_settings = dataclasses.replace(
+        load_settings(force_mock=True), root=Path(tempfile.mkdtemp(prefix="giftia-fail-"))
+    )
+    fbot = adapter.QQBot("X", "Y", owner_openid="", settings=fail_settings)
+    fcalls: list[tuple[str, str, str]] = []
+    fbot.send = recording_send(fcalls)
+    fbot.handle_event(adapter.EVENT_C2C, {
+        "id": "S-1", "author": {"user_openid": "ME", "username": "小林"}, "content": "你好",
+    })
+    fhub = brain_mod.get_default(fail_settings)
+
+    def assistant_count() -> int:
+        return len([
+            m for m in fhub.store.all_messages(fhub.instance_no, limit=80)
+            if m["role"] == "assistant"
+        ])
+
+    check("发送成功时，她的回复正常留档", assistant_count() == 1, f"{assistant_count()} 条")
+
+    fbot.send = recording_send(fcalls, fail=True)
+    fbot.handle_event(adapter.EVENT_C2C, {
+        "id": "S-2", "author": {"user_openid": "ME", "username": "小林"}, "content": "在吗",
+    })
+    check("★ 整条没送出去 → 那条回复不留在她的记忆里（她不会以为自己说过）",
+          assistant_count() == 1, f"{assistant_count()} 条")
+    diary = fhub.store.list_diary(limit=6)
+    check("但会记进她的日志（发不出去也算发生过）",
+          any("没能送出去" in str(r["content"]) for r in diary),
+          str([str(r["title"]) for r in diary][:4]))
+
+    fbot.send = recording_send(fcalls, partial="前半句")
+    fbot.handle_event(adapter.EVENT_C2C, {
+        "id": "S-3", "author": {"user_openid": "ME", "username": "小林"}, "content": "在忙吗",
+    })
+    last_assistant = [
+        m for m in fhub.store.all_messages(fhub.instance_no, limit=80)
+        if m["role"] == "assistant"
+    ][-1]
+    check("★ 只送出去一部分 → 她只记实际送达的那部分（和用户看到的一致）",
+          str(last_assistant["content"]) == "前半句", str(last_assistant["content"])[:24])
+    check("并且明确提示了这次不完整",
+          any("[发送]" in n for n in fhub.notices), str(fhub.notices[-1:]))
+    check("用户说的话不受影响，仍然完整留档",
+          any(str(m["content"]) == "在忙吗"
+              for m in fhub.store.all_messages(fhub.instance_no, limit=80)))
 
     brain_mod.reset_default()
 

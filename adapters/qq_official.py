@@ -38,6 +38,7 @@ import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -101,6 +102,37 @@ class QQError(RuntimeError):
 
 class QQReconnect(QQError):
     """需要重建连接（可带 resume）。"""
+
+
+@dataclass
+class SendResult:
+    """一次发送的结果。
+
+    为什么要这个东西：一条回复可能被切成几段发出去，**哪几段真的送达了**
+    以前是算不出来的（`send()` 把异常吞掉只打一行日志）。后果很隐蔽：
+    她的回复在发送之前就已经写进数据库了，所以发送失败时
+    **她的记忆里记着"我说过这句话"，而你从来没看到过**——
+    下一轮她可能引用"我刚才说的……"，而你一脸茫然。
+
+    现在把结果交回给编排层：没送出去的话，就从她的记忆里撤回。
+    """
+
+    sent: list[str] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.failed
+
+    @property
+    def delivered(self) -> str:
+        """用户实际看到的内容（可能比原文短，也可能为空）。"""
+        return "".join(self.sent)
+
+    @property
+    def progress(self) -> str:
+        total = len(self.sent) + len(self.failed)
+        return f"{len(self.sent)}/{total}"
 
 
 def chunk_text(text: str, limit: int = MAX_CHARS) -> list[str]:
@@ -266,12 +298,18 @@ class QQBot:
             self._seqs.pop(next(iter(self._seqs)))
         return seq
 
-    def send(self, kind: str, openid: str, text: str, msg_id: str | None) -> None:
+    def send(self, kind: str, openid: str, text: str, msg_id: str | None) -> SendResult:
+        """把一段话发出去。返回"哪几段真的送达了"——发送失败不抛异常，但必须如实上报。
+
+        以前这里把 QQError 吞掉只打一行日志，调用方以为发送成功了：
+        分段里某一段失败 → 用户看到半截；整条失败 → 她的记忆里却记着说过。
+        """
         path = (
             f"/v2/groups/{openid}/messages"
             if kind == "group"
             else f"/v2/users/{openid}/messages"
         )
+        result = SendResult()
         for piece in chunk_text(text):
             body: dict = {"msg_type": MSG_TYPE_TEXT, "content": piece}
             if msg_id:
@@ -279,11 +317,21 @@ class QQBot:
                 body["msg_seq"] = self._next_seq(msg_id)
             if self.dry_run:
                 print(f"[dry-run] {kind} → {openid}\n   {piece}")
+                result.sent.append(piece)
                 continue
             try:
                 self._request("POST", path, body)
+                result.sent.append(piece)
             except QQError as exc:
-                print(f"[发送失败] {exc}", file=sys.stderr)
+                result.failed.append((piece, str(exc)))
+                print(f"[发送失败] {kind} → {openid}：{exc}", file=sys.stderr)
+        if result.failed:
+            print(
+                f"[发送失败] 这条回复只送出去 {result.progress} 段"
+                f"（共 {len(text)} 字）",
+                file=sys.stderr,
+            )
+        return result
 
     # ══ 事件 ═════════════════════════════════════════════════
     # 同一条消息可能被推两次：
@@ -416,7 +464,10 @@ class QQBot:
                 group_id=target, speaker_name=speaker, is_handler=False,
             )
             print(f"[{self.settings.persona.name}·客人] {guest_reply}")
-            self.send(kind, target, guest_reply, msg_id)
+            gresult = self.send(kind, target, guest_reply, msg_id)
+            hub_g = brain_mod.current()
+            if hub_g is not None:
+                hub_g.note_reply_delivery(gresult.delivered)
             return
 
         if not is_handler:
@@ -438,11 +489,15 @@ class QQBot:
             is_handler=True,
         )
         print(f"[{self.settings.persona.name}] {reply}")
-        self.send(kind, target, reply, msg_id)
+        result = self.send(kind, target, reply, msg_id)
+
+        # 告诉她"这句话到底送出去没有"——没送出去的话要从记忆里撤回
+        hub = brain_mod.current()
+        if hub is not None:
+            hub.note_reply_delivery(result.delivered)
 
         # 她的"系统通知"（例如终端服务预告）另发一条，不混进她的台词。
         # 同一个 msg_id 的再次回复会自动用 msg_seq=2，避免被平台按重复消息拒掉。
-        hub = brain_mod.current()
         if hub is not None:
             for note in hub.notices:
                 if note.startswith(("[终端服务]", "[记忆整理]", "[记忆强化]")):

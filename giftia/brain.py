@@ -98,6 +98,9 @@ class Giftia:
         self.speaker_name = ""
         self.group_id = ""
         self.is_handler = True
+        # 上一条回复写进了哪一行 —— 适配器回报"到底送出去没有"时要改它
+        self.last_reply_id: int | None = None
+        self.last_reply_text = ""
 
     # ── 称呼与「认得的人」────────────────────────────────
     # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
@@ -296,6 +299,9 @@ class Giftia:
         log_only：只把这句话记进聊天记录、不回复（群里全量模式下的"旁听"）。
         """
         self.notices = []
+        # 清掉上一条回复的记账：适配器回报送达情况时只能作用在**这一轮**的回复上
+        self.last_reply_id = None
+        self.last_reply_text = ""
         self.last_scene = scene if scene in ("c2c", "group", "guest") else "c2c"
         text = (text or "").strip()
         if not text:
@@ -521,7 +527,7 @@ class Giftia:
         except LLMError as exc:
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
             self.notices.append(f"[模型请求失败] {exc}")
-        self.store.add_message(
+        self.last_reply_id = self.store.add_message(
             self.session_id,
             self.instance_no,
             "assistant",
@@ -532,6 +538,7 @@ class Giftia:
             self.memory_scope[0],
             self.memory_scope[1],
         )
+        self.last_reply_text = reply
 
         # 召回强化：她真的把哪几条说出口了，哪几条就记得更久
         self.last_cited = mark_cited(
@@ -668,6 +675,43 @@ class Giftia:
 
     def outreach_text(self) -> str:
         return outreach_history(self.settings, self.store, self.clock)
+
+    def note_reply_delivery(self, delivered: str) -> None:
+        """适配器回报：刚才那句回复**到底送出去了多少**。
+
+        没送出去的话要从她的记忆里撤回——否则她以为自己说过了，
+        而用户从来没看见（下一轮她可能引用"我刚才说的……"，用户一脸茫然）。
+        只送出去一部分，就按用户实际看到的那部分留存。
+
+        （真机自查发现的：`send()` 原来把发送异常吞掉只打一行日志。）
+        """
+        if not self.last_reply_id:
+            return
+        if delivered == self.last_reply_text:
+            self.last_reply_id = None
+            return
+        if delivered:
+            self.store.update_message_content(self.last_reply_id, delivered)
+            self.store.add_diary(
+                self.clock.iso(),
+                f"回复只送出去一部分，已按实际送达的内容留存：{delivered}",
+                kind="terminal",
+                title="发送不完整",
+            )
+            self.notices.append("[发送] 回复只送出去一部分——她按你实际看到的那部分记")
+        else:
+            lost = self.last_reply_text
+            self.store.delete_message(self.last_reply_id)
+            self.store.add_diary(
+                self.clock.iso(),
+                f"这条回复没能送出去，已从她的记忆里撤回：{lost}",
+                kind="terminal",
+                title="发送失败",
+            )
+            self.notices.append(
+                "[发送] 刚才那句没能送出去——她不会以为自己说过，下一轮会重新回答"
+            )
+        self.last_reply_id = None
 
     def note_outreach_sent(self, text: str, *, keep_in_history: bool = True) -> None:
         """适配器真的发出去之后调用：记账扣额度（私聊的还写进会话上下文）。

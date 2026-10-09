@@ -208,6 +208,22 @@ class Store:
         self.conn.commit()
         return int(cur.lastrowid)
 
+    def delete_message(self, message_id: int) -> None:
+        """删掉一条消息。
+
+        用途：她的一句话**根本没送出去**时，不该留在她的记忆里——
+        否则她以为自己说过了，而用户从来没看见。
+        """
+        self.conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        self.conn.commit()
+
+    def update_message_content(self, message_id: int, content: str) -> None:
+        """把一条消息改成实际送达的内容（分段发送只成功了一部分时用）。"""
+        self.conn.execute(
+            "UPDATE messages SET content = ? WHERE id = ?", (content, message_id)
+        )
+        self.conn.commit()
+
     def backfill_message_scopes(self) -> int:
         """给历史消息补 scope/subject_id。
 
