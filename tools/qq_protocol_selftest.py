@@ -59,14 +59,17 @@ from ws_testserver import accept_handshake, make_listener, read_frame, send_fram
 
 
 def load_settings(*args, **kwargs):  # noqa: F811
-    """测试专用：**关掉群聊聚批**，让"事件 → 回复"是同步的，断言才好写。
+    """测试专用：**关掉群聊聚批、并把响应档位钉在 0**，让"事件 → 回复"是同步且确定的。
 
-    聚批（等 wake_delay 秒把一段时间里的话一起处理）本身单独测，
-    见第 9 节；这里关心的是接线对不对。
+    聚批和档位各自单独测（第 9、11 节）；这里关心的是接线对不对——
+    档位跟着 settings.toml 走的话，改一次出厂值就会让一堆老测试红掉。
     """
     base = _raw_load_settings(*args, **kwargs)
     return dataclasses.replace(
-        base, runtime=dataclasses.replace(base.runtime, wake_delay_seconds=0)
+        base,
+        runtime=dataclasses.replace(
+            base.runtime, wake_delay_seconds=0, response_tier=0
+        ),
     )
 
 OP_TEXT = 0x1

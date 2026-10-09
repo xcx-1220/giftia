@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from datetime import datetime, timedelta
 import sqlite3
 import sys
 import tempfile
@@ -924,6 +925,8 @@ def main() -> int:
     check("别人私聊看不到搭档的私事", not any("考驾照" in m["summary"] for m in friend_view))
 
     # 提示词层面：群里根本检索不出来
+    # 探针用"下周三"——它只在那条**私事**里（群里那句只说"考驾照"）。
+    # 注意：别让规则文案里出现这个词，否则会误报（踩过一次）。
     mv.handle("考驾照", user_id="OWNER", scene="group", group_id="G-1", speaker_name="小林")
     grp_prompt = mv._prepare("下周三要做什么")[0][0]["content"]
     probe = grp_prompt.find("下周三")
@@ -1507,6 +1510,58 @@ def main() -> int:
               quiet.settings, quiet.store, quiet.clock, life=quiet.status(),
               occasions=[], mood=SimpleNamespace(key="uneasy", label="不安"),
               instance_no=quiet.instance_no, force=True) is None)
+
+    # ══ 33. 时间感：她得知道时间在走 ═══════════════════════════
+    print("\n33. 时间感（相对时间 / 跨天分段 / 星期几）")
+    from giftia.memory import day_label, human_age
+
+    base = datetime(2026, 10, 9, 19, 38)
+    cases = [
+        ("2026-10-09T19:35:00", "刚刚"),
+        ("2026-10-09T19:15:00", "23 分钟前"),
+        ("2026-10-09T09:12:00", "今天 09:12"),
+        ("2026-10-08T14:30:00", "昨天"),
+        ("2026-10-07T10:00:00", "前天"),
+        ("2026-10-01T10:00:00", "8 天前"),
+        ("2026-10-14T09:00:00", "4 天后"),
+    ]
+    bad = [(ts, human_age(ts, base)) for ts, want in cases if human_age(ts, base) != want]
+    check("★ 时间戳会说成人话（刚刚/昨天/3 天前）—— 模型不用自己做减法",
+          not bad, str(bad))
+    check("跨天分段的日子标题带星期", day_label("2026-10-07T10:00:00") == "10月7日（周三）",
+          day_label("2026-10-07T10:00:00"))
+
+    tm = Giftia(make_settings(tmp / "timing", 81920.0), llm=MockLLM(settings.model))
+    tm.set_handler_id("OWNER")
+    tm.set_handler_name("椎名")
+    tm.handle("我叫椎名", user_id="OWNER")
+    clock_now = tm.clock.now()
+    for days, summary in ((0, "椎名今天说他要考驾照"), (1, "椎名昨天去看了牙医"),
+                          (8, "椎名上个月换了工作")):
+        ts = (clock_now - _td(days=days)).isoformat(timespec="seconds")
+        tm.store.add_memory(instance_no=tm.instance_no, created_ts=ts, happened_ts=ts,
+                            summary=summary, importance=0.8, layer="important", about="椎名")
+    prompt = tm._prepare("牙医的事")[0][0]["content"]
+    check("★ 记忆条目前面是「昨天」而不是绝对时间戳",
+          "昨天｜" in prompt or "刚刚｜" in prompt, 
+          [ln for ln in prompt.splitlines() if ln.startswith("◆")][:2])
+    check("★ 当前时间带星期几（说「下周三」要能算）",
+          "（周" in prompt and "当前时间" in prompt,
+          next((ln for ln in prompt.splitlines() if "当前时间" in ln), ""))
+    check("规则里明确交代了时间在走",
+          "时间是真的在走的" in prompt, "")
+
+    # 跨天分段：把三天的话拼进 transcript，必须出现日子标题
+    from giftia.memory import build_transcript
+    fake = [
+        {"role": "user", "content": "早上好", "ts": "2026-10-07T09:00:00", "speaker_name": "椎名"},
+        {"role": "user", "content": "今天也在忙", "ts": "2026-10-08T15:00:00", "speaker_name": "椎名"},
+        {"role": "user", "content": "在吗", "ts": "2026-10-09T19:00:00", "speaker_name": "椎名"},
+    ]
+    tscript = build_transcript(fake, "艾拉")
+    check("★ 跨天的对话稿会分段标日子（写记忆时才知道是哪天说的）",
+          tscript.count("——") == 6 and "10月7日（周三）" in tscript,
+          tscript.replace("\n", " / ")[:110])
 
     brain.store.close()
     brain2.store.close()

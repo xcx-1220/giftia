@@ -17,6 +17,11 @@ from .memory import Recalled
 
 RULES = """【本次对话的规则】
 - {scene_line}
+- **时间是真的在走的**。记忆和聊天记录前面都标了「什么时候」：
+  「刚刚」「23 分钟前」「今天 09:12」「昨天」「3 天前」。
+  说事情的时候**照这个说法讲**（"你昨天说的""前几天你提过"），
+  **不要**把两三天前的事说成刚发生的，也不要自己换算出错的日期。
+  要提将来，按【现在】那一行给的今天日期和星期几去数，别凭感觉说。
 - 不要复述「你现在想起的事」的原文，要用你自己的话说出来，像真的在回忆。
 - 严格按每条记忆前面的标记来决定你怎么说它（这是你此刻的真实状态，不是演戏）：
   · [可以确信] —— 你可以直接把它当成发生过的事说出来。
@@ -44,11 +49,14 @@ SCENE_LINES = {
 }
 
 
-def render_memories(recalled: list[Recalled]) -> str:
+def render_memories(recalled: list[Recalled], now: datetime | None = None) -> str:
     """用 ◆ 开头，和人格内核里的普通项目符号区分开；每条带一个置信度标记。
 
     还会标出"这是谁的事"——真机数据里她曾把 A 的课记成 B 的，
     标上归属之后她才分得清。
+
+    **而且标出"这是什么时候的事"**（昨天 / 3 天前）：以前只给绝对时间戳，
+    模型得自己做日期减法，结果就是两三天前的事被她说得像刚发生。
     """
     if not recalled:
         return "（关于这个话题，你什么都想不起来了。）"
@@ -58,7 +66,8 @@ def render_memories(recalled: list[Recalled]) -> str:
         layer = {"core": "（这是关于他本人的事）", "important": ""}.get(r.layer, "")
         about = str(r.memory.get("about") or "").strip()
         who = f"（关于{about}）" if about and about != "搭档" else ""
-        lines.append(f"◆ {mark}{layer}{who} {r.happened}｜{r.text}")
+        when = r.when(now) if now is not None else r.happened
+        lines.append(f"◆ {mark}{layer}{who} {when}｜{r.text}")
     return "\n".join(lines)
 
 
@@ -171,7 +180,8 @@ def build_system_prompt(
         )
 
     state = [
-        f"当前时间：{now.strftime('%Y年%m月%d日 %H:%M')}",
+        # 带上星期几：说"下周三"的时候她要能算得出是哪天
+        f"当前时间：{now.strftime('%Y年%m月%d日')}（周{'一二三四五六日'[now.weekday()]}）{now.strftime('%H:%M')}",
         f"你的剩余寿命：{life.human_remaining()}",
         f"你的记忆状态：{life.stage.label}",
     ]
@@ -180,7 +190,7 @@ def build_system_prompt(
     blocks.append("【你此刻的状态】\n" + "\n".join(state))
 
     blocks.append("【关于记忆】\n" + (life.stage.note or "你对自己的记忆很有把握。"))
-    blocks.append("【你现在想起的事】\n" + render_memories(recalled))
+    blocks.append("【你现在想起的事】\n" + render_memories(recalled, now))
     blocks.append(RULES.format(scene_line=_scene_line(scene, is_handler)))
 
     return "\n\n".join(b for b in blocks if b.strip())

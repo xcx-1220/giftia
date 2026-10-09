@@ -27,6 +27,7 @@ from .dream import Dream, dream_text, latest_untold, make_dream, should_dream
 from .lifespan import Lifespan, LifeStatus
 from .llm import BaseLLM, DeepSeekLLM, LLMError, MockLLM
 from .memory import (
+    day_label,
     Recalled,
     consolidate,
     flush_sessions,
@@ -59,6 +60,16 @@ TOOL_LAST_ROUND_NUDGE = (
     "（不要再调用任何工具了。现在直接用一句话回答对方——"
     "你刚才想到的、答应的事，用你自己的语气说出来。）"
 )
+
+
+def _gap_hours(a: str, b: str) -> float:
+    """两条消息隔了几个小时。解析不了就当 0（宁可不标，也别标错）。"""
+    try:
+        first = datetime.fromisoformat(a[:19])
+        second = datetime.fromisoformat(b[:19])
+    except (ValueError, TypeError):
+        return 0.0
+    return abs((second - first).total_seconds()) / 3600.0
 
 
 def make_llm(settings: Settings) -> BaseLLM:
@@ -1039,12 +1050,26 @@ class Giftia:
         """
         rows = self.history(limit)
         lines: list[str] = []
+        last_day = ""
+        last_ts = ""
         for m in rows:
             content = " ".join(str(m["content"]).split())
             if not content:
                 continue
             if len(content) > per_line:
                 content = content[:per_line] + "…"
+            # ★ 跨天分段：这份记录是**跨天**的（按会话前缀翻历史），
+            #   不标日子她会把前天的和今天的当成一场连续对话 ——
+            #   这正是"她记不住时间在流动"最直接的原因。
+            day = day_label(str(m.get("ts") or ""))
+            if day and day != last_day:
+                lines.append(f"—— {day} ——")
+                last_day = day
+                last_ts = ""
+            elif last_ts and _gap_hours(last_ts, str(m.get("ts") or "")) >= 2.0:
+                # 同一天里隔了两个多小时，也标一下：否则"上午说的"和"刚说的"分不开
+                lines.append(f"（隔了约 {_gap_hours(last_ts, str(m.get('ts') or '')):.0f} 小时）")
+            last_ts = str(m.get("ts") or "")
             if m["role"] == "assistant":
                 lines.append(f"{self.settings.persona.name}：{content}")
             else:

@@ -239,6 +239,13 @@ class Recalled:
     def happened(self) -> str:
         return str(self.memory.get("happened_ts", ""))[:16].replace("T", " ")
 
+    def when(self, now: datetime) -> str:
+        """这条事"是什么时候的事"，说成人话（昨天 / 3 天前）。
+
+        这是修"她记不住时间在流动"的关键：相对说法**不需要模型做减法**。
+        """
+        return human_age(str(self.memory.get("happened_ts") or ""), now)
+
     @property
     def layer(self) -> str:
         return str(self.memory.get("layer") or "normal")
@@ -421,6 +428,63 @@ def mark_cited(
 # 整理用的提示词在 llm.py（属于"模型任务"的实现细节），这里只负责数据流。
 
 
+def human_age(ts: str, now: datetime) -> str:
+    """把一个时间戳说成"人话"：刚刚 / 23 分钟前 / 今天 09:12 / 昨天 / 3 天前。
+
+    **为什么必须做这一步**：以前提示词里给的是绝对时间（`2026-10-08 14:30`），
+    而"现在是几号"在另一个块里、还是另一种写法（`2026年10月09日`）。
+    模型得自己做日期减法——这恰恰是它最不擅长的事。真机上表现成
+    "她记不住时间在流动"，把两三天前的事说得像刚发生。
+    换算成相对说法之后，她只需要读，不需要算。
+    """
+    raw = str(ts or "").strip()
+    if not raw:
+        return ""
+    try:
+        when = datetime.fromisoformat(raw.replace(" ", "T")[:19])
+    except ValueError:
+        return raw[:16].replace("T", " ")
+    if when.tzinfo is not None and now.tzinfo is None:
+        when = when.replace(tzinfo=None)
+    delta = now - when
+    seconds = delta.total_seconds()
+    if seconds < 0:
+        # 未来（比如"明天要做的事"）：说成"还有多久"
+        ahead = -seconds
+        if ahead < 3600:
+            return f"{int(ahead // 60)} 分钟后"
+        if ahead < 86400:
+            return f"{int(ahead // 3600)} 小时后"
+        return f"{int(ahead // 86400)} 天后"
+    if seconds < 300:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} 分钟前"
+    if when.date() == now.date():
+        return f"今天 {when.strftime('%H:%M')}"
+    days = (now.date() - when.date()).days
+    if days == 1:
+        return "昨天"
+    if days == 2:
+        return "前天"
+    if days < 30:
+        return f"{days} 天前"
+    if days < 365:
+        return f"{days // 30} 个月前"
+    return f"{days // 365} 年前"
+
+
+def day_label(ts: str) -> str:
+    """给跨天的对话稿分段用：返回 `10月07日（周三）` 这样的日子标题。"""
+    raw = str(ts or "").strip()
+    try:
+        when = datetime.fromisoformat(raw.replace(" ", "T")[:19])
+    except ValueError:
+        return ""
+    week = "一二三四五六日"[when.weekday()]
+    return f"{when.month}月{when.day}日（周{week}）"
+
+
 def build_transcript(messages: list[dict], persona_name: str) -> str:
     """把一段对话拼成给模型看的稿子。
 
@@ -428,7 +492,14 @@ def build_transcript(messages: list[dict], persona_name: str) -> str:
     私聊里保持原来的"搭档"，不改她已有的记忆语气。
     """
     lines = []
+    last_day = ""
     for m in messages:
+        # 跨天时分段标日子。不标的话，模型会把前天的和今天的当成一场连续对话，
+        # 整理出来的记忆就没有时间感（"他昨天说"变成"他说"）。
+        day = day_label(str(m.get("ts") or ""))
+        if day and day != last_day:
+            lines.append(f"—— {day} ——")
+            last_day = day
         if m["role"] == "user":
             who = str(m.get("speaker_name") or "").strip() or "搭档"
         else:
