@@ -6,3 +6,9 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# 审查/修复过程里的临时数据（测试库、夹具 env、探针产出的库）——
+# 这些是"跑一次就有"的中间产物，不该进版本库（曾经误跟踪了 260MB 的测试库）。
+# 报告与探针脚本仍然入库：.review/findings、.review/probes、.review/evidence、
+# .review/fix-reports、.review/checks。
+.review/tmp/
