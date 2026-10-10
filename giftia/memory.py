@@ -207,7 +207,15 @@ def retention_of(mem: dict, cfg: MemoryConfig, now: datetime) -> float:
     strength = float(mem.get("strength") or 1.0)
     recalls = int(mem.get("recall_count") or 0)
     s = max(1e-6, cfg.retention_unit_hours * (strength + recalls))
-    base = mem.get("last_recalled_at") or mem.get("created_ts") or mem.get("happened_ts")
+    # Δt 的起点：上次被说出口 > **事情发生的时间** > 落库时间。
+    # 以前中间那一档是 created_ts（整理时刻），于是"10 天前发生、刚刚才被整理出来"
+    # 的记忆 retention≈1（跟刚说过一样清晰），而同一轮提示词里给模型看的却是
+    # human_age(happened_ts)=「10 天前」——自相矛盾（P3-4）。
+    base = (
+        mem.get("last_recalled_at")
+        or mem.get("happened_ts")
+        or mem.get("created_ts")
+    )
     return math.exp(-_age_hours(str(base or ""), now) / s)
 
 
@@ -597,16 +605,24 @@ def load_pending(
             instance_no, store.meta_get_int("last_consolidated_msg_id", 0)
         )
     key = f"last_consolidated:{session_id}"
-    cursor = store.meta_get_int(key, -1)
-    if cursor < 0:
-        # 第一次为这个会话建游标：**不能**直接继承全局游标。
-        # 全局游标是跨会话的最大值，继承它会让"这个会话里 id 更小的未整理消息"
-        # 永远落在窗口外、再也不被整理成记忆（P1-10）。
-        # 宁可多整理一次这个会话，也不要永久跳过：取
-        # min(本会话最早一条未整理消息的 id - 1, 全局游标)。
-        global_cursor = store.meta_get_int("last_consolidated_msg_id", 0)
-        first_open = store.first_open_message_id(instance_no, session_id)
+    # 游标 = "已经整理到的最大消息 id"，**从 0 起**（消息 id 从 1 开始）。
+    # 以前用 -1 当"未初始化"哨兵，于是"本会话最早一条未整理消息 id=1"
+    # 算出来的游标是 0，而 `open_messages` 的条件是 `id > cursor` → 那条 id=1
+    # 反而被自己跳过（P1-10 修了一半就是这个原因）。
+    cursor = store.meta_get_int(key, 0)
+    global_cursor = store.meta_get_int("last_consolidated_msg_id", 0)
+    # 第一次为这个会话建游标：**不能**直接继承全局游标——全局游标是跨会话的最大值，
+    # 继承它会让"这个会话里 id 更小的未整理消息"永远落在窗口外（P1-10）。
+    # 宁可多整理一次这个会话，也不要永久跳过。
+    first_open = store.first_open_message_id(instance_no, session_id)
+    if cursor <= 0:
         cursor = min(first_open - 1, global_cursor) if first_open is not None else global_cursor
+        cursor = max(0, cursor)
+        store.meta_set(key, cursor)
+    elif first_open is not None and cursor >= first_open:
+        # 自愈：库里已经有比游标更早的未整理消息（老版本写坏的游标、或消息被回填/重放），
+        # 把游标退回到"这些消息之前"，而不是让它们永远静默地不被整理。
+        cursor = max(0, min(first_open - 1, global_cursor))
         store.meta_set(key, cursor)
     return store.open_messages(instance_no, cursor, session_id=session_id)
 
@@ -667,6 +683,7 @@ def consolidate(
     added = 0
     merged = 0
     skipped = 0
+    index_in_batch = 0
     # 回调（关系加分 / 改称呼）会自己写 state 并 commit —— 所以**必须等事务提交后**
     # 再触发，否则它们会把还没写完的整理事务提前提交掉，回滚就不再完整。
     callbacks: list = []
@@ -676,11 +693,13 @@ def consolidate(
     # 下一轮可重试，且不会产生重复记忆（相似度去重仍在）。
     store.begin()
     try:
-        for d in drafts:
-            if not d.summary.strip():
-                continue
-            if d.importance < settings.memory.min_importance:
-                continue
+        # 先筛掉"空摘要 / 重要性太低"的草稿，让序号在**真正写入的条目**上连续，
+        # 这样 _spread_ts 的插值是均匀的
+        accepted = [
+            d for d in drafts
+            if d.summary.strip() and d.importance >= settings.memory.min_importance
+        ]
+        for index_in_batch, d in enumerate(accepted, start=1):
             layer = d.layer if d.layer in ("core", "important", "normal") else infer_layer(
                 d.importance, d.emotion
             )
@@ -709,10 +728,15 @@ def consolidate(
                     skipped += 1
                 continue
 
+            # 「这件事发生在什么时候」：以前整批都用 `pending[0]["ts"]`，
+            # 同一天 09:00 和 23:00 说的两件事会被记成同一个时间（14 小时偏差，
+            # 而提示词里给她看的就是这个时间）。现在按条目序号在**批内时间范围**上铺开：
+            # 一条 → 用批首时间；多条 → 从批首到批尾均匀插值。
+            happened_ts = _spread_ts(pending, index_in_batch)
             new_id = store.add_memory(
                 instance_no=instance_no,
                 created_ts=now_iso,
-                happened_ts=pending[0]["ts"],
+                happened_ts=happened_ts,
                 summary=d.summary.strip(),
                 tags=d.tags.strip(),
                 emotion=d.emotion.strip(),
@@ -941,12 +965,63 @@ def flush_sessions(
     return total
 
 
+# 兜底整理时**不该逐字存下来**的东西：凭据类。模型正常工作时会自己判断"值不值得记"，
+# 但模型挂掉时这条兜底路径会把搭档的原话照抄进长期记忆，然后一路进检索与提示词
+# （审查 P3-2 实测：「我的银行卡密码是 8899，别告诉别人」被原样写成记忆）。
+_SENSITIVE_RE = re.compile(
+    r"(密码|口令|验证码|身份证|银行卡|信用卡|CVV|CVC|社保|护照号|密钥|api[_ ]?key|token)",
+    re.IGNORECASE,
+)
+
+
+def _spread_ts(pending: list[dict], index: int) -> str:
+    """把"这件事发生的时间"按条目序号在批内时间范围上铺开。
+
+    一条 → 批首时间；多条 → 从批首到批尾线性插值（保持 ISO 字符串可比、可用）。
+    以前整批共用 `pending[0]["ts"]`，同一天 09:00 与 23:00 的两件事会被记成同一时刻。
+    """
+    if not pending:
+        return ""
+    if len(pending) == 1 or index <= 1:
+        return str(pending[0].get("ts") or "")
+    from datetime import datetime as _dt
+
+    try:
+        t0 = _dt.fromisoformat(str(pending[0].get("ts")))
+        t1 = _dt.fromisoformat(str(pending[-1].get("ts")))
+    except (TypeError, ValueError):
+        return str(pending[0].get("ts") or "")
+    if t1 <= t0:
+        return str(pending[0].get("ts") or "")
+    step = (t1 - t0) / max(1, len(pending) - 1)
+    # index 从 1 开始（第一条 = 批首）
+    pos = min(max(0, index - 1), len(pending) - 1)
+    return (t0 + step * pos).isoformat(timespec="seconds")
+
+
 def _fallback_drafts(messages: list[dict], settings: Settings) -> list[MemoryDraft]:
-    """模型不可用时的兜底：直接从搭档的话里挑两句留下来。"""
+    """模型不可用时的兜底：直接从搭档的话里挑两句留下来。
+
+    **凭据类内容不逐字存**（审查 P3-2）：模型正常时它会自己判断"值不值得记"，
+    但这条兜底路径是照抄原话的，所以先把明显是密码/验证码/证件号那种句子换成
+    "他说了一件跟安全/凭据有关的事，具体内容我没存"——既留住"发生过什么"，
+    又不把秘密写进会被检索、会被注入提示词的长期记忆。
+    """
     user_lines = [m["content"].strip() for m in messages if m["role"] == "user"]
     user_lines = [t for t in user_lines if len(t) >= 6]
     drafts: list[MemoryDraft] = []
     for text in user_lines[-2:]:
+        if _SENSITIVE_RE.search(text):
+            drafts.append(
+                MemoryDraft(
+                    summary="搭档说了一件跟密码/证件有关的事（原话我没有逐字记下来）。",
+                    tags="搭档,未整理",
+                    emotion="未整理",
+                    importance=0.35,
+                    layer="normal",
+                )
+            )
+            continue
         summary = text if len(text) <= 60 else text[:57] + "……"
         drafts.append(
             MemoryDraft(

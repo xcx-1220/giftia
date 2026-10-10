@@ -248,6 +248,8 @@ class QQBot:
         self._wakeup_once = False
         # 每个 msg_id 已经回出去几条（平台按 msg_id 计数：群 5 / 单聊 4）
         self._replies_sent: dict[str, int] = {}
+        # 这一条消息里刚刚完成"自动认主"吗（= 它就是认主那一条，按搭档处理）
+        self._auto_bound_here = False
 
     # ══ 退出 ═════════════════════════════════════════════════
     def request_stop(self, *_args: object) -> None:
@@ -778,24 +780,37 @@ class QQBot:
         """
         hub = brain_mod.get_default(self.settings)
         owner = self.owner_id()
+        self._auto_bound_here = False
         if not owner and self.settings.runtime.auto_bind:
             # 自动认主：省掉 /bind（官方 openid 无法预先知道，只能这样认人）
             if kind == "c2c":
                 # 私聊：未认证时只有管理员/体验号能找她，第一个说话的当然是他
                 hub.set_handler_id(user_id)
                 owner = user_id
+                self._auto_bound_here = True
                 print(f"[自动认主·私聊] 搭档 = {user_id}（想换人：/unbind）")
             elif role == "owner":
                 # 群聊：只有群主 @ 她时才认（陌生人冒充不了群主）
                 hub.set_handler_id(user_id)
                 owner = user_id
+                self._auto_bound_here = True
                 print(f"[自动认主·群主] 搭档 = {user_id}（想换人：/unbind）")
 
-        # 谁是搭档？
-        #   · 已绑定 → 就是绑定的人
-        #   · 未绑定 + 私聊 → 说话的就是他（本地 CLI 与"还没认人"时都是这样）
+        # 谁是搭档？（契约 §三）
+        #   · 已绑定 → 只有绑定的人本人
+        #   · 未绑定 + 私聊 + auto_bind=true → 这一条就是"认主"，按搭档处理
+        #   · 未绑定 + 私聊 + auto_bind=false → **不是搭档**（未确认路径：不检索私事、不写私事）
         #   · 未绑定 + 群聊 → 不是他（群里必须靠群主自动认主或 /bind）
-        is_handler = (user_id == owner) if owner else (kind == "c2c")
+        #
+        # ⚠ 这里以前写的是 `(user_id == owner) if owner else (kind == "c2c")`：
+        # "没有搭档 + 私聊"一律当搭档——`auto_bind=false` 时它绕过了核心的未确认路径，
+        # 陌生人第一条私聊就拿到 `("private","")` 这个**不带主体**的私事桶
+        # （审查 P0-3b 的最后一个入口，`pa_privacy_probe` B 段实测泄漏）。
+        is_handler = bool(owner) and user_id == owner
+        if not owner and kind == "c2c":
+            is_handler = bool(self.settings.runtime.auto_bind and self._auto_bound_here)
+        if not owner and kind == "group" and role == "owner":
+            is_handler = bool(self._auto_bound_here)
 
         if kind == "group" and not is_handler:
             # 群里的其他人：先让她认人（这是她"认得群里的人"的唯一来源），再决定出不出声

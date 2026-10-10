@@ -157,12 +157,27 @@ def toml_cases() -> None:
         store.close()
 
     # 2d 拼错的键
+    # 【期望为何变了】原来断言「拼错的键会生效（response_tier == 100）」= 记录缺陷；
+    # §8 配置校验定下的契约是：**未知键静默忽略 + 打印警告**（config._sub）。
+    # 所以期望翻转成：拼错的键**不生效**，但必须在 stderr 上出声。
+    import io
+    from contextlib import redirect_stderr
+
     p = toml_case("typo", "[runtime]\nresponse_tierr = 100\nwake_delay_second = 9\n")
-    st = cfg.load_settings(settings_path=p)
-    print(f"  [INFO] 拼错的键被静默忽略：response_tier={st.runtime.response_tier}，"
-          f"wake_delay_seconds={st.runtime.wake_delay_seconds}")
-    check("拼错的配置键会报错（而不是静默不生效）",
-          st.runtime.response_tier == 100, "静默忽略")
+    err = io.StringIO()
+    with redirect_stderr(err):
+        st = cfg.load_settings(settings_path=p)
+    warn = err.getvalue()
+    print(f"  [INFO] 拼错的键不生效：response_tier={st.runtime.response_tier}（默认值），"
+          f"wake_delay_seconds={st.runtime.wake_delay_seconds}；"
+          f"警告={warn.strip()!r}")
+    check("拼错的配置键不生效（不会被当成正确键吃进去）",
+          st.runtime.response_tier != 100 and st.runtime.wake_delay_seconds != 9,
+          f"tier={st.runtime.response_tier} wake={st.runtime.wake_delay_seconds}")
+    check("拼错的配置键会打印警告（不是静默忽略）",
+          "response_tierr" in warn and "未知" in warn and "不会生效" in warn, warn.strip())
+    check("正向对照：正确的键照常生效（不是把 [runtime] 整段丢掉）",
+          st.runtime.auto_bind is not None, f"auto_bind={st.runtime.auto_bind}")
 
     # 2e keywords 类型
     # 判据修订（team-store 2026-10-10）：§8 配置校验的契约是"keywords 必须是**字符串列表**"，

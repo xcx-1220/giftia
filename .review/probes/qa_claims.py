@@ -109,9 +109,24 @@ for i in range(8):
         pass
 C.info(f"8 条旁听后：chat 调用 {llm_l.chat_count} 次，extract 调用 {llm_l.extract_count} 次")
 C.check("旁听当场不回复（逐条零 token）", llm_l.chat_count == 0, str(llm_l.chat_count))
-C.check("★ 但每 8 条旁听会触发一次整理 = 会花 token（README 说「零 token」）",
-        llm_l.extract_count >= 1,
-        f"extract={llm_l.extract_count} → README §3.5「不调模型 —— 零 token」在聚合口径下不成立")
+# 【期望为何变了】原来这条以 README §3.5 的旧措辞「不调模型 —— 零 token」为判据，
+# 断言「每 8 条旁听必然触发一次整理」= 记录缺陷（对应 P1-14）。
+# P1-14 修复后旁听**当轮完全不调模型**（连整理也推迟）：只留一个 listen_pending 标记，
+# 由搭档那一轮（_post_turn → flush_listen_pending）或退出路径统一整理——
+# 群聊记忆照样会生成，只是不在这里花钱。README 现在的措辞正是这个意思（README.md:290-291）。
+pending_after_listen = b_listen.store.state_get("listen_pending")
+gmems_after_listen = len(b_listen.store.active_memories(
+    b_listen.instance_no, view=[("group", "gA")]))
+C.check("旁听**当轮完全不调模型**（连整理也推迟，只留待整理标记）",
+        llm_l.chat_count == 0 and llm_l.extract_count == 0,
+        f"chat={llm_l.chat_count} extract={llm_l.extract_count} pending={pending_after_listen!r}")
+# 正向对照：搭档回来说一句 → 待整理的旁听消息照常变成这个群的记忆（不是把功能关掉）
+b_listen.handle("我在呢", "u_owner", scene="c2c")
+gmems_later = b_listen.store.active_memories(b_listen.instance_no, view=[("group", "gA")])
+C.check("正向对照：搭档那一轮会把攒下的旁听整理成群记忆（一次模型调用）",
+        llm_l.extract_count >= 1 and len(gmems_later) >= 1,
+        f"extract={llm_l.extract_count}，群记忆 {len(gmems_later)} 条"
+        f"（旁听期间是 {gmems_after_listen} 条）")
 
 # ── 6. 每天最多主动 3 条 / 30 天额度 ───────────────────────────
 C.info("── [README §2/§3.5] 主动联系额度 ──")

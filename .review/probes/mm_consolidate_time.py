@@ -209,20 +209,31 @@ def main() -> int:
         '[model]\nprovider = "mock"\n[lifespan]\ntotal_hours = 100\n', encoding="utf-8"
     )
     (cfg_dir / "persona.toml").write_text('[persona]\nname = "测试"\n', encoding="utf-8")
-    st_no_stages = config_mod.load_settings(cfg_dir / "settings.toml", cfg_dir / "persona.toml")
-    print(f"    load_settings 成功，stages={st_no_stages.stages}")
-    print(f"    这一档的 min_ratio={st_no_stages.stages[0].min_ratio}，"
-          f"blur={st_no_stages.stages[0].blur}，top_k={st_no_stages.stages[0].top_k}")
-    for ratio in (1.0, 0.5, 0.1, 0.0):
-        got = st_no_stages.stage_for(ratio)
-        print(f"    stage_for({ratio}) → {got.name}（blur={got.blur}）")
+    # 期望（修复后）：缺少 [[degradation.stages]] 必须 **fail-loud**（启动即报错），
+    # 而不是静默退化成"永不模糊"。原断言记录的是 fail-open 的缺陷，现在翻转成
+    # "必须抛配置错误 + 错误信息说得清后果"（契约见 config._validated_stages）。
+    loud = ""
+    try:
+        st_no_stages = config_mod.load_settings(cfg_dir / "settings.toml", cfg_dir / "persona.toml")
+        print(f"    load_settings 竟然成功了：stages={st_no_stages.stages}")
+    except Exception as exc:  # noqa: BLE001
+        loud = f"{type(exc).__name__}: {exc}"
+    print(f"    load_settings 的结果：{loud or '（没有报错——这是 fail-open，不合格）'}")
     check(
-        "P2-7 degradation 配置缺失/写错时应当报错，而不是静默退化成'永不模糊'",
-        False,
-        "实际：任何剩余比例都命中唯一一档 clear，退化功能整条失效且无任何提示",
+        "P2-7 degradation 配置缺失时 fail-loud（报错并说明后果），不再静默退化成'永不模糊'",
+        bool(loud) and "degradation" in loud and ("模糊" in loud or "blur" in loud),
+        loud or "没有报错",
     )
-    failures += 1
-    print("    同理：settings.stages=() 时 stage_for() 也返回一个内置 clear 档（fail-open）。")
+    # 对照：补上一档合法 stage 之后必须能正常加载（证明拦的是"缺配置"而不是"这个文件不能用"）
+    (cfg_dir / "settings.toml").write_text(
+        '[model]\nprovider = "mock"\n[lifespan]\ntotal_hours = 100\n'
+        '[[degradation.stages]]\nname = "clear"\nlabel = "清晰"\n'
+        'min_ratio = 0.0\ntop_k = 6\nmin_score = 0.15\nblur = 0.0\nmax_chars = 400\n',
+        encoding="utf-8",
+    )
+    st_ok = config_mod.load_settings(cfg_dir / "settings.toml", cfg_dir / "persona.toml")
+    check("对照：补上合法 stage 后照常加载", len(st_ok.stages) == 1,
+          f"stages={[s.name for s in st_ok.stages]}")
 
     print()
     print(f"整理/时间探针失败计数：{failures}")

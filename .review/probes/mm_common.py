@@ -36,7 +36,13 @@ FAIL = "FAIL"
 
 
 def fresh_dir(tag: str) -> Path:
-    """工作区内的临时目录（默认 mode 0o777，沙箱可访问）。"""
+    """工作区内的临时目录（默认 mode 0o777，沙箱可访问）。
+
+    **整个 `memory-man-<tag>` 先删干净再建**：以前只 rmtree(tag) 之后 mkdir，
+    但 `make_brain(tmp / "cursor", ...)` 这种子目录里的库不在 tag 根下，
+    会跨次运行残留 → 探针读到上一次的消息 id（例如 id=5/7 而不是 1/2/3），
+    给出"看起来像缺陷"的假结果。
+    """
     p = TMPROOT / f"memory-man-{tag}"
     if p.exists():
         shutil.rmtree(p, ignore_errors=True)
@@ -64,7 +70,15 @@ def settings_for(tmp: Path, **overrides):
 
 
 def make_brain(tmp: Path, *, settings=None, clock_offset: float = 0.0, mock=None) -> Giftia:
+    """造一个跑在 `tmp` 这个数据根下的 brain。
+
+    ⚠ 这里必须把 `root` 换成 `tmp`：以前写的是 `s = settings or settings_for(tmp)`，
+    调用方传了 `settings`（root 指向探针总目录）时，`tmp` **被完全忽略** ——
+    第 1/2/3 节的库其实是同一个 `data/giftia.db`，消息 id 跨节累加，
+    "每会话游标"那节于是读到 id=5/7 而不是 1/2/3，给出假结果。
+    """
     s = settings or settings_for(tmp)
+    s = dataclasses.replace(s, root=Path(tmp))
     store = Store(s.db_path)
     clock = Clock(store, offset_hours=clock_offset)
     return Giftia(s, llm=mock or MockLLM(s.model), store=store, clock=clock)

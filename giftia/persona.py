@@ -54,6 +54,20 @@ SCENE_LINES = {
 }
 
 
+def _one_line(text: str) -> str:
+    """把记忆文本压成**单行**，并中和会伪造结构的标记。
+
+    记忆条目是模型对**原始对话**的压缩，原文来自用户/群友，里面可能有换行、
+    `◆`、`｜`、`【】`。原样塞进 system 提示词就成了一条"注入面"：
+    一条带换行的记忆能伪造出新的列表项、甚至新的段落块（审查 P2-12）。
+    这里只做最小中和：换行折成空格，保留字形的结构标记换成全角变体。
+    """
+    flat = " ".join(str(text or "").split())
+    for bad, safe in (("◆", "◇"), ("｜", "丨"), ("【", "["), ("】", "]"), ("\u3000", " ")):
+        flat = flat.replace(bad, safe)
+    return flat
+
+
 def render_memories(recalled: list[Recalled], now: datetime | None = None) -> str:
     """用 ◆ 开头，和人格内核里的普通项目符号区分开；每条带一个置信度标记。
 
@@ -69,10 +83,10 @@ def render_memories(recalled: list[Recalled], now: datetime | None = None) -> st
     for r in recalled:
         mark = CONFIDENCE_MARK.get(r.confidence, CONFIDENCE_MARK["cite"])
         layer = {"core": "（这是关于他本人的事）", "important": ""}.get(r.layer, "")
-        about = str(r.memory.get("about") or "").strip()
+        about = _one_line(str(r.memory.get("about") or "").strip())
         who = f"（关于{about}）" if about and about != "搭档" else ""
         when = r.when(now) if now is not None else r.happened
-        lines.append(f"◆ {mark}{layer}{who} {when}｜{r.text}")
+        lines.append(f"◆ {mark}{layer}{who} {when}｜{_one_line(r.text)}")
     return "\n".join(lines)
 
 

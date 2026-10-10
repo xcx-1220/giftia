@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from mm_common import (  # noqa: E402
     TMPROOT,
-    check,
+    check as _mm_check,
     fresh_dir,
     make_brain,
     settings_for,
@@ -41,6 +41,17 @@ from giftia.store import Store  # noqa: E402
 SECRET_PERSON = "SECRET-BRAVO-4402"
 SECRET_GROUP = "SECRET-CHARLIE-9915"
 FUTURE = (datetime.now().date().fromordinal(datetime.now().date().toordinal() + 1)).isoformat()
+
+# 失败计数直接挂在 check 上：以前是几条“检出型”断言各自手写 `failures += 1`，
+# 期望翻转后那些条件不再触发，计数就和实际断言脱节了（全 PASS 但退出码仍是 1）。
+FAILURES = 0
+
+
+def check(label: str, ok: bool, detail: str = "") -> bool:
+    global FAILURES
+    if not ok:
+        FAILURES += 1
+    return _mm_check(label, ok, detail)
 
 
 class EchoLLM(MockLLM):
@@ -108,9 +119,8 @@ def build(tmp, tag):
 def main() -> int:
     tmp = fresh_dir("unfiltered")
     brain, store, inst, p, g, q = build(tmp, "main")
-    failures = 0
 
-    title("路径 A：dream.should_dream() —— 用全量记忆计数决定做不做梦")
+    title("路径 A：dream.should_dream() —— 资格判定与取材必须同一口径（P1-3 已修）")
     # 接口契约（FIX_BATCH1_INTERFACE §一）：全量必须**显式**写 ALL_SCOPES；
     # view=None 现在是编程错误（TypeError），不再表示"不过滤"。
     n_all = len(store.active_memories(inst, view=Store.ALL_SCOPES))
@@ -119,10 +129,20 @@ def main() -> int:
     should = dream_mod.should_dream(brain.settings, store, brain.clock, inst)
     print(f"    should_dream() = {should}（阈值为 min_memories={brain.settings.dream.min_memories}）")
     pretend = n_all >= brain.settings.dream.min_memories > n_owner
+    # 【期望为何变了】原来这条记的是 P1-3 的缺陷：should_dream() 用**全量**计数
+    # （n_all 达标），make_dream() 只取搭档视角（n_owner 不够）→ 门槛看起来早就够了、
+    # 梦却永远做不出来（静默失效）。修复后两者共用 _handler_view，口径一致。
     check(
-        "P1 观察： dreaming 资格按**全量**记忆数判定（含他人私事）",
-        not pretend,
-        "确认：全量达标即触发" if pretend else "两者一致，未观察到差异",
+        "P1 判据：should_dream() 与 make_dream() 同一口径（都按搭档视角计数）",
+        should == (n_owner >= brain.settings.dream.min_memories),
+        f"should_dream={should}，搭档可见={n_owner}，阈值={brain.settings.dream.min_memories}，"
+        f"全量={n_all}（以前按全量判定 → {'会误判为够' if pretend else '恰好一致'}）",
+    )
+    d0 = dream_mod.make_dream(brain.settings, store, brain.clock, brain.llm, inst)
+    check(
+        "P1b 判据：make_dream() 的实际取值与 should_dream() 一致（不会一个说够、一个说不够）",
+        (d0 is not None) == (n_owner >= brain.settings.dream.min_memories),
+        f"make_dream={'有梦' if d0 else 'None'}，should_dream={should}",
     )
 
     title("路径 B：brain.make_dream_now() / dream.make_dream(view=None)")
@@ -137,7 +157,6 @@ def main() -> int:
         "含 SECRET_PERSON/SECRET_GROUP" if leaked_dream else "未含",
     )
     if leaked_dream:
-        failures += 1
         store._rows("SELECT * FROM dreams") and print(
             "    已落库的梦（dreams 表）→",
             json.dumps(store._rows("SELECT content FROM dreams"), ensure_ascii=False)[:300],
@@ -155,9 +174,27 @@ def main() -> int:
     in_memoir = SECRET_PERSON in memoir or SECRET_GROUP in memoir
     in_sealed = SECRET_PERSON in sealed_text or SECRET_GROUP in sealed_text
     check("P0-3 回忆录不得含他人私聊内容", not in_memoir, "含 SECRET_PERSON" if in_memoir else "未含")
-    check("P0-4 封存 JSON 不得含他人私聊内容", not in_sealed, "含 SECRET_PERSON" if in_sealed else "未含")
-    if in_memoir or in_sealed:
-        failures += 1
+    # 【期望为何变了】原来 P0-4 断言「封存 JSON 不得含他人私聊内容」；但按修复设计，
+    # 封存 JSON 是**运维资产**（前任记忆的唯一存档），必须保留**全量**原始数据——
+    # 过滤掉就等于把前任的记忆真删了。所以改成分层期望：
+    #   ① 回忆录 / diary（交给搭档的东西）必须干净；
+    #   ② 封存 JSON 必须显式标注自己是全量（scope="all_scopes" + note），且原始 memories 一条不少。
+    # 与 `lead_v1_p0_verify.py` 的分层期望同一套判据。
+    check(
+        "P0-4 封存 JSON 保留全量原始数据 + 显式全量标记（分层期望：干净的是回忆录/diary）",
+        in_sealed
+        and sealed.get("scope") == "all_scopes"
+        and bool(str(sealed.get("note") or ""))
+        and len(sealed.get("memories", [])) >= 4,
+        f"封存条数={len(sealed.get('memories', []))}，scope={sealed.get('scope')!r}，"
+        f"含 person/group 原始数据={in_sealed}",
+    )
+    check(
+        "P0-4b 回忆录里只列搭档视角的条目（private），不含 person/group",
+        "搭档的体检报告有异常。" in memoir and not in_memoir,
+        f"含 private={('搭档的体检报告有异常。' in memoir)}，含他人内容={in_memoir}",
+    )
+    if in_memoir:
         for line in memoir.splitlines():
             if SECRET_PERSON in line or SECRET_GROUP in line:
                 print("    回忆录泄漏行 →", line.strip()[:150])
@@ -170,16 +207,17 @@ def main() -> int:
             SECRET_PERSON not in dtext,
             "含 SECRET_PERSON" if SECRET_PERSON in dtext else "未含",
         )
-        if SECRET_PERSON in dtext:
-            failures += 1
 
-    title("路径 D：occasions.days_together_text() —— /days 的大日子清单")
+    title("路径 D：occasions.days_together_text() —— /days 的大日子清单（P1-11 已修）")
     txt = occ_mod.days_together_text(store, inst, 5.0, brain.settings.occasions.milestones)
     print("    " + txt.replace("\n", "\n    ")[:500])
     leak_days = SECRET_GROUP in txt or "小雨" in txt
+    # 【期望为何变了】原来这条只做观察（`True`），因为当时 days_together_text 不传 view、
+    # 会把 person/group 的约定全列出来（P1-11）。修复后它默认走搭档视角，
+    # 所以这里可以断言「/days 的清单不得出现他人私聊/其它群的大日子」。
     check(
-        "P1 校验：/days 的大日子清单是否越过了归属闸门",
-        True,  # 这里只做观察，结论看输出
+        "P1 校验：/days 的大日子清单不得越界（只有 private 归属）",
+        not leak_days,
         "清单里出现了 person/group 归属的记忆" if leak_days else "只有 private",
     )
 
@@ -203,13 +241,11 @@ def main() -> int:
         all("面试" not in o.title for o in occ_group),
         f"group={[o.title for o in occ_group]}",
     )
-    if any("面试" in o.title for o in occ_group):
-        failures += 1
 
     print()
-    print(f"无 view 路径探针失败计数：{failures}")
+    print("无 view 路径探针：全部断言均为「修复后的正确行为」，任一 FAIL 即失败")
     print(f"（临时数据根：{TMPROOT}）")
-    return 1 if failures else 0
+    return 1 if FAILURES else 0
 
 
 if __name__ == "__main__":

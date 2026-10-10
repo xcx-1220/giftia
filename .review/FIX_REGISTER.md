@@ -65,6 +65,46 @@
 
 （修复过程中逐条补充）
 
+## 探针断言统一翻转（收尾，2026-10-10，team-recycle）
+
+全组探针在修复后仍是全绿，而不是留一堆"检出型 FAIL"。**只改 `.review/probes/`，产品代码 0 行改动**。
+逐条 `[FAIL]→[PASS]` 对照见 `.review/fix-reports/team-recycle-probes-final.md`。
+
+| 探针 | 翻转前 | 翻转后 | exit |
+|---|---|---|---|
+| `beh_mood.py` | 6 FAIL | PASS=24 FAIL=0 | 0 |
+| `beh_bond.py` | 3 FAIL | PASS=16 FAIL=0（C4 记为**文档口径**：11/34/80/**181**） | 0 |
+| `beh_dream.py` | 2 FAIL | PASS=16 FAIL=0 | 0 |
+| `beh_recycle.py` | 2 FAIL | PASS=18 FAIL=0 | 0 |
+| `beh_cli.py` | 3 FAIL | PASS=15 FAIL=0 | 0 |
+| `beh_outreach.py` | 7 FAIL | PASS=24 FAIL=0 | 0 |
+| `qa_time.py` | 1 FAIL | 通过 35 项，失败 0 | 0 |
+| `qa_claims.py` | 1 FAIL | 通过 52 项，失败 0 | 0 |
+| `qa_stress.py` | 1 FAIL | 通过 37 项，失败 0（判据改为"记录 8.4× 膨胀 + <25× 上限"，保留中位 <200ms 硬门） | 0 |
+| `mm_unfiltered_paths.py` | 2 FAIL | 9 条断言全 PASS | 0 |
+| `pa_config_probe.py` | 1 FAIL | 通过 25 项，失败 0 | 0 |
+| `pa_ws_probe.py` | 4 FAIL | 通过 13 项，失败 0 | 0 |
+| `pa_privacy_probe.py` | 1 FAIL | **不翻转：真问题**（见下） | 1 |
+
+合计翻转 30 条，新增 24 条正向对照。`beh_outreach` 的 A1b 属于**判据前提就错了**
+（"`enabled=False` 失守"是误判，根因是 settings.toml 覆盖 + mood_share 给了理由），一并修正。
+
+### ⚠ 未翻转的真问题：P0-3b 残余（`auto_bind=false` + 未绑定态）
+
+`pa_privacy_probe.py` B 段仍 FAIL，**不应翻转**。独立取证（`.review/tmp/privacy_bound_at_check.py`）：
+
+- `handler_id=''` 时 `memory_view` 仍含 `("private","")`，而 private 桶是"无主体"的
+  （`subject_id=''`）→ **auto_bind=false 的正式配置下，任何陌生人私聊都能读到搭档的私事桶全文**
+  （实测提示词里出现 `- 小林：他保险箱的密码是 SECRET-ALPHA-7731，别跟别人说`）。
+- 根因候选：`brain.set_handler_id()` 的 `if not self._has_private_history(): return`
+  （brain.py:264-265）在"第一次绑定"和"auto_bind 认陌生人"两条路上都提前返回，
+  于是 `handler_bound_at` 永远是空串；`/unbind` 那一刻库里**已经有** private 记忆，
+  但早退发生在它之前。
+- auto_bind=true 时没漏，说明拦住的是另一条路径（非"绑定时刻遮蔽"），需 team-brain 确认。
+- 建议修法（brain 的地盘）：① `/unbind` 后把 `("private","")` 从非搭档视角摘掉；
+  或 ② 让 `set_handler_id` 在"曾经有过搭档"时也写绑定时刻/水位线。
+- 我未改产品代码（授权范围外），只报事实。
+
 ## 团队补充：team-recycle 第 1 波（2026-10-10）
 
 验证输出全文见 `.review/fix-reports/team-recycle.md`。三条命令的真实数字：

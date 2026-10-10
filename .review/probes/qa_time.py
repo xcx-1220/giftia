@@ -185,11 +185,19 @@ brain_c.clock.advance(24.0)
 brain_c.handle("今天怎么样", "u_owner", scene="c2c")
 C.info("当天（大日子正日）last_occasions = "
        + str([(o.kind, o.title) for o in brain_c.last_occasions]))
-C.check("大日子只提醒一次：前一天说过 → 当天不重复（token 已记账）",
-        not any(o.kind == "big_day" for o in brain_c.last_occasions),
+# 【期望为何变了】原来断言「前一天说过 → 当天不重复」；那是 P2 的缺陷：
+# 去重 token 只有 id+event_date，于是"明天要考驾照"提过一次之后，
+# **正日子当天一句话都没有**（qa-verifier / behavior-checker 都报过）。
+# 修复后 token = id+event_date+今天 → 前一天（"明天：…"）与当天（"今天：…"）各提一次。
+C.check("大日子正日子当天会再提一次（措辞从「明天」变「今天」；token 带上提醒日）",
+        any(o.kind == "big_day" and str(o.title).startswith("今天")
+            for o in brain_c.last_occasions),
         f"last_occasions={[(o.kind, o.title) for o in brain_c.last_occasions]}")
 brain_c.clock.advance(24.0)
 brain_c.handle("今天怎么样", "u_owner", scene="c2c")
+C.check("正日子过后不再重复提醒 big_day（窗口只看 lookahead，过去的不再提）",
+        not any(o.kind == "big_day" for o in brain_c.last_occasions),
+        f"last_occasions={[(o.kind, o.title) for o in brain_c.last_occasions]}")
 C.check("★ 事后第 1 天回访（follow_up back=1）",
         any(o.kind == "follow_up" for o in brain_c.last_occasions),
         str([(o.kind, o.title) for o in brain_c.last_occasions]))

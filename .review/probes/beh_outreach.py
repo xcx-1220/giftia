@@ -71,9 +71,21 @@ def main() -> int:
     off_forced = off_brain.outreach_plan(force=True)     # force=True
     print(f"    enabled=False 的新 brain（同一个库） + force=False → {off_plan}（应为 None）")
     print(f"    enabled=False + force=True  → {off_forced.reason if off_forced else None}"
-          f"（/outreach 预览用的就是这条）")
-    check("A1b enabled 开关本身没有失守：force=False 时返回 None，force=True 才给预览",
-          off_plan is None and off_forced is not None)
+          f"（/outreach 预览用的就是这条；没有可说的理由时同样是 None）")
+    check("A1b enabled=False 时开关没有失守：force=False / force=True 都不会产出计划",
+          off_plan is None and off_forced is None)
+    # 正向对照：开关打开、且有新鲜理由时，force=True 的预览路径照常工作
+    on_prev = dataclasses.replace(base, outreach=dataclasses.replace(
+        base.outreach, enabled=True, idle_days=3))
+    prev_brain = Giftia(on_prev, llm=MockLLM(on_prev.model))
+    prev_brain.handle("在吗")
+    prev_brain.force_mood("low")
+    prev_brain.clock.advance(7)
+    prev_preview = prev_brain.outreach_plan(force=True)
+    print(f"    正向对照：enabled=True + 新鲜心情 + 静置 7h → force=True 预览 = "
+          f"{prev_preview.reason if prev_preview else None}")
+    check("A1c 正向对照：force=True 的预览路径照常工作（不是把预览关掉）",
+          prev_preview is not None, prev_preview.reason if prev_preview else "None")
 
     on = dataclasses.replace(base, outreach=dataclasses.replace(
         base.outreach, enabled=True, idle_days=3))
@@ -114,7 +126,7 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("B. 过期的心情仍被当作「她今天心情X」拿去主动分享")
+    print("B. 过期的心情不再被当作「她今天心情X」拿去主动分享（P1-16 已修）")
     print("=" * 78)
     sb = with_outreach("outreach-b", enabled=True, idle_days=3)
     stale = Giftia(sb, llm=MockLLM(sb.model))
@@ -125,16 +137,30 @@ def main() -> int:
     show_mood(stale, "5 天之后")
     m = stale.current_mood()
     now_iso = stale.clock.now().isoformat(timespec="seconds")
-    check("B1 心情早已过期（duration_hours=10，now 超过 until 120 小时）",
-          bool(m.until) and m.until < now_iso, f"until={m.until} now={now_iso}")
+    print("    【期望为何变了】B1/B2 原来记录的是 P1-16 的缺陷：")
+    print("    · current() 完全不看 until，5 天后仍返回旧心情（state 里那份值没被清）；")
+    print("    · outreach 于是天天拿「她今天心情X」当理由，把稀缺额度烧在同一个旧心情上。")
+    print("    修复后 current() 对软心情过期即回落 calm(source=expired)，mood_share 不再被触发。")
+    check("B1 过期后 current() 回落 calm（source=expired），不再对外报那个陈旧心情",
+          m.key == "calm" and m.source == "expired", f"{m.key}/{m.source}")
     pb = stale.outreach_plan(force=True)
-    check("B2 过期的心情依然触发 mood_share，标题仍是「她今天心情…」",
-          pb is not None and pb.reason == "mood_share" and "今天" in pb.title,
+    check("B2 过期心情不再触发 mood_share（落到别的理由或 None，标题也不是「她今天心情…」）",
+          pb is None or (pb.reason != "mood_share" and "今天心情" not in pb.title),
           f"reason={pb.reason if pb else None} title={pb.title if pb else ''}")
+    # 正向对照：心情新鲜时 mood_share 仍然会被用上
+    fresh_b = with_outreach("outreach-b2", enabled=True, idle_days=3)
+    fb2 = Giftia(fresh_b, llm=MockLLM(fresh_b.model))
+    fb2.handle("在吗")
+    fb2.force_mood("low")
+    fb2.clock.advance(7)
+    pf = fb2.outreach_plan(force=True)
+    check("B2b 正向对照：心情**新鲜**时 mood_share 仍然会被用上（不是把这条路关掉）",
+          pf is not None and pf.reason == "mood_share",
+          pf.reason if pf else "None")
 
     print()
     print("=" * 78)
-    print("C. mood_share 吃额度：4 条/30 天的额度花光后，missing_you 永远轮不到")
+    print("C. 额度账本：共用一份、发完就挡住（旧断言记录的「心情分享吃光额度」已修）")
     print("=" * 78)
     cy = with_outreach("outreach-c", 2000.0, enabled=True, idle_days=3,
                        max_per_30_days=4, max_per_day=3, min_gap_hours=6, target="owner")
@@ -159,9 +185,16 @@ def main() -> int:
             reasons.append(r)
         c.clock.advance(24)
     used, left, _ = quota_state(c.settings, c.store, c.clock.now())
-    check("C1 mood_share 与 missing_you/dream/milestone 共用同一份 30 天额度",
-          reasons.count("mood_share") >= 1 and used >= 1,
-          f"8 天理由序列={reasons} used={used}")
+    print(f"    8 天理由序列={reasons}，账本 used={used}")
+    print("    【期望为何变了】C1/C2/C3 原来记录的是 P1-16/P1-17 的缺陷：")
+    print("    mood_share 用陈旧心情当理由、与 missing_you/milestone 抢同一份稀缺额度，")
+    print("    并把它吃光（30 条全是 mood_share）。修复后陈旧心情不再参与，")
+    print("    额度按 max_per_30_days 正常封顶、发完就挡住。")
+    check("C1 额度共用且陈旧心情不再占额度（序列里没有 mood_share，used 不超过上限）",
+          "mood_share" not in reasons and 0 < used <= ctx.max_per_30_days,
+          f"8 天理由序列={reasons} used={used}/{ctx.max_per_30_days}")
+    check("C1b 正向对照：额度账本真的在记（used>0，且每种理由都走同一个账本）",
+          used >= 2, f"used={used}")
 
     c.clock.advance(24 * 15)          # 再闲 15 天（总共 23 天没说话）
     print("\n    再闲 15 天（共 23 天没说话）后：")
@@ -171,9 +204,9 @@ def main() -> int:
     used_l, left_l, nxt = quota_state(c.settings, c.store, c.clock.now())
     print(f"      outreach_plan -> reason={plan_late.reason if plan_late else None} "
           f"can_send={ok_late} used={used_l} left={left_l}")
-    check("C2 额度被心情分享花光后，即使真的「太久没见」也一条都发不出去",
-          plan_late is not None and plan_late.reason == "mood_share" and not ok_late,
-          f"reason={plan_late.reason if plan_late else None} can_send={ok_late} left={left_l}")
+    check("C2 额度用光后 can_send=False（稀缺额度真的封顶，不会超发）",
+          used_l >= ctx.max_per_30_days and left_l == 0 and not ok_late,
+          f"used={used_l}/{ctx.max_per_30_days} left={left_l} can_send={ok_late}")
 
     # 出厂配置（settings.toml: max_per_30_days=60, max_per_day=3）下连跑 30 天
     c3 = Giftia(with_outreach("outreach-c3", 4000.0, enabled=True, idle_days=2,
@@ -194,8 +227,9 @@ def main() -> int:
     used3, left3, _ = quota_state(c3.settings, c3.store, c3.clock.now())
     print(f"\n    出厂额度 60/30 天、日上限 3：30 天里理由序列 = "
           f"{ {r: seq.count(r) for r in set(seq)} }，真发出 {sent_n} 条，used={used3} left={left3}")
-    check("C3 出厂配置下心情分享会吃掉一半的 30 天额度（30 条全是 mood_share）",
-          sent_n == 30 and used3 >= 29, f"发出 {sent_n}，used={used3}")
+    check("C3 出厂配置下 30 天不会超发（used ≤ 60，且不再出现 30 条全是 mood_share）",
+          used3 <= 60 and seq.count("mood_share") <= 1 and sent_n <= 30,
+          f"发出 {sent_n}，used={used3}，mood_share={seq.count('mood_share')}")
 
     print()
     print("=" * 78)
@@ -247,7 +281,7 @@ def main() -> int:
           f"min_gap_hours={both_s.outreach.min_gap_hours}，"
           f"next_ok={quota_state(both_s, dbrain.store, dbrain.clock.now())[2]}")
 
-    print("\n    —— use_wakeup=true 时额度并没有收紧（官方：30 天 4 条）——")
+    print("\n    —— use_wakeup=true 时额度收紧到官方 4 条/30 天（P1-17 已修）——")
     wk = with_outreach("outreach-d2", enabled=True, idle_days=2, target="owner",
                        use_wakeup=True)   # max_per_30_days 保持 shipped 的 60
     wbrain = Giftia(wk, llm=MockLLM(wk.model))
@@ -255,12 +289,18 @@ def main() -> int:
     for i in range(10):
         record_sent(wbrain.store, wnow + timedelta(days=i))
     wused, wleft, _ = quota_state(wk, wbrain.store, wnow + timedelta(days=10))
+    wcan = can_send(wk, wbrain.store, wnow + timedelta(days=10, hours=3))
     print(f"    use_wakeup={wk.outreach.use_wakeup} max_per_30_days={wk.outreach.max_per_30_days} "
-          f"→ 30 天内已发 {wused} 条，还剩 {wleft}，can_send="
-          f"{can_send(wk, wbrain.store, wnow + timedelta(days=10, hours=3))}")
-    check("D5 use_wakeup=true 时官方 4 条/30 天的额度没有被本地账本约束（会超发）",
-          can_send(wk, wbrain.store, wnow + timedelta(days=10, hours=3)) and wused > 4,
-          f"已发 {wused} 条仍 can_send=True")
+          f"→ 30 天内已发 {wused} 条，还剩 {wleft}，can_send={wcan}")
+    print("    【期望为何变了】D5 原来记录的是 P1-17 的缺陷：use_wakeup=true 时本地账本")
+    print("    仍按 max_per_30_days=60 算，官方硬限 4 条/30 天却还显示「有额度」（会超发）。")
+    print("    修复后 effective_max_per_30_days() 取 min(60, wakeup_max_per_30_days=4)。")
+    check("D5 use_wakeup=true 时额度收紧到官方 4 条/30 天：已发 10 条 → left=0、can_send=False",
+          wused >= 4 and wleft == 0 and not wcan, f"已发 {wused} 条，left={wleft}，can_send={wcan}")
+    check("D5b 正向对照：use_wakeup=false 时仍按 max_per_30_days=60 算（没有把普通路径一起收紧）",
+          quota_state(with_outreach("outreach-d3", enabled=True, use_wakeup=False),
+                      wbrain.store, wnow + timedelta(days=10))[1] == 60 - wused,
+          f"left={quota_state(with_outreach('outreach-d4', enabled=True, use_wakeup=False), wbrain.store, wnow + timedelta(days=10))[1]}")
 
     print()
     print("=" * 78)

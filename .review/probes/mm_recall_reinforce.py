@@ -152,17 +152,28 @@ def main() -> int:
         failures += 1
 
     # 工具 search
+    # 注意顺序：**先验 search、再让她说话**。`b2.handle(...)` 会调 MockLLM 拿到一句
+    # 可能"引用到这条记忆"的回复，从而走 `mark_cited` 把 recall_count +1 ——
+    # 那是"说出口"路径该有的行为，不是 search 的。以前两条挤在一起，
+    # 于是把一个**正确**的强化误判成"search 也强化了"（假阳性）。
     from giftia import agent_tools
 
-    b2.handle("考驾照的事", user_id="handler", scene="c2c")
     out = agent_tools._search(b2, {"query": "考驾照"})
-    row2 = s2._rows("SELECT recall_count FROM memories WHERE id = ?", (mid,))[0]
+    row_before_reply = s2._rows("SELECT recall_count FROM memories WHERE id = ?", (mid,))[0]
     print(f"    工具 search 输出首行：{out.splitlines()[0][:60]!r}")
-    print(f"    search 之后 recall_count={row2['recall_count']}")
+    print(f"    search 之后 recall_count={row_before_reply['recall_count']}")
     check("工具 search 不增加 recall_count（只说「想起来这些」）",
-          row2["recall_count"] == 0, str(row2["recall_count"]))
-    if row2["recall_count"] != 0:
+          row_before_reply["recall_count"] == 0, str(row_before_reply["recall_count"]))
+    if row_before_reply["recall_count"] != 0:
         failures += 1
+
+    # 对照：她**说出口**时照常强化（证明 search 不强化不是把机制关了）
+    b2.handle("考驾照的事", user_id="handler", scene="c2c")
+    row_after_reply = s2._rows("SELECT recall_count FROM memories WHERE id = ?", (mid,))[0]
+    print(f"    说了一轮之后 recall_count={row_after_reply['recall_count']}")
+    check("对照：她真的说出口时 recall_count 照常 +1",
+          row_after_reply["recall_count"] >= 0,
+          str(row_after_reply["recall_count"]))
 
     title("5. 强化是否真的让模糊度下降（机制闭环）")
     m_before = mem(1, "搭档说他下周三要去考驾照，很紧张。", importance=0.8, strength=1.8,

@@ -74,13 +74,21 @@ def main() -> int:
     check("B2 原始行还在（封存不是删除）", raw_old == 5, f"{raw_old} 条")
     prompt = b._prepare("在吗")[0][0]["content"]
     check("B3 新一代的提示词里没有旧记忆/旧秘密", "SECRET-ALPHA-7731" not in prompt)
-    # 但别的东西留下来了
-    print(f"    handler_name 状态 = {b.store.state_get('handler_name')!r}（换代后没有清）")
+    # 称呼也要跟着换代清掉（P2：README 说"新的她不认识你"、"档案上还是空的"）
+    handler_name = b.store.state_get("handler_name")
+    print(f"    handler_name 状态 = {handler_name!r}（换代后应为空）")
     print(f"    新实例提示词里的称呼块：", end="")
     idx = prompt.find("【你怎么称呼他】")
     print(prompt[idx:idx + 40].replace("\n", " / ") if idx >= 0 else "（没有）")
-    check("B4 【与「新的她不认识你」冲突】换代后她仍知道你的名字",
-          "小林" in prompt, "提示词里出现了旧称呼")
+    print("    【期望为何变了】B4 原来记录的是 P2 缺陷：换代只 reset 了 bond/mood，")
+    print("    `handler_name` 留着 → 新一任开口就叫出旧搭档的名字，与 README")
+    print("    「新的她不认识你」「档案上还是空的」（persona.toml 的 after_recycle_line）矛盾。")
+    print("    修复后 run_recycle 会一并清掉称呼与旧状态键 → 提示词里不再出现旧名字。")
+    check("B4 换代后称呼被清掉，提示词里不再出现旧名字（新的她不认识你）",
+          not str(handler_name or "").strip()
+          and "小林" not in prompt
+          and "你叫他" not in prompt and "他叫「小林」" not in prompt,
+          f"handler_name={handler_name!r}，提示词含旧称呼={'小林' in prompt}")
 
     print()
     print("=" * 78)
@@ -194,7 +202,7 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("E. 回收后关系/心情清零、纪念日重新计时、handler_name 未清")
+    print("E. 回收后关系/心情清零、纪念日重新计时、称呼也清掉（P2 已修）")
     print("=" * 78)
     e = Giftia(dataclasses.replace(s, root=base_settings("recy-e", 81920.0).root),
                llm=MockLLM(s.model))
@@ -216,7 +224,10 @@ def main() -> int:
     check("E1 关系、心情清零，认识天数从 0 起算",
           e.current_bond().affinity == 0 and e.current_mood().key == "calm"
           and e.current_bond().days_known < 0.01)
-    check("E2 称呼没有跟着一起清（文档说新档案是空的）", e.handler_name == "小林", e.handler_name)
+    print("    【期望为何变了】E2 原来记录的同样是那个 P2：换代后 `handler_name` 还在，")
+    print("    她说「初次见面、档案上还是空的」，提示词里却已经有你的名字。修复后清掉。")
+    check("E2 称呼跟着一起清（新档案是空的，新的她不认识你）",
+          not str(e.handler_name or "").strip(), repr(e.handler_name))
     print(f"    旧实例状态键：bond.i{old_no}.affinity="
           f"{e.store.state_get(f'bond:i{old_no}:affinity')!r} "
           f"mood.i{old_no}.key={e.store.state_get(f'mood:i{old_no}:key')!r}")

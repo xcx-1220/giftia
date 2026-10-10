@@ -53,21 +53,32 @@ def main() -> int:
          mem(3, "x", created_ts=ten_days_ago, happened_ts=ten_days_ago,
              last_recalled_at=just_now)),
     ]
+    retentions = []
     for label, m in cases:
-        base = m.get("last_recalled_at") or m.get("created_ts") or m.get("happened_ts")
+        base = (
+            m.get("last_recalled_at") or m.get("happened_ts") or m.get("created_ts")
+        )
         r = retention_of(m, cfg, NOW)
+        retentions.append(r)
         b = effective_blur(m, stage(settings, "fading"), cfg, NOW)
         print(f"    {label}")
         print(f"      base={base!r} retention={r:.4f} fading_blur={b:.4f} "
               f"human_age(happened)={human_age(m['happened_ts'], NOW)!r}")
+    # 期望（修复后）：Δt 的起点是 **happened_ts**（没有 last_recalled_at 时），
+    # 所以"10 天前发生、刚刚才整理出来"的那条 retention 明显小于 1，
+    # 与提示词里给她看的 human_age(happened)=「10 天前」一致。
+    # 原断言是"固定 FAIL"，记录的是 created_ts 当起点的缺陷（P3-4）。
+    stale_ok = retentions[0] < 0.9
+    fresh_ok = retentions[2] > 0.9   # 有 last_recalled_at（刚说过）→ 仍然接近 1
     check(
-        "P3-4 记忆的'清晰度'按 created_ts 算，而不是事情发生的 happened_ts",
-        False,
-        "10 天前发生、刚刚才被整理出来的事，retention≈1（=刚说过），不会随时间变模糊",
+        "P3-4 清晰度按 happened_ts 起算（不是整理时刻），与提示词里的相对时间一致",
+        stale_ok and fresh_ok,
+        f"retention 序列={[round(x, 4) for x in retentions]}（第 1 条应明显 <1、第 3 条应 ≈1）",
     )
-    failures += 1
-    print("    影响：攒够 6 条才整理 → 一段对话可能在几小时后才落库，"
-          "落库那一刻 retention 归 1；而人在提示词里看到的相对时间是 happened_ts。")
+    if not (stale_ok and fresh_ok):
+        failures += 1
+    print("    说明：攒够阈值才整理 → 一段对话可能几小时后才落库；"
+          "现在落库不再把'久远的事'刷成'刚说过'，而'刚被说出口'的那条照旧最清晰。")
 
     title("2. strength 的取值范围与 S 的语义")
     for strength, recalls in ((1.0, 0), (1.8, 0), (1.8, 3), (0.0, 0), (-5.0, 0)):

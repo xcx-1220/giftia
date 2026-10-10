@@ -143,9 +143,21 @@ def main() -> int:
     told2 = [int(x.get("told") or 0) for x in d.store.recent_dreams(1)]
     print(f"    同一个梦 #{dd.id} 还在，latest_untold="
           f"{'有' if latest_untold(s, d.store, d.clock, 1) else '无'}，told={told2}")
-    check("D2 【重复】同一天里她把同一个梦又讲了一遍（适配器路径不标记 told）",
-          p2 is not None and p2.reason == "dream" and told2 == [0],
-          f"第二次 reason={p2.reason if p2 else None}，told={told2}")
+    print("    【期望为何变了】D2 原来记录的是 P1-19 的缺陷：适配器路径（record=False +")
+    print("    note_outreach_sent）**不标记 told**，于是同一天里她把同一个梦又讲了一遍。")
+    print("    修复后 note_outreach_sent 会把刚讲的梦标记掉 → 第二次不再以 dream 为理由。")
+    check("D2 适配器路径实发后就标记 told=[1]，同一天不会把同一个梦再讲一遍",
+          told == [1] and told2 == [1] and (p2 is None or p2.reason != "dream"),
+          f"told={told}→{told2}，第二次 reason={p2.reason if p2 else None}")
+    # 正向对照：梦还得能讲出来——再攒一场新梦，它仍然会被当成主动理由
+    d.clock.advance(s.dream.min_hours_between + 1)
+    dd2 = make_dream(s, d.store, d.clock, d.llm, 1, view=[("private", "")])
+    p3 = d.outreach_plan(force=True)
+    print(f"    正向对照：再做一场新梦 #{dd2.id if dd2 else None} → outreach_plan().reason = "
+          f"{p3.reason if p3 else None}")
+    check("D2b 正向对照：新的梦仍然会被讲出来（不是把讲梦这条路关掉）",
+          dd2 is not None and p3 is not None and p3.reason == "dream",
+          p3.reason if p3 else "None")
 
     # 对照：CLI / record=True 的路径会标记
     e = Giftia(dataclasses.replace(s, root=base_settings("dream-e", 81920.0).root),
@@ -174,9 +186,23 @@ def main() -> int:
     fd = make_dream(s0, f.store, f.clock, f.llm, 1, view=[("private", "")])
     src = f.store.recent_dreams(1)[0]["source_ids"] if fd else ""
     n_src = len([x for x in str(src).split(",") if x])
-    print(f"    failures: fragments=0 → 梦的 source_ids 条数 = {n_src}（记忆共 "
+    print(f"    fragments=0 → 梦的 source_ids 条数 = {n_src}（记忆共 "
           f"{f.store.count_memories(1)} 条）")
-    check("E1 fragments=0 时 memories[-0:] 拿到的是全部记忆（不是 0 条）", n_src == 8, f"{n_src} 条")
+    print("    【期望为何变了】E1 原来记录的是切片陷阱：`memories[-0:]` 等价于 `memories[0:]`，")
+    print("    会把**全部** 8 条记忆当素材（fragments=0 的本意是「至少 1 条」）。")
+    print("    修复后取 `max(1, fragments)` 条 → source_ids 恰好 1 条。")
+    check("E1 fragments=0 时只取 1 条素材（不再是 memories[-0:] 拿全部 8 条）",
+          n_src == 1, f"{n_src} 条")
+    # 正向对照：fragments 配置真的生效，不是恒取 1 条
+    f0 = Giftia(dataclasses.replace(s, root=base_settings("dream-f3", 81920.0).root,
+                                    dream=dataclasses.replace(s.dream, fragments=3)),
+                llm=DreamSpy(s.model))
+    seed_memories(f0, 8)
+    make_dream(f0.settings, f0.store, f0.clock, f0.llm, 1, view=[("private", "")])
+    src3 = f0.store.recent_dreams(1)[0]["source_ids"]
+    n3 = len([x for x in str(src3).split(",") if x])
+    print(f"    正向对照：fragments=3 → source_ids 条数 = {n3}")
+    check("E1b 正向对照：fragments=3 时取材 3 条（配置真的生效）", n3 == 3, f"{n3} 条")
 
     return report("beh_dream")
 

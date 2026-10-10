@@ -1,9 +1,9 @@
 $ python .review/run_tests.py tools/selftest.py
-exit_code=0  elapsed=15.0s
+exit_code=0  elapsed=16.6s
 ----------------------------------------------------------------------
 STDOUT
 ----------------------------------------------------------------------
-临时数据目录：D:\ai chatbot\.review\tmp\runtime\giftia-selftest-_kuydw4x
+临时数据目录：D:\ai chatbot\.review\tmp\runtime\giftia-selftest-195buyqz
 
 1. 出厂状态（寿命 100 小时）
   [PASS] 实例编号为 #1

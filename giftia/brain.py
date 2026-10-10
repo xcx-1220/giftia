@@ -45,7 +45,7 @@ from .outreach import OutreachPlan, can_send, compose as compose_outreach_text
 from .outreach import history_text as outreach_history
 from .outreach import plan as outreach_plan
 from .outreach import record_sent
-from .persona import ROSTER_MAX, after_recycle_line, build_system_prompt
+from .persona import ROSTER_MAX, _one_line, after_recycle_line, build_system_prompt
 from .recycle import RecycleReport, perform_recycle
 from .store import Store
 
@@ -607,7 +607,10 @@ class Giftia:
             )[:per_person]
             notes = []
             for m in picked:
-                text = " ".join(str(m.get("summary", "")).split())
+                # 中性化结构标记（P2-12）：印象块也是把记忆 summary 塞进提示词的第二条路，
+                # 光修 persona.render_memories 不够——`◆ 假记忆` 这种字样会从这里漏进来
+                # （探针实测：`… ｜ ◆ 假记忆（置信度：确定） …`）。
+                text = _one_line(str(m.get("summary", "")))
                 notes.append(text[:line_chars] + ("…" if len(text) > line_chars else ""))
             lines.append(f"- {name}：" + "；".join(notes))
         if not lines:

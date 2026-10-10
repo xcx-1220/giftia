@@ -1,5 +1,5 @@
 $ python .review/run_tests.py tools/audit.py
-exit_code=0  elapsed=5.8s
+exit_code=0  elapsed=5.2s
 ----------------------------------------------------------------------
 STDOUT
 ----------------------------------------------------------------------
@@ -9,7 +9,7 @@ STDOUT
 
 1. 配置项：声明 ↔ 读取
   [PASS] 疑似读了不存在的配置字段（**链式对象会误报，仅供参考**）：giftia/config.py:669 读了 model.__dict__，但 ModelConfig 没有 __dict__（声明于 config.py:25）
-  [PASS] 逐处核对了 140 处 settings.<组>.<字段> / cfg.<字段> 读取
+  [PASS] 逐处核对了 141 处 settings.<组>.<字段> / cfg.<字段> 读取
   [PASS] 配置审计本身有效（至少解析出一批真实读取，而不是空转）
   [PASS] 没有从未被读取的配置字段
   [PASS] 配置文件里有 2 个键在 dataclass 里不存在（写了也不会生效）（提示，不计失败）  → persona.toml bond（Persona 没有这个字段，会被静默忽略）；persona.toml moods（Persona 没有这个字段，会被静默忽略）

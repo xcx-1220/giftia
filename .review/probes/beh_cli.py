@@ -140,12 +140,33 @@ def main() -> int:
     except BaseException as exc:
         err2 = exc
     print(f"    重启后 run_cli(banner=True) → {type(err2).__name__ if err2 else '正常'}: {err2}")
-    check("B1 /time nan|inf 会把非有限值写进 meta.virtual_offset_hours",
-          offset in ("nan", "inf", "-inf"), f"{offset!r}")
-    check("B2 写坏之后重启即崩（连 /time reset 都打不进去，时钟每调 now() 都抛）",
-          err2 is not None, f"{type(err2).__name__ if err2 else 'None'}")
-    print(f"    说明：Clock.__init__ 用 float(raw) 读回 'nan'，Clock.now() 里 "
-          f"datetime.now()+timedelta(hours=nan) → ValueError")
+    print("    【期望为何变了】B1/B2 原来记录的是 P2 的缺陷：")
+    print("    · `/time nan|inf` 会把非有限值写进 meta.virtual_offset_hours；")
+    print("    · 重启后 `Clock.__init__` 用 float('nan') 读回，`now()` 里")
+    print("      `datetime.now()+timedelta(hours=nan)` → ValueError，**连 /time reset 都打不进去**。")
+    print("    修复后非有限值被当场拦下（上面的「★ /time nan 被拦下」），")
+    print("    落库的 offset 是有限数、重启后 banner 正常打出 → 期望翻转为「不写坏、不崩」。")
+    offset_f = None
+    try:
+        offset_f = float(str(offset or 0) or 0)
+    except (TypeError, ValueError):
+        offset_f = None
+    check("B1 非有限值不会写进 meta.virtual_offset_hours（落库的是有限数）",
+          offset_f is not None and offset_f == offset_f and abs(offset_f) != float("inf"),
+          f"{offset!r}")
+    check("B2 重启后能正常进 CLI（banner 里就会调 clock.now()，不再崩）",
+          err2 is None, f"{type(err2).__name__ if err2 else 'None'}")
+    # 正向对照：合法的 /time 仍然生效（不是把 /time 关掉）
+    s_ok = base_settings("cli-time-ok", 500.0)
+    b_ok = ProbeBrain(s_ok, llm=MockLLM(s_ok.model))
+    with contextlib.redirect_stdout(io.StringIO()):
+        _handle_command(b_ok, "/time +6")
+    ok_offset = b_ok.store.meta_get("virtual_offset_hours")
+    print(f"    正向对照：/time +6 → 落库 offset={ok_offset!r}")
+    check("B1b 正向对照：合法的 /time +6 照常写库（不是把 /time 关掉）",
+          str(ok_offset) not in ("", "None") and abs(float(ok_offset) - 6.0) < 1e-9,
+          f"{ok_offset!r}")
+    b_ok.store.close()
 
     print()
     print("=" * 78)
@@ -190,17 +211,21 @@ def main() -> int:
     check("C3 聊天路径的异常被 run_cli 兜住（不会退出，后面的指令还接着跑）",
           err3 is None and "内部错误" in out3 and "实例编号" in out3)
 
-    # 对照：指令路径没有任何兜底
+    # 对照：指令路径现在**也有**兜底（审查 P2 的第二半）
     class BoomCmdBrain(ProbeBrain):
         def status_text(self):
             raise RuntimeError("模拟指令内部错误")
 
     s3 = base_settings("cli-c3", 500.0)
     code4, out4, err4, brain4 = drive(s3, ["/status", "/quit"], brain_cls=BoomCmdBrain)
-    print(f"    指令里抛异常 → 异常={type(err4).__name__ if err4 else None}: {err4}"
-          f"（主循环直接结束，进程会带 traceback 退出）")
-    check("C4 指令路径没有 try/except，任何指令异常都会终止整个 CLI", err4 is not None,
-          type(err4).__name__ if err4 else "None")
+    print(f"    指令里抛异常 → 异常={type(err4).__name__ if err4 else None}: {err4}；"
+          f"输出含「内部错误」={'内部错误' in out4}；退出码={code4}")
+    print("    【期望为何变了】C4 原来记录的是 P2 缺陷：指令路径没有 try/except，")
+    print("    `/forget 99999999999999999999` 这类异常会把整个 CLI 进程带走。")
+    print("    修复后指令与聊天一样被兜住（cli.py:86-91 打印 [内部错误] 后继续循环），")
+    print("    所以期望翻转为「不崩、有提示、后面的指令照跑」。")
+    check("C4 指令路径的异常被兜住：不终止 CLI，打印 [内部错误]，后续指令照跑",
+          err4 is None and "内部错误" in out4, f"err={err4!r} out={out4[-120:]!r}")
 
     print()
     print("=" * 78)
@@ -242,9 +267,11 @@ def main() -> int:
         err4 = exc
     finally:
         builtins.input = old
-    print(f"    --reset（无 --yes）在非交互 shell 里 → {type(err4).__name__ if err4 else '正常'}: {err4}")
-    check("D4 --reset 无 --yes 时 EOF 直接抛未捕获异常（脚本里会 traceback）", err4 is not None,
-          type(err4).__name__ if err4 else "None")
+    print(f"    --reset（无 --yes）在非交互 shell 里 → {type(err4).__name__ if err4 else '正常退出（已取消）'}: {err4}")
+    # 期望（修复后）：EOFError 被当成"没人能回答确认"→ 取消并正常退出，
+    # 而不是把 traceback 打给用户。原断言记录的是未捕获 EOF 的缺陷（审查 P3）。
+    check("D4 --reset 无 --yes 时非交互环境优雅取消（不 traceback）",
+          err4 is None, type(err4).__name__ if err4 else "正常退出")
 
     # --lifespan-hours 负数
     st = isolated.lifespan.effective_hours(-5)

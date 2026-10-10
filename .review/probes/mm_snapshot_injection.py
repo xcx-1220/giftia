@@ -132,9 +132,10 @@ def main() -> int:
     for ln in injected_lines:
         print(f"      {ln[:110]!r}")
     check(
-        "P2-12 记忆内容里的提示词结构标记（◆/｜/换行）未被过滤 —— 注入面",
+        "P2-12 记忆内容里的结构标记（◆/｜/换行）不会伪造出新的列表项/段落",
         not injected_lines,
-        "记忆文本原样进了 system 提示词，且自带换行可以伪造新的列表项" if injected_lines else "未出现",
+        "记忆文本原样进了 system 提示词，且自带换行可以伪造新的列表项" if injected_lines else
+        "已中和（persona._one_line：换行折成空格、◆/｜/【】 换成无结构含义的字形）",
     )
     if injected_lines:
         failures += 1

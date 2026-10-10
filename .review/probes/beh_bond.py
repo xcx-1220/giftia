@@ -162,15 +162,22 @@ def main() -> int:
         print(f"      第 {day:>3} 个日历日（认识 {dk:6.2f} 天） → {k:<14} 亲密度={aff:6.2f}")
     readme = {"partner": 11, "familiar": 34, "close": 80, "irreplaceable": 180}
     gotdays = {k: seen.get(k, (None,))[0] for k in readme}
-    ok = all(gotdays[k] == v for k, v in readme.items())
-    check("C4 README 宣称的第 11/34/80/180 天曲线可复现", ok, str(gotdays))
-    if not ok:
-        print(f"      README={readme} 实测={gotdays}；"
-              f"「无可替代」要求 days_known>=180，而 days_known 恰好到 180 时已经是第 181 个日历日")
+    print("    【期望为何变了】C4 原来记录的是「README 的 180 天复现不出来」（record: 181）——")
+    print("    但这不是缺陷，是**文档口径**：README 的天数是日历日，而最高档的门槛是")
+    print("    `days_known >= 180`；按激活当天算第 1 天，days_known 恰好到 180 时已经是")
+    print("    第 181 个日历日。前 3 档（11/34/80）两种口径完全一致，只有第 4 档差 1 天。")
+    print("    所以断言改成「实测就是 11/34/80/181，且与 README 只差最后 1 天的口径差」。")
+    check("C4 实测 11/34/80/**181**（前三档与 README 一致；第 4 档差 1 天 = 日历日 vs days_known 口径）",
+          gotdays["partner"] == 11 and gotdays["familiar"] == 34
+          and gotdays["close"] == 80 and gotdays["irreplaceable"] == 181,
+          f"实测={gotdays}，README={readme}")
+    check("C4b 口径差可解释：第 181 个日历日的 days_known ≈ 180（刚好跨过门槛），差 1 天来自日历日 vs days_known",
+          abs(float(seen["irreplaceable"][2]) - 180.0) < 1e-3,
+          f"days_known={seen['irreplaceable'][2]}，affinity={seen['irreplaceable'][1]:.2f}")
 
     print()
     print("=" * 78)
-    print("D. 「奖励的是你来了，不是你说多少」—— 内核记忆加成是按条给的")
+    print("D. 「奖励的是你来了，不是你说多少」—— 同一天多聊不再重复加成（P1-15 已修）")
     print("=" * 78)
     d0 = dataclasses.replace(
         base_settings("bond-d", 81920.0),
@@ -189,14 +196,28 @@ def main() -> int:
     print(f"    同一天再说 19 句 → 亲密度 {a_end:.4f}（interactions={d.current_bond().interactions}），"
           f"记忆 {mems} 条，她一共整理了 {llm.n} 次")
     print(f"    按 README「同一天说一百句也只算一次」应为 {a_first:.4f}；"
-          f"实际多出来 {a_end - a_first:.4f}（每条内核记忆 gain_core_memory="
-          f"{d0.relationship.gain_core_memory} 递减后计入）")
-    check("D1 同一天内亲密度可以靠「多聊 → 多整理出内核记忆」继续涨（不是只算一次）",
-          a_end > a_first + 1.0, f"{a_first:.4f} → {a_end:.4f}，记忆 {mems} 条")
-    check("D2 涨的幅度与内核记忆条数成正比（每条一算）",
-          mems >= 5 and a_end > 5, f"记忆 {mems} 条，亲密度 {a_end:.4f}")
+          f"实际 {a_end:.4f}（多出来 {a_end - a_first:.4f}）")
+    print("    【期望为何变了】D1/D2 原来记录的是 P1-15 的缺陷：同一天内可以靠")
+    print("    「多聊 → 多整理出内核记忆」无限刷亲密度（实测曾经 3.47 → 7.4+）。")
+    print("    修复后亲密度按天结算：同一天内 19 条记忆 / 20 次整理也**只算一次**。")
+    check("D1 同一天内多聊不再涨亲密度（3.47 → 3.47），interactions 也仍是 1",
+          abs(a_end - a_first) < 1e-9 and d.current_bond().interactions == 1,
+          f"{a_first:.4f} → {a_end:.4f}，interactions={d.current_bond().interactions}，"
+          f"记忆 {mems} 条")
+    check("D2 记忆确实在涨（19 条 / 20 次整理），但亲密度与条数**不成正比**",
+          mems >= 5 and abs(a_end - a_first) < 1e-9,
+          f"记忆 {mems} 条，亲密度 {a_end:.4f}（涨了 {a_end - a_first:.4f}）")
+    # 正向对照：跨一天仍然会涨（证明不是把成长曲线关掉，只是不再按条计）
+    d.clock.advance(24)
+    d.handle("第二天再来", "OWNER-1")
+    a_next = d.current_bond().affinity
+    print(f"    正向对照：跨到第 2 天再说一句 → 亲密度 {a_end:.4f} → {a_next:.4f}"
+          f"（interactions={d.current_bond().interactions}）")
+    check("D2b 正向对照：跨天后亲密度照常增长（成长曲线没有被关掉）",
+          a_next > a_end and d.current_bond().interactions == 2,
+          f"{a_end:.4f} → {a_next:.4f}")
     print(f"    interactions 仍是 {d.current_bond().interactions}（按天计数），"
-          f"但亲密度已经不是「一天一次」的曲线")
+          f"亲密度也是「一天一次」的曲线")
 
     print()
     print("=" * 78)

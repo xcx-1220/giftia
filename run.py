@@ -58,7 +58,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.reset:
         if not args.yes:
-            answer = input(f"这会删除 {DATA_DIR} 下的全部记忆与档案，确定？(yes/N) ")
+            # 非交互环境（管道/CI/计划任务）里 `input()` 会抛 EOFError 并打出 traceback
+            # —— 那不是"删库失败"，只是"没人能回答确认"，当成取消处理就好（审查 P3）。
+            try:
+                answer = input(f"这会删除 {DATA_DIR} 下的全部记忆与档案，确定？(yes/N) ")
+            except EOFError:
+                print("没有可交互的终端，已取消（要跳过确认请加 --yes）。")
+                return 0
             if answer.strip().lower() not in ("y", "yes"):
                 print("已取消。")
                 return 0

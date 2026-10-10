@@ -101,7 +101,7 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("C. duration 过期逻辑：过期的心情不会消失，也不会回到平静")
+    print("C. duration 过期逻辑：过期的**软**心情对外回落成 calm（P1-16 已修）")
     print("=" * 78)
     e = base_settings("mood-c", 81920.0)
     eb = Giftia(e, llm=MockLLM(e.model))
@@ -113,25 +113,36 @@ def main() -> int:
     eb.clock.advance(11)                      # > duration_hours=10
     later = eb.clock.now()
     m1 = eb.current_mood()
-    print(f"    T0+11h now={sec(later)} current()={m1.key} until={m1.until} "
-          f"（until 已过 {11} 小时）")
-    check("C1 current() 无视 until：过期 11 小时仍返回 low（状态不会自己回落到 calm）",
-          m1.key == "low" and m1.until < sec(later), f"{m1.key} until={m1.until}")
+    print(f"    T0+11h now={sec(later)} current()={m1.key} until={m1.until} source={m1.source} "
+          f"（until 已过 11 小时）")
+    print("    【期望为何变了】C1/C2/C3 原来记录的是 P1-16 的**缺陷**：")
+    print("    current() 完全不看 until，旧心情永久留在 state 里，状态栏/提示词/主动计划")
+    print("    读到的都是「5 天前的心情」，于是她每天都能分享同一个旧心情、把稀缺额度烧光。")
+    print("    修复后的契约：**软心情过期 → 对外回落 calm（source='expired'）**；")
+    print("    只有 source=lifespan 的「不安」不被静默清掉（它压过一切，由 tick() 收尾）。")
+    check("C1 软心情过期 11 小时 → current() 报 calm（source=expired），不再返回陈旧 low",
+          m1.key == "calm" and m1.source == "expired", f"{m1.key}/{m1.source}")
+    check("C1b 正向对照：没过期时 current() 仍然给出真实心情（不是把心情功能关掉）",
+          m0.key == "low" and m0.source == "manual", f"{m0.key}/{m0.source}")
 
-    # 过期后重新掷骰：同一天内会掷出同一个 key
+    # 过期后重新掷骰：按日期确定性重掷，并把新的 until 写回 state
     m2 = eb.mood.tick(later, eb.status(), 1, last_user_text="在吗")
     print(f"    过期后 tick(中性) → {m2.key}（source={m2.source}）")
-    check("C2 「过期就回到平静」不成立：过期后是重新掷骰，且同一天会掷回同一个 key",
-          m2.key == m1.key and m2.source == "daily",
-          f"{m1.key} → {m2.key}（duration_hours={e.mood.duration_hours}，"
-          f"种子只含日期 {later.date()} 和实例号）")
+    again = eb.current_mood()
+    check("C2 过期后 tick() 按当天种子重掷并把新心情写回（不再无限保留旧值）",
+          m2.source == "daily" and again.key == m2.key
+          and again.source != "expired" and again.until != "",
+          f"{m1.key} → {m2.key}（source={m2.source}，写回后 {again.key}/{again.source}）")
+    mt3 = MoodTracker(eb.store, e)
+    check("C2b 重掷是确定性的：同一天同一实例再掷一次结果相同（种子 = 日期+实例号）",
+          mt3._roll(later, 1) == m2.key, f"_roll({later.date()}, 1)={mt3._roll(later, 1)} vs {m2.key}")
 
     eb.clock.advance(24 * 30)
     m3 = eb.current_mood()
     print(f"    再快进 30 天（期间没人说话）→ current() 仍={m3.key}，"
           f"until={m3.until}，now={sec(eb.clock.now())}")
-    check("C3 长期闲置时 current() 永远给出陈旧心情（主动联系/状态栏/提示词都用它）",
-          m3.key == "low", f"{m3.key}")
+    check("C3 长期闲置 30 天：current() 不会给出陈旧心情（仍是 calm/expired，不是 30 天前的 low）",
+          m3.key == "calm" and m3.source == "expired", f"{m3.key}/{m3.source}")
 
     print()
     print("=" * 78)
@@ -147,12 +158,21 @@ def main() -> int:
     ]
     for text, why in cases:
         print(f"    tone_of({text!r}) = {tone_of(text):+.2f}   （{why}）")
-    check("D1 「不开心」被判为中性（POSITIVE 的『开心』先命中，抵消 NEGATIVE 的『不开心』）",
-          tone_of("不开心") == 0.0, f"{tone_of('不开心')}")
-    check("D2 「我不累」被判为低落（NEGATIVE『累』命中，否定词无人处理）",
-          tone_of("我不累") < 0, f"{tone_of('我不累')}")
+    print("    【期望为何变了】D1/D2 原来记录的是 tone_of 的两个中文坑（P2）：")
+    print("    「不开心」被 POSITIVE 的『开心』先命中、与 NEGATIVE 对消成 0（她不会担心你）；")
+    print("    「我不累」被 NEGATIVE 的『累』命中（她会担心你）——而且「我不累」的否定根本没被处理。")
+    print("    修复后：命中位置紧邻的前一个字是否定字就**反向计分**（并排除「特别/分别」这类假否定）。")
+    check("D1 「不开心」判为负面（否认前缀反向计分后 = -1.0，她会担心你）",
+          tone_of("不开心") < 0, f"{tone_of('不开心')}")
+    check("D2 「我不累」判为非负面（否定词被处理，不再误判成低落）",
+          tone_of("我不累") > 0, f"{tone_of('我不累')}")
+    check("D2b 正向对照：真正的负面句仍然判成低落（不是把负面词都关掉）",
+          tone_of("今天真的好累") < 0 and tone_of("我快撑不住了") < 0,
+          f"累={tone_of('今天真的好累')} 撑不住={tone_of('我快撑不住了')}")
+    check("D2c 正向对照：假否定不被误伤（「特别难过」里的『别』不是否定）",
+          tone_of("特别难过") < 0, f"{tone_of('特别难过')}")
     print(f"    阈值 tone_threshold={s.mood.tone_threshold}："
-          f"『不开心』= {tone_of('不开心')} 达不到 → 她不会担心；『我不累』= {tone_of('我不累')} → 她会担心")
+          f"『不开心』= {tone_of('不开心')} 达到 → 她会担心；『我不累』= {tone_of('我不累')} → 她不会担心")
     check("D3 关键词表里『开心』与『不开心』同时存在（子串互相抵消）",
           "开心" in POSITIVE and "不开心" in NEGATIVE,
           f"POSITIVE 含『开心』={('开心' in POSITIVE)}，NEGATIVE 含『不开心』={('不开心' in NEGATIVE)}")
@@ -183,7 +203,7 @@ def main() -> int:
 
     print()
     print("=" * 78)
-    print("F. 心情分享（mood_share）用的是 current()：陈旧心情 + 每日一条")
+    print("F. 心情分享（mood_share）用的是 current()：过期心情不再被每天分享（P1-16 已修）")
     print("=" * 78)
     f = base_settings("mood-f", 81920.0)
     fb = Giftia(f, llm=MockLLM(f.model))
@@ -195,10 +215,33 @@ def main() -> int:
         shared.append(plan_.reason if plan_ else "None")
         fb.clock.advance(24)
     print(f"    连续 5 天，outreach_plan().reason = {shared}")
-    print(f"    期间心情一直是 {fb.current_mood().key}（until={fb.current_mood().until}，"
-          f"now={sec(fb.clock.now())}），从没被清过")
-    check("F1 同一个陈旧心情会被『每天分享一次』（同一天同一种心情只说一次 = 一天一条）",
-          shared.count("mood_share") >= 4, str(shared))
+    print(f"    期间心情一直是 {fb.current_mood().key}（source={fb.current_mood().source}，"
+          f"until={fb.current_mood().until}，now={sec(fb.clock.now())}）")
+    print("    【期望为何变了】F1 原来记录的是 P1-16 的缺陷：同一个陈旧心情会被")
+    print("    「每天分享一次」，把一份稀缺的 30 天额度全烧在同一个旧心情上。")
+    print("    修复后 current() 在过期时回落 calm → mood_share 不再拿陈旧心情当理由。")
+    check("F1 陈旧心情不再被『每天分享一次』（5 天里 mood_share 至多 1 次）",
+          shared.count("mood_share") <= 1, str(shared))
+    check("F1b 心情确实过期了（until 已过，current() 报 calm/expired）",
+          fb.current_mood().key == "calm" and fb.current_mood().source == "expired",
+          f"{fb.current_mood().key}/{fb.current_mood().source}")
+
+    # 正向对照：额度并没有被关掉——心情新鲜时 mood_share 仍然会被用上
+    # （mood_share 还有第二道闸：距上次说话 ≥ mood_share_min_idle_hours(6h)，
+    #   所以先静置 7 小时再问，别让"刚聊完"这条闸挡住对照）
+    g = base_settings("mood-g", 81920.0)
+    gb = Giftia(g, llm=MockLLM(g.model))
+    gb.handle("在吗")
+    gb.force_mood("tired")
+    gb.clock.advance(7)
+    fresh = gb.current_mood()
+    plan_fresh = gb.outreach_plan(force=True)
+    print(f"    正向对照：force_mood('tired') + 静置 7h（until={fresh.until} 未过期，"
+          f"now={sec(gb.clock.now())}）→ outreach_plan().reason = "
+          f"{plan_fresh.reason if plan_fresh else None}")
+    check("F1c 正向对照：心情**新鲜**时 mood_share 仍然会用（不是把这条路关掉）",
+          plan_fresh is not None and plan_fresh.reason == "mood_share",
+          plan_fresh.reason if plan_fresh else "None")
 
     return report("beh_mood")
 
