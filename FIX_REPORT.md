@@ -157,10 +157,11 @@ python .review\acceptance.py          # 全部套件 + 真实项数/耗时 → .
 ## 九、如何回滚 / 复现
 
 ```powershell
-git log --oneline                       # 44aefb1 审查基线 → 319c0ba 第 1 波 → b004e4b 第 2 波 → 后续收尾
+git log --oneline                       # 44aefb1 审查基线 → 319c0ba/b004e4b/ef4d85c/7037c19/039e4fc 五步修复
 git diff 44aefb1..HEAD --stat           # 看全部改动
 git checkout 44aefb1 -- giftia adapters # 只回滚某几个文件
 ```
 
-每波都跑过完整验收（`python .review\acceptance.py`）；`selftest` 从 `299/3` → `304/0` 全程只升不降。
-逐条修复证据在各流报告里：[team-store.md](.review/fix-reports/team-store.md)、[team-brain.md](.review/fix-reports/team-brain.md)、[team-recycle.md](.review/fix-reports/team-recycle.md)，以及登记册 [FIX_REGISTER.md](.review/FIX_REGISTER.md)。
+每个检查点都跑过完整验收（`python .review\acceptance.py`）；`selftest` 从 `299/3` → `304/0` 全程只升不降。
+**最终状态**：套件全绿（`304 / 17 / 72 / 10`）+ **49 个探针全部 `exit=0` 且 `0 FAIL`**，工作区无未提交改动。
+逐条修复证据：[team-store.md](.review/fix-reports/team-store.md)、[team-brain.md](.review/fix-reports/team-brain.md)、[team-recycle.md](.review/fix-reports/team-recycle.md)、[team-recycle-probes-final.md](.review/fix-reports/team-recycle-probes-final.md)，以及登记册 [FIX_REGISTER.md](.review/FIX_REGISTER.md)。
