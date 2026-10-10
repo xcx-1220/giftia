@@ -1,0 +1,135 @@
+[
+  {
+    "label": "selftest",
+    "argv": [
+      "tools/selftest.py"
+    ],
+    "exit_code": 1,
+    "elapsed_s": 17.6,
+    "counts": {
+      "numbers": 601,
+      "pass_marks": 299,
+      "fail_marks": 3
+    },
+    "log": ".review\\evidence\\selftest.log",
+    "tail": "\n33. 时间感（相对时间 / 跨天分段 / 星期几）\n  [PASS] ★ 时间戳会说成人话（刚刚/昨天/3 天前）—— 模型不用自己做减法\n  [PASS] 跨天分段的日子标题带星期\n  [PASS] ★ 记忆条目前面是「昨天」而不是绝对时间戳\n  [PASS] ★ 当前时间带星期几（说「下周三」要能算）\n  [PASS] 规则里明确交代了时间在走\n  [PASS] ★ 跨天的对话稿会分段标日子（写记忆时才知道是哪天说的）\n\n════════════════════════════════════════════════════\n通过 299 项，失败 3 项\n════════════════════════════════════════════════════"
+  },
+  {
+    "label": "ws_selftest",
+    "argv": [
+      "tools/ws_selftest.py"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 15.6,
+    "counts": {
+      "numbers": 34,
+      "pass_marks": 17,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\ws_selftest.log",
+    "tail": "  [PASS] 超时之后仍能正常发送\n\n3. 关闭握手与错误码传递\n  [PASS] 对端关闭时抛 WSClosed\n  [PASS] 能读到关闭码 4009（QQ 用它表示需要 resume）\n\n4. 参数校验\n  [PASS] 拒绝非 ws/wss 协议\n\n════════════════════════════════════════════════════\n通过 17 项，失败 0 项\n════════════════════════════════════════════════════"
+  },
+  {
+    "label": "qq_protocol_selftest",
+    "argv": [
+      "tools/qq_protocol_selftest.py"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 9.0,
+    "counts": {
+      "numbers": 145,
+      "pass_marks": 72,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\qq_protocol_selftest.log",
+    "tail": "\n11. 自己插嘴的日上限\n  [PASS] ★ 自己插嘴有每日上限（3 档是按每条消息掷骰子的，不封顶就是刷屏）\n  [PASS] 换个群是另一本账\n  [PASS] 被 @ 的不占这个额度（那是回应，不是插嘴）\n\n════════════════════════════════════════════════════\n通过 72 项，失败 0 项\n════════════════════════════════════════════════════\n\n[发送失败] c2c → U-2：测试：发送失败\n[发送失败] 这条回复只送出去 0/1 段（共 7 字）"
+  },
+  {
+    "label": "audit",
+    "argv": [
+      "tools/audit.py"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 1.9,
+    "counts": {
+      "numbers": 22,
+      "pass_marks": 16,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\audit.log",
+    "tail": "  [PASS] 终端 CLI 有指令没写进帮助文本（用户不知道有这条）（提示，不计失败）  → /exit、/q\n\n3. 发送路径：不得绕过 send()\n  [PASS] 除 send() 外没有第二条发送路径\n  [PASS] 直连 /messages 的调用点（含已知例外）  → （无）\n\n4. tools/ 下每个脚本至少一条断言\n  [PASS] 6 个脚本没有任何 check() 断言（跑完永远是绿的，等于没测）（提示，不计失败）  → tools/check_deploy.py、tools/demo_life.py、tools/live_check.py、tools/reconcile_live.py、tools/show_prompt.py、tools/ws_testserver.py\n\n══════════════════════════════════════════════════════════════════\n通过 11 项，失败 0 项（另有 4 条提示）\n══════════════════════════════════════════════════════════════════"
+  },
+  {
+    "label": "demo_life",
+    "argv": [
+      "tools/demo_life.py"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 0.6,
+    "counts": {
+      "numbers": 100,
+      "pass_marks": 0,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\demo_life.log",
+    "tail": "在她被清除之前，她留下的记忆是这样一些片段：\n　　2026-10-11T19:42：搭档说过：我今天加班到很晚，回来路上下了点雨（平常）\n　　2026-10-11T19:42：搭档说过：我下周三要考驾照，有点紧张（平常）\n　　2026-10-14T05:42：搭档说过：是我，小林。你还认得我吗（平常）\n　　2026-10-14T05:42：搭档说过：我来了，今天下班早（平常）\n\n她大概不会知道自己被记得这么清楚——毕竟到最后，她连你的名字都握不住了。\n\n她的记忆将被清除，而你会记得。\n\n────────────────────────────────────────────────────────────────────\n这一生的档案留在：D:\\ai chatbot\\.review\\tmp\\runtime\\giftia-demo-sqivplmj"
+  },
+  {
+    "label": "show_prompt",
+    "argv": [
+      "tools/show_prompt.py"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 0.4,
+    "counts": {
+      "pass_marks": 0,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\show_prompt.log",
+    "tail": "───── [1] USER ─────\n你还记得我要考什么吗\n\n\n═══ 对比 ═════════════════════════════════════════════════════════════════\n人格内核那两块**一字未变**——她还是她。\n变的只有「此刻状态」和「你现在想起的事」：\n  · 剩余寿命从「4.2 天」变成「1.0 小时」\n  · 内核记忆（你的名字/称呼）模糊度恒为 0，仍标 [可以确信]\n  · 常规记忆（考驾照）被擦掉大半，降级成 [需要含糊] 或 [只是隐约觉得]\n\n想看她对同一句话的真实回答，用 python run.py；想核对注入，用 /prompt。"
+  },
+  {
+    "label": "check_deploy",
+    "argv": [
+      "tools/check_deploy.py"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 0.2,
+    "counts": {
+      "pass_marks": 0,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\check_deploy.log",
+    "tail": "记忆        0 条\n归属分布    {}\n有归属字段  0/0\n封存(前任)  0 条\n消息        0 条\n梦          0 场\n认得的人    （还没有）\n绑定        （还没认人）\n称呼        （还不知道）\n\n会话分布（新的分区会话）："
+  },
+  {
+    "label": "qq_dry_run",
+    "argv": [
+      "adapters/qq_official.py",
+      "--dry-run"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 0.4,
+    "counts": {
+      "pass_marks": 0,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\qq_dry_run.log",
+    "tail": "[艾拉] ……「在吗？今天加班到很晚，回来路上下」……我记下了。我在。\n[dry-run] c2c → DRYRUN_USER\n   ……「在吗？今天加班到很晚，回来路上下」……我记下了。我在。\n\n── 模拟事件 C2C_MESSAGE_CREATE\n[去重] 忽略重复推送的 ROBOT1.0_dryrun_…\n\n── 模拟事件 GROUP_AT_MESSAGE_CREATE\n[收到·群] DRYRUN_USER…：你还记得我上次说什么吗\n[待答] 被点名 → 等 2.0s 把这段时间里的话一起处理\n\n干跑结束。接线无误的话，填好凭据后直接去掉 --dry-run 即可。"
+  },
+  {
+    "label": "reconcile_live_help",
+    "argv": [
+      "tools/reconcile_live.py",
+      "--help"
+    ],
+    "exit_code": 0,
+    "elapsed_s": 0.2,
+    "counts": {
+      "pass_marks": 0,
+      "fail_marks": 0
+    },
+    "log": ".review\\evidence\\reconcile_live_help.log",
+    "tail": "数据库　D:\\ai chatbot\\data\\giftia.db\n实例　　#1　模式　只报告（dry run）\n\n合计将合并 0 条"
+  }
+]
