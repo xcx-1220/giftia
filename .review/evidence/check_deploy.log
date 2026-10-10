@@ -1,5 +1,5 @@
 $ python .review/run_tests.py tools/check_deploy.py
-exit_code=0  elapsed=0.2s
+exit_code=0  elapsed=0.1s
 ----------------------------------------------------------------------
 STDOUT
 ----------------------------------------------------------------------

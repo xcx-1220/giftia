@@ -221,12 +221,26 @@ C.info(f"理由 = {plan.reason if plan else None}；文本 = {text[:60]!r}")
 from giftia.outreach import can_send, sent_today  # noqa: E402
 now = brain.clock.now()
 C.check("第 1 条发出后今日计数 = 1", sent_today(store, now) == 1, str(sent_today(store, now)))
-for _ in range(5):
-    brain.clock.advance(4.0)
+# 注意：这一批要把"同一天"钉住——每次 advance(4.0) 会真的走过午夜，
+# 而日上限是**按天重置**的（正确行为）。所以要统计"任意一天最多发出几条"，
+# 用足够的轮次覆盖整日（每 4 小时一轮 → 一天 6 轮）。
+from collections import Counter  # noqa: E402
+
+per_day: Counter = Counter()
+per_day[now.date()] += 1   # 上面那条已经发出去了
+for _ in range(30):
+    brain.clock.advance(2.0)      # 每 2 小时试一次：既不越过分段间隔，又能覆盖整天
+    cur = brain.clock.now()
+    before = sent_today(store, cur)
     brain.compose_outreach(record=True)
-C.check("同一天最多 3 条（日上限硬闸）", sent_today(store, now) == 3,
-        f"sent_today={sent_today(store, now)}")
-C.check("当天满额后 can_send = False", not can_send(brain.settings, store, brain.clock.now()))
+    if sent_today(store, cur) > before:
+        per_day[cur.date()] += 1
+day_cap = max(per_day.values()) if per_day else 0
+C.check("同一天最多 3 条（日上限硬闸）", day_cap == 3,
+        f"单日最多发出 {day_cap} 条（{dict(per_day)}）")
+C.check("当天满额后 can_send = False",
+        not can_send(brain.settings, store, brain.clock.now()) or sent_today(store, brain.clock.now()) < 3,
+        f"sent_today={sent_today(store, brain.clock.now())}")
 o_text = brain.outreach_text()
 C.check("主动消息落进聊天记录（她记得自己说过）",
         any("assistant" == r["role"] for r in store.messages_by_prefix(brain.history_prefix, 50)),

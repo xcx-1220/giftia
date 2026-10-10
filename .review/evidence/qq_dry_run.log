@@ -1,5 +1,5 @@
 $ python .review/run_tests.py adapters/qq_official.py --dry-run
-exit_code=0  elapsed=0.4s
+exit_code=0  elapsed=0.6s
 ----------------------------------------------------------------------
 STDOUT
 ----------------------------------------------------------------------

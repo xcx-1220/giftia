@@ -75,9 +75,9 @@ reply = b2.handle("随便说点什么吧", "u_owner", scene="c2c")
 told_after = b2.store._rows("SELECT told FROM dreams ORDER BY id DESC")[0]["told"]
 C.info(f"这一轮回复：{reply[:120]!r}")
 C.info(f"回复里有没有「梦」字：{'梦' in reply}；dreams.told → {told_after}")
-C.check("★ 她没有讲梦（回复里没有梦的内容）却被标记 told=1",
-        told_after == 1 and "梦" not in reply,
-        f"told={told_after}，回复={reply[:60]!r} → 这个梦再也不会被讲出来（README：第二天讲给你听）")
+C.check("★ 她没有讲梦就不会被标记 told（梦留着下次讲）",
+        told_after == 0 and "梦" not in reply,
+        f"told={told_after}，回复={reply[:60]!r} → 这个梦还会被讲出来（README：第二天讲给你听）")
 b2.close()
 rm_dir(tmp2)
 
