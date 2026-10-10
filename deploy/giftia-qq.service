@@ -4,6 +4,12 @@ Documentation=file:/opt/giftia/README.md
 After=network-online.target
 Wants=network-online.target
 
+# 崩溃重启的上限：Restart=always 碰上"凭据填了但无效"（AppSecret 过期）会每 5 秒
+# 无限重启、日志刷屏。60 秒内最多 3 次，超过就停下来等人看 systemctl status。
+# 注意：这两个指令的有效位置是 [Unit]，写在 [Service] 里会被 systemd 忽略。
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
 [Service]
 Type=simple
 User=giftia

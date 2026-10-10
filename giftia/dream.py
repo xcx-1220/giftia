@@ -34,16 +34,40 @@ class Dream:
         return (now - born).total_seconds() / 3600.0 <= within_hours
 
 
+def _handler_view(store: Store) -> list[tuple[str, str]]:
+    """做梦的素材视角：搭档自己的事（private + 他本人的私聊），**不含群**。
+
+    `should_dream`（资格判定）与 `make_dream`（取材）必须用**同一套**视角计数，
+    否则会出现"门槛早就够了、梦却永远做不出来"的静默失效（一个全量、一个搭档视角）。
+    """
+    handler_id = str(store.state_get("handler_id", "") or "")
+    view: list[tuple[str, str]] = [("private", "")]
+    if handler_id:
+        view.append(("person", handler_id))
+    return view
+
+
 def _last_dream(store: Store, instance_no: int) -> dict | None:
     dreams = store.recent_dreams(instance_no, limit=1)
     return dreams[0] if dreams else None
 
 
-def should_dream(settings: Settings, store: Store, clock: Clock, instance_no: int) -> bool:
-    """现在该不该做梦：有足够的记忆、且离上一场梦够久。"""
+def should_dream(
+    settings: Settings,
+    store: Store,
+    clock: Clock,
+    instance_no: int,
+    view: list[tuple[str, str]] | None = None,
+) -> bool:
+    """现在该不该做梦：有足够的记忆、且离上一场梦够久。
+
+    「足够的记忆」按 `view`（默认搭档视角）计数——**和 `make_dream` 完全同一个口径**，
+    否则别人的私聊会把门槛凑够，而取材时又一条都取不到。
+    """
     if not settings.dream.enabled:
         return False
-    memories = store.active_memories(instance_no)
+    effective_view = view if view is not None else _handler_view(store)
+    memories = store.active_memories(instance_no, view=effective_view)
     if len(memories) < settings.dream.min_memories:
         return False
     last = _last_dream(store, instance_no)
@@ -71,13 +95,14 @@ def make_dream(
     梦是她内心的东西，别人的私事不该进她的梦，
     否则她在群里讲梦就等于把别人的私事当众说了出去（真机测试抓到过这条）。
     """
-    if view is None:
-        view = [("private", ""), ("person", str(store.state_get("handler_id", "") or ""))]
-    memories = store.active_memories(instance_no, view=view)
+    effective_view = view if view is not None else _handler_view(store)
+    memories = store.active_memories(instance_no, view=effective_view)
     if len(memories) < settings.dream.min_memories:
         return None
 
-    recent = memories[-settings.dream.fragments :]
+    # `fragments = 0` 时 `memories[-0:]` 会拿到**全部**记忆（切片陷阱）→ 至少取 1 条。
+    take = max(1, int(settings.dream.fragments))
+    recent = memories[-take:]
     fragments: list[str] = []
     for mem in recent:
         text, _ = blur_text(

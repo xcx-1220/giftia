@@ -83,6 +83,15 @@ MSG_TYPE_TEXT = 0
 MAX_CHARS = 350          # 超出会被平台以"消息长度超限"拒掉，主动分条
 DEDUP_WINDOW = 300.0     # 同一 msg_id 在这个秒数内只处理一次
 
+# 平台的被动回复硬限：**同一个 msg_id 最多能回几条**（超出会被平台拒掉）。
+# 见 README「平台限制」小节：群聊 @ 她之后 5 分钟内最多 5 条，单聊 60 分钟内最多 4 条。
+PASSIVE_REPLY_LIMIT_GROUP = 5
+PASSIVE_REPLY_LIMIT_C2C = 4
+# 系统通知（终端服务预告 / 记忆整理 / 记忆强化）要占一个名额
+NOTICE_REPLY_RESERVE = 1
+# 限频命中时最多等这么久；等不起就如实上报为发送失败（不静默丢消息）
+RATE_LIMIT_MAX_WAIT = 20.0
+
 DEFLECT = (
     "……抱歉。我认得的人不多，如果不是你在叫我，我就先安静待着了。"
 )
@@ -180,10 +189,13 @@ def extract_content(payload: dict) -> str:
     for el in elements:
         if not isinstance(el, dict):
             continue
-        # 拍一拍：官方文档里我没找到它的正式字段名，所以按内容宽松识别；
-        # 认出来就补一个占位符，让她知道"有人在戳她"（不然这条消息是空的）。
-        blob = f"{el.get('content_type', '')}{el.get('ark_type', '')}{el.get('type', '')}"
-        if any(w in str(el).lower() for w in ("poke", "拍了拍")):
+        # 拍一拍：官方文档里我没找到它的正式字段名，所以按**结构字段**宽松识别
+        # （content_type / ark_type / type —— 也就是 blob）。
+        # 注意：以前这里对整个 `str(el)` 做子串匹配，于是正常文本里出现 "poke"
+        # （比如 "Pokemon"、"poker"）也会被整段替换成 "[拍了拍]"，用户的话就丢了。
+        blob = f"{el.get('content_type', '')}{el.get('ark_type', '')}{el.get('type', '')}".lower()
+        element_text = str(el.get("content") or "").strip()
+        if ("poke" in blob or "拍了拍" in blob) and not element_text:
             parts.append("[拍了拍]")
             continue
         text = strip_mention(str(el.get("content") or ""))
@@ -231,7 +243,9 @@ class QQBot:
         self._batch: dict[str, dict] = {}
         # 发送节奏：每会话的发送时间戳（算限频用）与最近一条（同文去重用）
         self._send_times: dict[str, list[float]] = {}
-        self._sent_recently: dict[str, tuple[str, float]] = {}
+        self._sent_recently: dict[str, tuple[str, float, str]] = {}
+        # 这一次 send() 是否要带官方的「互动召回」字段（is_wakeup），只对单聊有意义
+        self._wakeup_once = False
 
     # ══ 退出 ═════════════════════════════════════════════════
     def request_stop(self, *_args: object) -> None:
@@ -270,11 +284,31 @@ class QQBot:
         except Exception as exc:
             raise QQError(f"{type(exc).__name__}: {exc}") from exc
 
-        body = json.loads(raw) if raw.strip() else {}
+        body = self._parse_body(raw)
         # 官方明确说明：业务失败时 HTTP 仍可能是 200，必须看 code
-        code = body.get("code") if isinstance(body, dict) else None
+        code = body.get("code")
         if code not in (None, 0):
             raise QQError(f"业务错误 {code}：{body.get('message', '')}")
+        return body
+
+    @staticmethod
+    def _parse_body(raw: str) -> dict:
+        """把响应体解析成 dict，**失败一律 QQError**。
+
+        以前这里是裸的 `json.loads(raw)`：代理页 / CDN 错误页 / 网关页常常是
+        **HTTP 200 + text/html**，于是抛 `json.JSONDecodeError` 穿过 `send()` 和
+        `handle_event()`（它们只接 `QQError`），一路冒到 `run()` 被当成"断开"——
+        一个坏响应就能拆掉整条 WebSocket 会话，而且那一轮的"发送失败要回滚记忆"也不会执行。
+        """
+        text = (raw or "").strip()
+        if not text:
+            return {}
+        try:
+            body = json.loads(text)
+        except ValueError as exc:
+            raise QQError(f"响应不是合法 JSON：{text[:200]!r}") from exc
+        if not isinstance(body, dict):
+            raise QQError(f"响应不是 JSON 对象：{text[:200]!r}")
         return body
 
     def access_token(self, *, force: bool = False) -> str:
@@ -339,12 +373,39 @@ class QQBot:
             return result
         key = f"{kind}:{openid}"
 
-        # 同文去重（8 秒）
-        last_text, last_ts = self._sent_recently.get(key, ("", 0.0))
-        if pieces == [last_text] and time.time() - last_ts < 8.0:
-            print("[发送] 8 秒内发过同样的话，跳过（防重复回复）")
+        # 同文去重（8 秒）：**按 msg_id 分桶**。
+        # 以前不看 msg_id：两个不同的 msg_id（平台侧两条独立的被动回复）文本相同且在 8 秒内，
+        # 第二条不会发出却进了 result.sent → 调用方以为"用户看见了"，而屏幕上什么都没有。
+        # 现在只有"同一个 msg_id"（真·平台重推）才跳过；没有 msg_id 的调用路径
+        # （脚本/自测/直连）保持原来的"同会话 8 秒内同文不重发"。
+        # 兼容读取：老版本存的是 2 元组 (text, ts)，别让热重载/长跑进程炸掉
+        stored = self._sent_recently.get(key)
+        last_text, last_ts, last_mid = ("", 0.0, "")
+        if isinstance(stored, tuple):
+            if len(stored) >= 3:
+                last_text, last_ts, last_mid = stored[0], stored[1], stored[2]
+            elif len(stored) == 2:
+                last_text, last_ts = stored
+        same_source = str(last_mid) == str(msg_id or "")
+        if same_source and pieces == [last_text] and time.time() - last_ts < 8.0:
+            print("[发送] 同一个 msg_id 在 8 秒内发过同样的话，跳过（防重复回复）")
             result.sent.extend(pieces)
             return result
+
+        # 平台硬限：同一个 msg_id 的被动回复条数（群 5 / 单聊 4）。
+        # 超出的段落不会被平台接受，与其"发 5 段被拒 1 段"，不如把尾巴并进最后一段。
+        if msg_id:
+            limit = PASSIVE_REPLY_LIMIT_GROUP if kind == "group" else PASSIVE_REPLY_LIMIT_C2C
+            budget = limit - self._seqs.get(msg_id, 0)
+            if budget > 0 and len(pieces) > budget:
+                keep = pieces[: budget - 1] if budget > 1 else []
+                tail = "".join(pieces[budget - 1 :])
+                pieces = [*keep, tail]
+                print(
+                    f"[发送] 这条回复超过平台上限（同一 msg_id 最多 {limit} 条），"
+                    f"已把尾巴并成一段（{len(pieces)} 段）",
+                    file=sys.stderr,
+                )
 
         for index, piece in enumerate(pieces):
             if index:  # 分段之间隔一下，别顶着风控
@@ -354,13 +415,27 @@ class QQBot:
                 ))
             blocked = self._rate_limit_wait(key)
             if blocked:
-                print(f"[发送] {blocked}，这句先不发了（{piece[:20]}…）", file=sys.stderr)
-                result.failed.append((piece, blocked))
-                continue
+                # 注释一直说"超了就等（不硬丢）"，但以前是**直接丢这一段**：
+                # 分段回复会缺一段，用户看到半截。现在按注释等窗口过去（有上限），
+                # 等不起才如实上报为失败（调用方会回滚那句记忆）。
+                wait = self._send_slot_delay(key)
+                if wait <= 0:
+                    blocked = ""
+                elif wait <= RATE_LIMIT_MAX_WAIT:
+                    print(f"[发送] {blocked}，等 {wait:.1f}s 再发这一段", file=sys.stderr)
+                    time.sleep(wait)
+                    blocked = self._rate_limit_wait(key)
+                if blocked:
+                    print(f"[发送] {blocked}，这句等不起先不发了（{piece[:20]}…）", file=sys.stderr)
+                    result.failed.append((piece, blocked))
+                    continue
             body: dict = {"msg_type": MSG_TYPE_TEXT, "content": piece}
             if msg_id:
                 body["msg_id"] = msg_id
                 body["msg_seq"] = self._next_seq(msg_id)
+            if self._wakeup_once and kind == "c2c":
+                # 官方「互动召回消息」：只有单聊有意义，额度更紧但更合规
+                body["is_wakeup"] = True
             if self.dry_run:
                 print(f"[dry-run] {kind} → {openid}\n   {piece}")
                 result.sent.append(piece)
@@ -370,7 +445,7 @@ class QQBot:
                 result.sent.append(piece)
                 self._note_send(key)          # 成功才记账
                 if len(pieces) == 1:
-                    self._sent_recently[key] = (piece, time.time())
+                    self._sent_recently[key] = (piece, time.time(), str(msg_id or ""))
             except QQError as exc:
                 result.failed.append((piece, str(exc)))
                 print(f"[发送失败] {kind} → {openid}：{exc}", file=sys.stderr)
@@ -397,6 +472,25 @@ class QQBot:
 
     def _note_send(self, key: str) -> None:
         self._send_times.setdefault(key, []).append(time.time())
+
+    def _send_slot_delay(self, key: str) -> float:
+        """还要等多久才有发送额度。0 = 现在就能发。
+
+        与 `_rate_limit_wait()`（返回人话原因）配合使用：先看原因，再算等待时间。
+        """
+        now = time.time()
+        stamps = [t for t in self._send_times.get(key, []) if now - t < 3600]
+        runtime = self.settings.runtime
+        waits: list[float] = []
+        recent = sorted(t for t in stamps if now - t < 60)
+        cap_min = max(1, int(runtime.send_max_per_minute))
+        if len(recent) >= cap_min:
+            # 额度在"第 (len-cap+1) 条"发出后腾出来
+            waits.append(recent[len(recent) - cap_min] + 60.0 - now)
+        cap_hour = max(1, int(runtime.send_max_per_hour))
+        if len(stamps) >= cap_hour:
+            waits.append(sorted(stamps)[len(stamps) - cap_hour] + 3600.0 - now)
+        return max(0.0, max(waits)) if waits else 0.0
 
     # ══ 聚批：被触发后等她说完再一起处理 ══════════════════════
     def _may_speak_up(self, group: str) -> bool:
@@ -464,17 +558,37 @@ class QQBot:
         # 前面几句只当"听见了"：落库进她的聊天记录，让她在上下文里看得到，
         # 但只有最后一句触发回复（被动回复窗口也是按它算的）。
         for item in items[:-1]:
-            handle_message(
-                item["content"], item["user_id"], settings=self.settings, scene="group",
-                group_id=target, speaker_name=item["speaker"], is_handler=False,
-                log_only=True, mid=item["msg_id"],
-            )
+            try:
+                handle_message(
+                    item["content"], item["user_id"], settings=self.settings, scene="group",
+                    group_id=target, speaker_name=item["speaker"], is_handler=False,
+                    log_only=True, mid=item["msg_id"],
+                )
+            except Exception as exc:  # noqa: BLE001 —— 旁听落库失败不该影响这一批的回复
+                print(f"[旁听失败] {type(exc).__name__}: {exc}", file=sys.stderr)
         last = items[-1]
-        self._respond(
+        self.respond_safely(
             "group", target, last["user_id"], last["speaker"],
             last["content"], last["msg_id"], at_bot=last["at_bot"],
             role=str(last.get("role") or ""),
         )
+
+    def _flush_pending_batches(self) -> None:
+        """退出前把还在窗口里的批次处理掉（不等 deadline）。
+
+        systemd 停止/重启（改完 persona.toml 的常规操作）时，命中 2 秒窗口的那条消息
+        以前会**永久消失**：不回复、也不落聊天记录。这里在收尾路径上主动冲一次。
+        """
+        if not self._batch:
+            return
+        pending = list(self._batch.items())
+        self._batch.clear()
+        print(f"[退出] 还有 {len(pending)} 个批次没处理，先处理完再走")
+        for target, batch in pending:
+            try:
+                self._run_batch(target, batch["items"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"[退出] 批次处理失败：{type(exc).__name__}: {exc}", file=sys.stderr)
 
     # ══ 事件 ═════════════════════════════════════════════════
     # 同一条消息可能被推两次：
@@ -570,7 +684,7 @@ class QQBot:
             brain_mod.get_default(self.settings).note_activity(user_id)
 
         # 先看是不是指令（官方 openid 与 QQ 号不互通，所以有 /bind 兜底）
-        if self.handle_command(kind, target, content, user_id, msg_id):
+        if self.handle_command(kind, target, content, user_id, msg_id, role):
             return
 
         # ── 群聊：先决定这条要不要让她开口（档位见 giftia/trigger.py）──
@@ -608,7 +722,7 @@ class QQBot:
                 return
             if self.settings.runtime.wake_delay_seconds <= 0:
                 # 不聚批：立刻处理（想让她"听到就回"就把 wake_delay_seconds 设成 0）
-                self._respond(kind, target, user_id, speaker, content, msg_id, at_bot, role)
+                self.respond_safely(kind, target, user_id, speaker, content, msg_id, at_bot=at_bot, role=role)
                 return
             self._enqueue_batch(target, user_id, speaker, content, msg_id, at_bot, role)
             print(
@@ -618,7 +732,7 @@ class QQBot:
             return
 
         # 私聊：直接处理（群聊走聚批，到点了由 _run_batch 转到这里）
-        self._respond(kind, target, user_id, speaker, content, msg_id)
+        self.respond_safely(kind, target, user_id, speaker, content, msg_id)
 
     def _respond(
         self,
@@ -718,6 +832,39 @@ class QQBot:
                 if note.startswith(("[终端服务]", "[记忆整理]", "[记忆强化]")):
                     self.send(kind, target, note, msg_id)
 
+    def respond_safely(
+        self,
+        kind: str,
+        target: str,
+        user_id: str,
+        speaker: str,
+        content: str,
+        msg_id: str | None,
+        *,
+        at_bot: bool = True,
+        role: str = "",
+    ) -> None:
+        """`_respond` 的包壳：**一条消息处理失败不该掀掉整条连接**。
+
+        以前 `_respond` / `_run_batch` 没有 try/except，任何异常（写库失败、
+        编码问题、模型层意外异常）都会冒到 `run()`，被当成"断开"→ 整条 WebSocket
+        重连，而用户那句话永远没有回复。这里兜住并如实报错。
+        """
+        try:
+            self._respond(
+                kind, target, user_id, speaker, content, msg_id,
+                at_bot=at_bot, role=role,
+            )
+        except Exception as exc:  # noqa: BLE001 —— 兜底就是它的职责
+            print(
+                f"[处理失败] {kind} → {target}：{type(exc).__name__}: {exc}（连接保持，继续收消息）",
+                file=sys.stderr,
+            )
+            try:
+                self.send(kind, target, "……抱歉，我刚才走神了。你再说一遍好不好？", msg_id)
+            except Exception:
+                pass
+
     # ══ 认人：官方 OpenID 与真实 QQ 号不互通，只能靠一句 /bind ══
     def owner_id(self) -> str:
         """优先用 --owner / QQ_OWNER_OPENID；没配就读运行时绑定（/bind 写进去的）。"""
@@ -729,9 +876,21 @@ class QQBot:
             return ""
 
     def handle_command(
-        self, kind: str, target: str, text: str, user_id: str, msg_id: str | None
+        self,
+        kind: str,
+        target: str,
+        text: str,
+        user_id: str,
+        msg_id: str | None,
+        role: str = "",
     ) -> bool:
-        """返回 True 表示这条消息已被指令消费掉，不再交给她。"""
+        """返回 True 表示这条消息已被指令消费掉，不再交给她。
+
+        **身份闸门是白名单语义**（审查 P0-3a）：没有搭档时只放行 `/bind` `/help` `/unbind`，
+        其余指令一律婉拒、不执行也不写库。以前闸门写成 `if owner and user_id != owner`，
+        `owner` 为空时条件为 False → 群里任何成员一条 `/profile` 就能把搭档视角的
+        全部私聊记忆当众念出来（还能 `/forget` 掉记忆、`/impress` 写东西）。
+        """
         parts = text.split()
         if not parts or not parts[0].startswith("/"):
             return False
@@ -739,6 +898,25 @@ class QQBot:
 
         hub = brain_mod.get_default(self.settings)
         owner = self.owner_id()
+
+        # ① 单聊专属的指令：它们是"你看她的记忆"的视角，不该当众输出
+        if cmd in ("/profile", "/impress", "/forget", "/reconcile") and kind != "c2c":
+            self.send(kind, target, "……这个我们私下说。", msg_id)
+            return True
+
+        # ② 白名单：没有搭档时只允许这三条（否则"未绑定 = 放行一切"）
+        if not owner and cmd not in ("/bind", "/help", "/unbind"):
+            self.send(
+                kind, target,
+                "……这个我现在做不了。得先让我知道你是我的搭档——发一句 /bind。",
+                msg_id,
+            )
+            return True
+
+        # ③ 已绑定时：只有搭档本人能下指令（群里的指令一定不是搭档本人，见 ①）
+        if owner and user_id != owner and cmd not in ("/help", "/bind"):
+            self.send(kind, target, DEFLECT, msg_id)
+            return True
 
         if cmd == "/help":
             self.send(kind, target, COMMANDS, msg_id)
@@ -750,6 +928,14 @@ class QQBot:
                 return True
             if owner and owner != user_id:
                 self.send(kind, target, "……抱歉，我已经有搭档了。", msg_id)
+                return True
+            if owner == user_id:
+                self.send(kind, target, "……嗯，我认得你。", msg_id)
+                return True
+            # 群里的 /bind 只有**群主**可以用——陌生人冒充不了群主，
+            # 否则"解绑后群里任何 member 一条 /bind 就能抢注"。
+            if kind == "group" and role not in ("owner", "群主"):
+                self.send(kind, target, "……这个得群主来说才行。", msg_id)
                 return True
             hub.set_handler_id(user_id)
             print(f"[绑定] 搭档 = {user_id}")
@@ -837,32 +1023,46 @@ class QQBot:
 
         只在主线程里跑（Giftia 不是线程安全的），所以由 WebSocket 循环定时调用，
         而不是另开一个后台线程。
+
+        **一批只判一次限流**：以前把 `can_send` 放在 for 循环里，第一轮发完私聊立刻记账，
+        第二轮就被 `min_gap_hours` 挡掉 → `target=both` 时群里那条**静默丢失**，
+        额度也只扣 1 条（README 承诺"两边都发、每次占 2 条"）。现在：
+        循环外判一次（日上限 + 30 天额度 + 最小间隔），一批里的多个目标共享这次判定；
+        每个真正发出去的目标各自记账（所以 `both` 真的占 2 条额度）。
         """
         if not self.settings.outreach.enabled:
             return
         hub = brain_mod.get_default(self.settings)
-        if not self._outreach_targets():
+        targets = self._outreach_targets()
+        if not targets:
             return  # 还没认人 / 还没进过群，不知道发给谁
-        for kind, target in self._outreach_targets():
-            if not can_send(self.settings, hub.store, hub.clock.now()):
-                return
+        # 一批只判一次：按"这一批要发几条"预留额度，之后同批目标不再被判间隔挡掉
+        extra = max(0, len(targets) - 1)
+        if not can_send(self.settings, hub.store, hub.clock.now(), batch_extra=extra):
+            return
+        for index, (kind, target) in enumerate(targets):
+            if index and not can_send(
+                self.settings, hub.store, hub.clock.now(), ignore_gap=True
+            ):
+                break  # 同批里后面的目标：额度还在就发，间隔不再重复判
             which = "owner" if kind == "c2c" else "group"
             plan_, text = hub.compose_outreach(record=False, target=which)
             if not plan_ or not text.strip():
                 continue
-            body: dict = {"msg_type": 0, "content": text}
-            # 互动召回只对单聊有意义，群消息不带这个字段
+            # 主动消息也走 send()：**三道闸（同文去重 / 限频 / 分段）必须一起生效**。
+            # 以前这里直连 _request，绕过了分钟/小时限频——而主动消息恰恰是最容易触发
+            # 平台风控的那一类（"防平台风控"的闸不能只保护被动回复）。
             if self.settings.outreach.use_wakeup and kind == "c2c":
-                body["is_wakeup"] = True
-            path = (
-                f"/v2/users/{target}/messages"
-                if kind == "c2c"
-                else f"/v2/groups/{target}/messages"
-            )
+                self._wakeup_once = True   # send() 会把它写进请求体
             try:
-                self._request("POST", path, body)
-            except QQError as exc:
-                print(f"[主动发送失败·{which}] {exc}", file=sys.stderr)
+                result = self.send(kind, target, text, None)
+            finally:
+                self._wakeup_once = False
+            if not result.ok:
+                print(
+                    f"[主动发送失败·{which}] {result.progress} 段未送达：{result.failed[:1]}",
+                    file=sys.stderr,
+                )
                 continue
             hub.note_outreach_sent(text, keep_in_history=(kind == "c2c"))
             where = "私聊" if kind == "c2c" else "群里"
@@ -959,7 +1159,19 @@ class QQBot:
                     elif event == "RESUMED":
                         print("[恢复] 会话已恢复，遗漏事件已补发")
                     else:
-                        self.handle_event(str(event), data)
+                        # 一条事件处理失败（写库/编码/模型层意外异常）不该拆掉整条连接：
+                        # 以前没有这层兜底，异常会冒到 run() 被当成"断开"→ 重连，
+                        # 而那条消息永远没有回复。
+                        try:
+                            self.handle_event(str(event), data)
+                        except QQReconnect:
+                            raise
+                        except Exception as exc:  # noqa: BLE001
+                            print(
+                                f"[事件失败] {event}：{type(exc).__name__}: {exc}"
+                                "（连接保持，继续收消息）",
+                                file=sys.stderr,
+                            )
                 elif op == OP_HEARTBEAT_ACK:
                     pass
                 elif op == OP_RECONNECT:
@@ -973,6 +1185,9 @@ class QQBot:
                 self.session_id, self.seq = None, None
             raise
         finally:
+            # 收尾：先把还在 2 秒窗口里的批次处理掉（systemd 停止/重启时不丢消息），
+            # 再关连接、再落库退出。
+            self._flush_pending_batches()
             ws.close()
 
     def run(self) -> None:

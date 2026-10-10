@@ -279,6 +279,47 @@ def known_block(memories: list[dict], limit: int = 14) -> str:
     return "\n".join(lines)
 
 
+# 同一条记忆每一轮检索都要重新分词（BM25 要逐条算），而记忆内容基本不变。
+# 按 (id, 文本) 缓存：文本被 update_memory 改过之后键就变了，不会读到旧值。
+_DOC_COUNTS_CACHE: dict[tuple[int, str], Counter] = {}
+_DOC_COUNTS_CACHE_MAX = 4096
+
+
+def _doc_counts(mem: dict) -> Counter:
+    """记忆的加权词元（带缓存）。"""
+    text = memory_text(mem)
+    key = (int(mem.get("id") or 0), text)
+    cached = _DOC_COUNTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    counts = tokenize_weighted(text)
+    if len(_DOC_COUNTS_CACHE) >= _DOC_COUNTS_CACHE_MAX:
+        _DOC_COUNTS_CACHE.clear()  # 内存有界：满了整表清空，比 LRU 省事，也够用
+    _DOC_COUNTS_CACHE[key] = counts
+    return counts
+
+
+def _prefilter(memories: list[dict], cfg: MemoryConfig) -> list[dict]:
+    """候选集预筛：记忆很多时先按"更该被想起"的顺序取前 N 条。
+
+    排序只看便宜的字段（层级 / 重要性 / id），不做分词——预筛自己不能变成瓶颈。
+    N = cfg.recall_prefilter，默认够大（2000），正常数据量下**不改变任何行为**；
+    真到了几千条以上，它保证每轮检索的开销有上界。
+    """
+    limit = int(getattr(cfg, "recall_prefilter", 0) or 0)
+    if limit <= 0 or len(memories) <= limit:
+        return memories
+
+    def rank(m: dict) -> tuple:
+        return (
+            -cfg.layer_weight(str(m.get("layer") or "normal")),
+            -float(m.get("importance") or 0.5),
+            -int(m.get("id") or 0),
+        )
+
+    return sorted(memories, key=rank)[:limit]
+
+
 def recall(
     query: str,
     memories: list[dict],
@@ -296,6 +337,10 @@ def recall(
       2. 相关性主导：分数 = 归一化相关度 ×（关键词 + 重要性 + 保留率 + 层级）；
       3. 相对裁剪 + min_score：只留得分 ≥ 首名 relative_cutoff 的结果，
          压掉"第五名那条半残记忆"污染回复的问题。
+
+    **min_score 是相对门槛**（`bm = 本条 BM25 / 本轮候选集最高 BM25`，首名恒为 1.0）：
+    候选集小时它几乎拦不住任何东西，同一条记忆的分数还会随旁边有哪些候选而变。
+    要绝对严格度请用 `cfg.min_raw_score`（未归一化的 BM25 分，默认 0.0 = 不启用）。
     """
     if not memories:
         return []
@@ -306,10 +351,11 @@ def recall(
     qcounts_list = [tokenize_weighted(q) for q in queries]
     gates = [min(EVIDENCE_GATE, sum(_term_weight(t) for t in qc)) for qc in qcounts_list]
 
-    docs = [tokenize_weighted(memory_text(m)) for m in memories]
+    candidates = _prefilter(memories, cfg)
+    docs = [_doc_counts(m) for m in candidates]
     top = 0.0
-    best_raw = [0.0] * len(memories)
-    passed = [False] * len(memories)
+    best_raw = [0.0] * len(candidates)
+    passed = [False] * len(candidates)
     for qc, gate in zip(qcounts_list, gates):
         scores = bm25_scores(qc, docs)
         for i, s in enumerate(scores):
@@ -321,9 +367,11 @@ def recall(
                 passed[i] = True
 
     scored: list[tuple[float, dict]] = []
-    for i, mem in enumerate(memories):
+    for i, mem in enumerate(candidates):
         if not passed[i]:
             continue
+        if cfg.min_raw_score > 0 and best_raw[i] < cfg.min_raw_score:
+            continue  # 绝对门槛：与候选集里别的记忆无关
         bm = (best_raw[i] / top) if top > 0 else 0.0
         importance = float(mem.get("importance") or 0.5)
         retention = retention_of(mem, cfg, now)
@@ -384,8 +432,11 @@ def is_weak(
 def is_cited(reply: str, summary: str, cfg: MemoryConfig) -> bool:
     """她真的把这条记忆说出口了吗？
 
-    用**字面重合**判定：共享 ≥ cite_min_shared 个词（二元组/单词），
-    或有一段 ≥ cite_min_chars 的连续重合。
+    两条**都**要满足：
+      1. **至少命中一个二元组/词**（`shared_bigram >= 1`）——光靠三个单字凑数不算：
+         「搭档说：他」这种公共前缀本来就能凑够 `cite_min_shared`，于是
+         "她只是说了句普通话"会被记成"她把这条记忆说出口了"；
+      2. 共享 ≥ `cite_min_shared` 个二元组/词，或有一段 ≥ `cite_min_chars` 的连续重合。
 
     已知局限：模型完全改写措辞（同义替换）时会判为"没被引用"。
     宁可漏记也不误记——误记会让从没提过的事莫名其妙地变清晰。
@@ -394,12 +445,19 @@ def is_cited(reply: str, summary: str, cfg: MemoryConfig) -> bool:
     summary = (summary or "").strip()
     if not reply or not summary:
         return False
+    reply_counts = tokenize_weighted(reply)
+    summary_counts = tokenize_weighted(summary)
+    # 二元组 = 相邻两个汉字；英文/数字按整词算（长度 ≥ 2）。单字不计。
+    shared_bigrams = sum(
+        1 for term in summary_counts if len(term) >= 2 and term in reply_counts
+    )
+    if shared_bigrams < 1:
+        return False
     if longest_common_substring(reply, summary) >= cfg.cite_min_chars:
         return True
-    reply_counts = tokenize_weighted(reply)
     shared = sum(
         1
-        for term, weight in tokenize_weighted(summary).items()
+        for term, weight in summary_counts.items()
         if weight >= 2.0 and term in reply_counts
     )
     return shared >= cfg.cite_min_shared
@@ -408,20 +466,19 @@ def is_cited(reply: str, summary: str, cfg: MemoryConfig) -> bool:
 def mark_cited(
     store: Store, recalled: list[Recalled], reply: str, cfg: MemoryConfig, now_iso: str
 ) -> list[int]:
-    """把她真的说出口的记忆强化一次。返回被强化的 id 列表。
+    """把她真的说出口的记忆强化一次。返回被强化的 id 列表（**最多一条**）。
 
+    为什么最多一条：`recall_count` 是单调递增、永不清零的，而且同时抬高检索分
+    和降低模糊度 —— 一句话给三条记忆各 +1，等于把"她记得"这件事整体往上推，
+    而其中只有一条真的被她说出口（P1-2）。`recalled` 已按得分降序排列，
+    所以"最该被算作说出口的那条"就是第一个判真的。
     同时比对"她看到的模糊版"和"原始条目"：只要有一边对得上就算数。
-    偏向于强化而不是漏计——漏计会让记忆力单向衰减，形成死亡螺旋。
     """
-    cited = [
-        r.memory["id"]
-        for r in recalled
-        if is_cited(reply, r.text, cfg)
-        or is_cited(reply, str(r.memory.get("summary", "")), cfg)
-    ]
-    if cited:
-        store.mark_cited(cited, now_iso)
-    return cited
+    for r in recalled:
+        if is_cited(reply, r.text, cfg) or is_cited(reply, str(r.memory.get("summary", "")), cfg):
+            store.mark_cited([r.memory["id"]], now_iso)
+            return [r.memory["id"]]
+    return []
 
 
 # ── 整理 ──────────────────────────────────────────────────────────
@@ -523,9 +580,14 @@ def load_pending(
     key = f"last_consolidated:{session_id}"
     cursor = store.meta_get_int(key, -1)
     if cursor < 0:
-        # 第一次为这个会话建游标：从全局游标接上，
-        # 免得升级之后把历史消息重新整理一遍、记忆翻倍。
-        cursor = store.meta_get_int("last_consolidated_msg_id", 0)
+        # 第一次为这个会话建游标：**不能**直接继承全局游标。
+        # 全局游标是跨会话的最大值，继承它会让"这个会话里 id 更小的未整理消息"
+        # 永远落在窗口外、再也不被整理成记忆（P1-10）。
+        # 宁可多整理一次这个会话，也不要永久跳过：取
+        # min(本会话最早一条未整理消息的 id - 1, 全局游标)。
+        global_cursor = store.meta_get_int("last_consolidated_msg_id", 0)
+        first_open = store.first_open_message_id(instance_no, session_id)
+        cursor = min(first_open - 1, global_cursor) if first_open is not None else global_cursor
         store.meta_set(key, cursor)
     return store.open_messages(instance_no, cursor, session_id=session_id)
 
@@ -586,68 +648,91 @@ def consolidate(
     added = 0
     merged = 0
     skipped = 0
-    for d in drafts:
-        if not d.summary.strip():
-            continue
-        if d.importance < settings.memory.min_importance:
-            continue
-        layer = d.layer if d.layer in ("core", "important", "normal") else infer_layer(
-            d.importance, d.emotion
+    # 回调（关系加分 / 改称呼）会自己写 state 并 commit —— 所以**必须等事务提交后**
+    # 再触发，否则它们会把还没写完的整理事务提前提交掉，回滚就不再完整。
+    callbacks: list = []
+    # ── 一个显式事务：写记忆 + 标 consolidated + 推两个游标，要么全成，要么全不成 ──
+    # 以前每一步各自 commit，中途失败会留下"记忆已落库、消息没标已整理、
+    # 游标没推进"的撕裂状态（P1-7）。失败时整批回滚 → 消息仍是未整理，
+    # 下一轮可重试，且不会产生重复记忆（相似度去重仍在）。
+    store.begin()
+    try:
+        for d in drafts:
+            if not d.summary.strip():
+                continue
+            if d.importance < settings.memory.min_importance:
+                continue
+            layer = d.layer if d.layer in ("core", "important", "normal") else infer_layer(
+                d.importance, d.emotion
+            )
+
+            # 去重：这件事她已经记过了吗？
+            dup = None
+            for old in existing:
+                if similarity(d.summary, str(old.get("summary", ""))) >= settings.memory.dedupe_ratio:
+                    dup = old
+                    break
+            if dup is not None:
+                old_summary = str(dup.get("summary", ""))
+                if len(d.summary.strip()) > len(old_summary) + 8:
+                    # 新版本更详细 → 让旧那条长大（记忆演进），而不是再记一条
+                    store.update_memory(
+                        int(dup["id"]),
+                        summary=d.summary.strip(),
+                        tags=d.tags.strip(),
+                        importance=float(d.importance),
+                        layer=layer,
+                        commit=False,
+                    )
+                    dup["summary"] = d.summary.strip()
+                    merged += 1
+                else:
+                    skipped += 1
+                continue
+
+            new_id = store.add_memory(
+                instance_no=instance_no,
+                created_ts=now_iso,
+                happened_ts=pending[0]["ts"],
+                summary=d.summary.strip(),
+                tags=d.tags.strip(),
+                emotion=d.emotion.strip(),
+                importance=float(d.importance),
+                source_session=session_id,
+                layer=layer,
+                strength=initial_strength(d.importance, d.emotion),
+                event_date=d.event_date,
+                scope=scope,
+                subject_id=subject_id,
+                speaker_id=speaker_id,
+                about=d.about,
+                commit=False,
+            )
+            added += 1
+            # 同一批里后面的条目也要跟刚写进去的做去重
+            existing = [*existing, {"id": new_id, "summary": d.summary.strip()}]
+            if on_draft is not None:
+                callbacks.append((on_draft, d))
+
+        ids = [m["id"] for m in pending]
+        store.mark_consolidated(ids, commit=False)
+        store.meta_set(f"last_consolidated:{session_id}", ids[-1], commit=False)
+        store.meta_set(
+            "last_consolidated_msg_id",
+            max(ids[-1], store.meta_get_int("last_consolidated_msg_id", 0)),
+            commit=False,
         )
+    except BaseException:
+        store.rollback()
+        raise
+    store.commit()
 
-        # 去重：这件事她已经记过了吗？
-        dup = None
-        for old in existing:
-            if similarity(d.summary, str(old.get("summary", ""))) >= settings.memory.dedupe_ratio:
-                dup = old
-                break
-        if dup is not None:
-            old_summary = str(dup.get("summary", ""))
-            if len(d.summary.strip()) > len(old_summary) + 8:
-                # 新版本更详细 → 让旧那条长大（记忆演进），而不是再记一条
-                store.update_memory(
-                    int(dup["id"]),
-                    summary=d.summary.strip(),
-                    tags=d.tags.strip(),
-                    importance=float(d.importance),
-                    layer=layer,
-                )
-                dup["summary"] = d.summary.strip()
-                merged += 1
-            else:
-                skipped += 1
-            continue
+    for cb, d in callbacks:
+        try:
+            cb(d)
+        except Exception:
+            pass  # 回调失败不该影响记忆落库
 
-        new_id = store.add_memory(
-            instance_no=instance_no,
-            created_ts=now_iso,
-            happened_ts=pending[0]["ts"],
-            summary=d.summary.strip(),
-            tags=d.tags.strip(),
-            emotion=d.emotion.strip(),
-            importance=float(d.importance),
-            source_session=session_id,
-            layer=layer,
-            strength=initial_strength(d.importance, d.emotion),
-            event_date=d.event_date,
-            scope=scope,
-            subject_id=subject_id,
-            speaker_id=speaker_id,
-            about=d.about,
-        )
-        added += 1
-        # 同一批里后面的条目也要跟刚写进去的做去重
-        existing = [*existing, {"id": new_id, "summary": d.summary.strip()}]
-        if on_draft is not None:
-            try:
-                on_draft(d)
-            except Exception:
-                pass  # 回调失败不该影响记忆落库
-
-    ids = [m["id"] for m in pending]
-    store.mark_consolidated(ids)
-    store.meta_set(f"last_consolidated:{session_id}", ids[-1])
-    store.meta_set("last_consolidated_msg_id", max(ids[-1], store.meta_get_int("last_consolidated_msg_id", 0)))
     if stats is not None:
         stats.update(added=added, merged=merged, skipped=skipped)
     return added

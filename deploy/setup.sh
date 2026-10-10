@@ -43,13 +43,26 @@ fi
 say "3/6 安装到 $APP_DIR"
 mkdir -p "$APP_DIR"
 if [ "$SRC_DIR" != "$APP_DIR" ]; then
+  # 代码全量覆盖；**config/ 单独处理**：persona.toml / settings.toml 是"她是谁"，
+  # 服务器上多半被改过（改人格、调退化曲线），重复运行 setup.sh 不该把改动冲掉。
   tar -C "$SRC_DIR" \
       --exclude=./data \
       --exclude=./.git \
+      --exclude=./.review \
+      --exclude=./config \
       --exclude=./__pycache__ \
       --exclude='*/__pycache__' \
       -cf - . | tar -C "$APP_DIR" -xf -
-  echo "已从 $SRC_DIR 复制（data/ 不动）"
+  mkdir -p "$APP_DIR/config"
+  for f in persona.toml settings.toml; do
+    if [ -f "$APP_DIR/config/$f" ]; then
+      echo "  保留已有的 config/$f（不覆盖）"
+    else
+      cp "$SRC_DIR/config/$f" "$APP_DIR/config/$f"
+      echo "  补上 config/$f（仓库默认值）"
+    fi
+  done
+  echo "已从 $SRC_DIR 复制（data/ 与已有 config/ 都不动）"
 else
   echo "源目录就是 $APP_DIR，跳过复制"
 fi
@@ -73,8 +86,16 @@ grep -qE '^[[:space:]]*QQ_BOT_APPID=[^[:space:]]' "$APP_DIR/.env" && \
 echo "DeepSeek key：$([ $HAS_LLM -eq 1 ] && echo 已配置 || echo '缺失')　QQ 凭据：$([ $HAS_QQ -eq 1 ] && echo 已配置 || echo '还没申请')"
 
 # ── 4. 环境自检（不需要联网、不需要 API key）───────────────────
-say "4/6 环境自检（跑一遍项目自带的 187 项测试）"
-if sudo -u "$APP_USER" python3 "$APP_DIR/tools/selftest.py" >/tmp/giftia-selftest.log 2>&1; then
+say "4/6 环境自检（跑一遍项目自带的端到端测试）"
+# 自检用的解释器必须与服务的 ExecStart 是同一个，否则会出现"自检通过、服务起不来"
+# （例如 PATH 里是用户装的 3.12，而 ExecStart 写死 /usr/bin/python3 = 3.10，没有 tomllib）。
+SERVICE_PY="$(sed -n 's|^ExecStart=\([^ ]*\).*|\1|p' "$SRC_DIR/deploy/${SERVICE}.service" | head -n1)"
+[ -n "$SERVICE_PY" ] || SERVICE_PY="/usr/bin/python3"
+if [ ! -x "$SERVICE_PY" ]; then
+  die "服务里写的解释器不存在：$SERVICE_PY。请改 deploy/${SERVICE}.service 的 ExecStart。"
+fi
+echo "自检解释器：$SERVICE_PY（与 service 的 ExecStart 一致）"
+if sudo -u "$APP_USER" "$SERVICE_PY" "$APP_DIR/tools/selftest.py" >/tmp/giftia-selftest.log 2>&1; then
   tail -n 3 /tmp/giftia-selftest.log | sed 's/^/  /'
   echo "自检通过 —— 这台机器上她能正常跑。"
 else

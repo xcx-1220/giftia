@@ -91,16 +91,32 @@ def sent_today(store: Store, now: datetime) -> int:
     return count
 
 
-def can_send(settings: Settings, store: Store, now: datetime) -> bool:
+def can_send(
+    settings: Settings,
+    store: Store,
+    now: datetime,
+    *,
+    batch_extra: int = 0,
+    ignore_gap: bool = False,
+) -> bool:
+    """现在能不能主动开口。
+
+    `batch_extra`：这一批除了"这一条"之外**还要多发几条**（`target=both` 传 1）。
+    日上限按"这一批发完还剩不剩"判：已发 + 额外条数 必须**小于**上限，
+    否则会在只剩 1 个日额度时硬发 2 条，把"每天最多 N 次"撑破。
+    `ignore_gap`：同一批里的第 2、3 个目标跳过最小间隔——间隔已经在**这一批开始时**
+    判过一次了，不能再拿"刚发出去的那条"把同批的其它目标挡掉。
+    """
     if not settings.outreach.enabled:
         return False
     # 先看日上限：这是防打扰的第一道闸（30 天总额度是第二道）
-    if sent_today(store, now) >= max(1, settings.outreach.max_per_day):
+    extra = max(0, int(batch_extra))
+    if sent_today(store, now) + extra >= max(1, settings.outreach.max_per_day):
         return False
     used, left, next_ok = quota_state(settings, store, now)
-    if left <= 0:
+    if left < 1 + extra:
         return False
-    if next_ok:
+    if next_ok and not ignore_gap:
         try:
             if now < datetime.fromisoformat(next_ok):
                 return False
@@ -180,9 +196,23 @@ def plan(
 
     # 3) 她自己的心情（"主动分享自己"）
     #    不安那种心情不往外说——那是终端服务迫近，只在私聊、且走 near_end 那条路。
+    #    **两道闸**（审查 P1-16）：
+    #      ① 心情必须还在有效期内（过期的软心情不算"她今天的样子"）；
+    #      ② 距上次说话要够久——刚聊完就再发一条"我今天心情 X"是打扰，
+    #         而且按"每条消息都算一次主动"的额度算，几天就能把稀缺额度烧光。
     if mood is not None and getattr(mood, "key", "") not in ("", "calm", "uneasy"):
+        min_idle = float(getattr(settings.outreach, "mood_share_min_idle_hours", 6.0) or 0.0)
+        idle_ok = True
+        if min_idle > 0:
+            last_ts = store.last_message_ts(instance_no)
+            if last_ts:
+                try:
+                    gap = (now - datetime.fromisoformat(last_ts)).total_seconds() / 3600.0
+                    idle_ok = gap >= min_idle
+                except ValueError:
+                    idle_ok = True
         day_key = f"mood_shared:{now.date().isoformat()}"
-        if str(store.state_get(day_key, "") or "") != str(mood.key):
+        if idle_ok and str(store.state_get(day_key, "") or "") != str(mood.key):
             if not for_group:
                 return OutreachPlan(
                     reason="mood_share",

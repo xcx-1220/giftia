@@ -6,11 +6,13 @@
 
 from __future__ import annotations
 
+import math
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from .clock import Clock
-from .config import Settings, Stage
+from .config import LifespanConfig, Settings, Stage
 from .store import Store
 
 
@@ -110,9 +112,13 @@ class Lifespan:
 
     @property
     def total_hours(self) -> float:
-        """这一任的总寿命：激活时写死的值优先，其次才看当前配置。"""
+        """这一任的总寿命：激活时写死的值优先，其次才看当前配置。
+
+        库里的值可能是坏的（0 / 负数 / nan / inf——手改库、旧版本写进去的）。
+        坏值一律不用，退回配置值，别让"她活多久"取决于一个坏数字。
+        """
         stored = self.store.meta_get_float(self.META_TOTAL, 0.0)
-        if stored > 0:
+        if math.isfinite(stored) and stored > 0:
             return stored
         return self.settings.lifespan.effective_hours()
 
@@ -121,7 +127,26 @@ class Lifespan:
         now = self.clock.now()
         activated = self.activated_at
         total = self.total_hours
-        expires = activated + timedelta(hours=total)
+        if not math.isfinite(total) or total <= 0:
+            # 绝不把坏值表现成"出生即到期"：那会让第一条消息就触发回收换代、
+            # 把她的档案封存掉（P1-9）。退回能用的值，并且**大声说出来**。
+            fallback = float(self.settings.lifespan.total_hours)
+            if not math.isfinite(fallback) or fallback <= 0:
+                fallback = LifespanConfig().total_hours
+            print(
+                f"[lifespan] 总寿命值非法（{total!r}），按 {fallback:g} 小时处理；"
+                "请检查 settings.toml [lifespan] 与 meta.instance_total_hours",
+                file=sys.stderr,
+            )
+            total = fallback
+        try:
+            expires = activated + timedelta(hours=total)
+        except (OverflowError, OSError, ValueError):
+            # 极大但有限的值（例如 1e300）会让 timedelta 直接溢出。
+            # status() 无处不在（/status、/prompt、进度条、brief），在这儿崩
+            # 等于这个库再也启动不了对话。只影响展示的"回收预定"日期，
+            # ratio / stage / expired 都不受影响。
+            expires = activated + timedelta(days=36500)  # ≈100 年
         used = (now - activated).total_seconds() / 3600.0
         remaining = total - used
         ratio = remaining / total if total > 0 else 0.0

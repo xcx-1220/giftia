@@ -123,6 +123,11 @@ def available(hub: Any) -> tuple[bool, str]:
         return False, "这一轮她是客人（群里别人说话），不该动记忆"
     if not getattr(hub, "is_handler", False):
         return False, "说话的不是搭档"
+    if not str(getattr(hub, "handler_id", "") or ""):
+        # 未绑定态（`/unbind` 之后、`auto_bind = false` 时的私聊）：
+        # 没有搭档，就没人有资格动"你们之间"的记忆。工具不能绕过这条边界
+        # （契约 §三：没有搭档时任何私聊都不是搭档）。
+        return False, "她还没有搭档——先认主或 /bind 才能动记忆"
     return True, ""
 
 
@@ -147,7 +152,13 @@ def _valid_names(hub: Any) -> list[str]:
 
 def execute(hub: Any, name: str, arguments: str) -> str:
     """执行一次工具调用，返回给模型看的文本结果。**永远不抛异常**——
-    工具报错不该让整轮对话崩掉，如实回一句就够了。"""
+    工具报错不该让整轮对话崩掉，如实回一句就够了。
+
+    P1-4：以前这个承诺是假的——`_remember` 直接 `store.add_memory(...)`，
+    库一锁（`sqlite3.OperationalError: database is locked`）就抛穿，
+    顺着 `_chat` → `handle()` → 适配器把整条 WS 打回重连，用户永远等不到回复。
+    现在整段包在 try/except 里：失败回一句人话，并在 notices/diary 里留一笔。
+    """
     ok, why = available(hub)
     if not ok:
         return f"（现在不能用记忆工具：{why}）"
@@ -158,13 +169,35 @@ def execute(hub: Any, name: str, arguments: str) -> str:
     if not isinstance(args, dict):
         return "（参数应该是一个对象）"
 
-    if name == "remember":
-        return _remember(hub, args)
-    if name == "search":
-        return _search(hub, args)
-    if name == "forget":
-        return _forget(hub, args)
-    return f"（没有 {name} 这个工具；可用的是 remember / search / forget）"
+    try:
+        if name == "remember":
+            return _remember(hub, args)
+        if name == "search":
+            return _search(hub, args)
+        if name == "forget":
+            return _forget(hub, args)
+        return f"（没有 {name} 这个工具；可用的是 remember / search / forget）"
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        _note_failure(hub, name, detail, arguments)
+        return "（刚才那个动作没做成，别当它发生过——先用你知道的继续说。）"
+
+
+def _note_failure(hub: Any, name: str, detail: str, arguments: str) -> None:
+    """工具失败留痕（P1-4）：notices 给人看、diary 给排障看。自己绝不抛。"""
+    try:
+        hub.notices.append(f"[内部错误] 工具 {name} 失败：{detail}")
+    except Exception:
+        pass
+    try:
+        hub.store.add_diary(
+            hub.clock.iso(),
+            f"工具 {name} 执行失败：{detail}\n参数：{str(arguments)[:200]}",
+            kind="terminal",
+            title="工具失败",
+        )
+    except Exception:
+        pass  # 连日记都写不进去（库坏了）：至少模型那一边已经拿到人话
 
 
 def _remember(hub: Any, args: dict) -> str:
@@ -212,7 +245,8 @@ def _search(hub: Any, args: dict) -> str:
     if not query:
         return "（query 不能为空）"
     about = str(args.get("about") or "").strip()
-    memories = hub.store.active_memories(hub.instance_no, view=hub.memory_view)
+    # 走 hub 的可见记忆（视角 + P0-3b 的绑定时刻遮蔽），别绕过它直接查库
+    memories = hub.visible_memories()
     if about:
         memories = [m for m in memories if str(m.get("about") or "") == about]
     if not memories:
@@ -232,10 +266,9 @@ def _forget(hub: Any, args: dict) -> str:
         mem_id = int(raw)
     except (TypeError, ValueError):
         return "（memory_id 得是一个编号，从 search 的结果里拿）"
-    # 只能忘掉她"此刻看得见"的记忆：不能借这个工具碰到别人的私事
-    visible = {
-        int(m["id"]) for m in hub.store.active_memories(hub.instance_no, view=hub.memory_view)
-    }
+    # 只能忘掉她"此刻看得见"的记忆：不能借这个工具碰到别人的私事，
+    # 也不能绕过换人之后的绑定时刻遮蔽（P0-3b）
+    visible = {int(m["id"]) for m in hub.visible_memories()}
     if mem_id not in visible:
         return f"（#{mem_id} 不在你能看到的记忆里）"
     hub.store.forget_memory(mem_id)

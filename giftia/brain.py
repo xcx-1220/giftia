@@ -44,7 +44,7 @@ from .outreach import OutreachPlan, can_send, compose as compose_outreach_text
 from .outreach import history_text as outreach_history
 from .outreach import plan as outreach_plan
 from .outreach import record_sent
-from .persona import after_recycle_line, build_system_prompt
+from .persona import ROSTER_MAX, after_recycle_line, build_system_prompt
 from .recycle import RecycleReport, perform_recycle
 from .store import Store
 
@@ -53,6 +53,18 @@ FAILURE_LINES = [
     "……信号好像断了一下。……我还在，你继续。",
     "……唔。刚才那句话掉进什么地方去了，我没接住。",
 ]
+
+# 本地/单机调用方的默认 uid（`giftia/cli.py`、`run.py --once`、
+# `handle_message()` 的默认值都是它）。它**不是**平台身份（QQ 的 openid 是 32 位十六进制），
+# 所以核心可以据此判断"调用方就是本机的搭档本人"——详见 _auto_bind / set_handler_id。
+LOCAL_USER_ID = "handler"
+
+# 花名册里"最近活跃"这个时间戳多久刷新一次。每条群消息都重写一遍 state 没必要，
+# 一小时粒度足够排序用，也避免每条消息多一次写库。
+PERSON_LAST_REFRESH_MINUTES = 60.0
+
+# 旁听攒下来的会话（P1-14）：值 = 会话 id → 最后一次旁听的时间。
+LISTEN_PENDING_KEY = "listen_pending"
 
 # 工具轮次用满前的最后一句系统提醒：**同时还会拿掉工具**（见 _reply_with_tools）。
 # 光靠提醒不足以保证她说得出话——她可能又去调工具，用户就永远等不到回复。
@@ -93,14 +105,32 @@ class Giftia:
         self.llm = llm or make_llm(settings)
         self.lifespan = Lifespan(settings, self.store, self.clock)
         self.lifespan.ensure_activated()
-        # 老数据的 scope 是默认值，会让群里的话被当成"你的私事"——启动时归位一次
+        # 老数据的 scope 是默认值，会让群里的话被当成"你的私事"——启动时归位一次。
+        # P1-5：这是一次**隐私归位迁移**，失败不能静默吞掉（否则群里的话一直被当成私事），
+        # 也不能留下"已完成"标记——要留着下次启动重试。
+        init_warnings: list[str] = []
         try:
             self.store.backfill_message_scopes()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._reset_backfill_markers()
+            detail = f"{type(exc).__name__}: {exc}"
+            init_warnings.append(
+                f"[隐私迁移] 历史消息归属回填失败：{detail}（下次启动会重试）"
+            )
+            try:
+                self.store.add_diary(
+                    self.clock.iso(),
+                    f"历史消息归属回填失败：{detail}\n"
+                    "这些老消息的归属还是默认值（可能把群里的话当成你的私事）。"
+                    "已清掉完成标记，下次启动会重试。",
+                    kind="terminal",
+                    title="隐私迁移失败",
+                )
+            except Exception:
+                pass  # 连日记都写不进去（库都坏了）：至少 init_warnings 里有
         self.bond = BondTracker(self.store, settings)
         self.mood = MoodTracker(self.store, settings)
-        self.notices: list[str] = []
+        self.notices: list[str] = list(init_warnings)
         self.last_recalled: list[Recalled] = []
         self.last_cited: list[int] = []
         self.rewritten_queries: list[str] = []
@@ -125,6 +155,38 @@ class Giftia:
         self.tool_writes: list[str] = []
         # 最近一次"她想主动说什么"的计划（心情分享要靠它去重）
         self.last_outreach_plan = None
+
+    # ── 留痕与善后 ────────────────────────────────────────
+    def _note_error(self, where: str, exc: BaseException) -> None:
+        """异常留痕：`notices` 给人看，`diary` 给排障看。**自己绝不抛**。
+
+        适配器那一层最怕的是"异常冒穿 → 断连重连"，而模糊的日志又排不了障，
+        所以两条路都写：格式固定成 `[内部错误] 哪里：类型: 消息`。
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        self.notices.append(f"[内部错误] {where}：{detail}")
+        try:
+            self.store.add_diary(
+                self.clock.iso(),
+                f"{where}出错了：{detail}",
+                kind="terminal",
+                title="内部错误",
+            )
+        except Exception:
+            pass  # 日记都写不进去就只能算了，但绝不能因此再抛
+
+    def _reset_backfill_markers(self) -> None:
+        """把"回填已完成"的标记清掉，让下次启动重试（P1-5）。
+
+        标记由 `Store.backfill_message_scopes` 自己写（v1/v2 两个键）；
+        失败时如果它已经把标记落下了，不清就等于永久放弃这次隐私迁移。
+        """
+        for key in ("msg_scope_backfilled", "msg_scope_backfill_v2"):
+            try:
+                if self.store.meta_get_int(key, 0):
+                    self.store.meta_set(key, 0)
+            except Exception:
+                pass
 
     # ── 称呼与「认得的人」────────────────────────────────
     # 出厂时她**不知道**你叫什么（返回空串）。这是数据，不是预设。
@@ -160,8 +222,134 @@ class Giftia:
         """平台上的搭档 id（适配器 /bind 或自动认主时写入）。核心不关心它长什么样。"""
         return str(self.store.state_get("handler_id", "") or "")
 
-    def set_handler_id(self, user_id: str) -> None:
-        self.store.state_set("handler_id", str(user_id or ""))
+    @property
+    def handler_bound_at(self) -> str:
+        """"这一次绑定"的时刻——新搭档看不到早于它的 private 记忆（P0-3b）。
+
+        空串 = 没有历史私事需要遮蔽（第一次绑定就是全新的一任）。
+        见 `_memory_visible` / `visible_memories`：遮蔽只作用在 private 归属上，
+        同一任搭档自己说的话照旧全在。
+        """
+        return str(self.store.meta_get("handler_bound_at", "") or "")
+
+    def set_handler_id(self, user_id: str, *, local: bool = False) -> None:
+        """绑定 / 解绑搭档。
+
+        P0-3b（契约 §二）：**每一次换人**都重记一次"绑定时刻"：新搭档是"从这一刻开始"
+        跟她有过去的，所以绑定之前留下的 private 记忆对他们不存在——前任的私事不会换主人。
+        下界只往前推、不往回退（隐私优先：后来的绑定不许把它"洗掉"）。
+
+        - `local=True`：调用方就是本机的搭档本人（本地 CLI 不传 user_id，见 LOCAL_USER_ID）。
+          他看的是自己留下的记忆，所以不设下界；但也不会清掉已有的下界。
+        - 同一个人 `/unbind` 之后再 `/bind` 回来（`meta['handler_prev_id']` 对得上）：
+          保留原来那一道下界——他记得的是自己的过去，不该被自己的解绑清空。
+        - 除了时间戳还记两条 **id 水位线**：这个库的时间戳只有秒级精度，
+          "前任刚说完就 /unbind、新人立刻说话"会压在同一秒里，只比时间戳分不开。
+          id 是单调递增的，`id <= 水位线` = "绑定之前就写下的"，精确。
+        """
+        uid = str(user_id or "")
+        old = self.handler_id
+        if uid and uid == old:
+            return  # 同一任重复绑定：不动遮蔽下界
+        if not uid:
+            # /unbind：记下"刚才这一任是谁"，好让下一任判断是"同一个人回来"还是"换人"
+            if old:
+                self.store.meta_set("handler_prev_id", old)
+            self.store.state_set("handler_id", "")
+            return
+        self.store.state_set("handler_id", uid)
+        if local:
+            return  # 本机调用方 = 搭档本人：不遮
+        if not self._has_private_history():
+            return  # 全新的一任（库里没有历史私事）：没有要遮的东西
+        same_person = uid == str(self.store.meta_get("handler_prev_id", "") or "")
+        if same_person:
+            return  # 同一个人回来：他记得自己的过去，解绑不该清空它
+        self.store.meta_set("handler_bound_at", self.clock.iso())
+        self.store.meta_set("handler_bound_mem_id", self._max_private_memory_id())
+        self.store.meta_set("handler_bound_msg_id", self._max_message_id())
+
+    def _int_meta(self, key: str) -> int:
+        try:
+            return int(self.store.meta_get_int(key, 0) or 0)
+        except Exception:
+            return 0
+
+    def _max_private_memory_id(self) -> int:
+        try:
+            rows = self.store.active_memories(self.instance_no, view=[("private", "")])
+        except Exception:
+            return 0
+        return max((int(m.get("id") or 0) for m in rows), default=0)
+
+    def _max_message_id(self) -> int:
+        try:
+            rows = self.store.all_messages(self.instance_no, limit=1)
+        except Exception:
+            return 0
+        return max((int(m.get("id") or 0) for m in rows), default=0)
+
+    def _has_private_history(self) -> bool:
+        """库里还有"前任留下的"private 记忆吗（换人时决定要不要设遮蔽下界）。"""
+        try:
+            return bool(
+                self.store.active_memories(self.instance_no, view=[("private", "")])
+            )
+        except Exception:
+            return True  # 查不出来就按"有"处理：宁可多遮，不要漏
+
+    def _private_floor(self) -> str:
+        return self.handler_bound_at
+
+    def _memory_visible(self, mem: dict) -> bool:
+        """P0-3b：private 记忆按"绑定时刻"遮蔽，别的一律放行。
+
+        两条判据，先精确后兜底：
+
+        1. **id 水位线**（`handler_bound_mem_id`）：id 是插入时单调分配的，
+           `id <= 水位线` = "这条记忆是绑定之前写下的"——与秒级时间戳无关。
+        2. **时间戳**（`created_ts`，落库时刻；没有才退回 `happened_ts`）**严格晚于**
+           绑定时刻才可见。`happened_ts` 的语义是"事情发生在故事里的什么时候"
+           （`consolidate` 取的是批内最早那条消息的时间），可以早于或晚于落库时刻，
+           拿它跟绑定下界比会出现"同秒相等"甚至"未来时间"的误判。
+           水位线缺失时（老库、查询失败）这条是兜底。
+
+        另外：绑定**之后**写下的记忆，如果它说的是绑定**之前**的事
+        （延迟整理前任留下的话，`happened_ts < 下界`），也一并藏着。
+        """
+        floor = self._private_floor()
+        if not floor:
+            return True
+        if str(mem.get("scope") or "") != "private":
+            return True  # 群里的公开的事、别人私聊里的事各有各的视角闸门
+        watermark = self._int_meta("handler_bound_mem_id")
+        if watermark:
+            if int(mem.get("id") or 0) <= watermark:
+                return False  # 绑定之前就写下的：藏着
+            happened = str(mem.get("happened_ts") or "")
+            return not (happened and happened < floor)
+        written = str(mem.get("created_ts") or mem.get("happened_ts") or "")
+        return written > floor
+
+    def visible_memories(self, view=None) -> list[dict]:
+        """她**此刻真的能想起来**的记忆：视角闸门（view）+ 绑定时刻遮蔽（P0-3b）。
+
+        view 默认用当前视角 `self.memory_view`。检索、印象、工具、"她自己查一下"
+        都走这一条路——绕过它就等于绕过了遮蔽。
+        """
+        rows = self.store.active_memories(
+            self.instance_no, view=self.memory_view if view is None else view
+        )
+        return [m for m in rows if self._memory_visible(m)]
+
+    def _visible_by_person(self, view=None) -> dict[str, list[dict]]:
+        """按"关于谁"分组，且同样过一遍绑定时刻遮蔽（给印象块 / /profile 用）。"""
+        out: dict[str, list[dict]] = {}
+        for mem in self.visible_memories(view):
+            about = str(mem.get("about") or "").strip()
+            if about:
+                out.setdefault(about, []).append(mem)
+        return out
 
     @property
     def last_group_id(self) -> str:
@@ -173,7 +361,12 @@ class Giftia:
             self.store.state_set("last_group_openid", str(group_openid))
 
     # ── 群里认得的人 ──────────────────────────────────────
-    def known_people(self) -> dict[str, str]:
+    def _people_meta(self) -> dict[str, dict]:
+        """花名册的完整结构：uid → {"name", "groups", "last", "n"}。
+
+        `groups` = 在哪个群见过他（P1-12 之前不存在，只有名字）。
+        兼容老格式：值直接是名字字符串 → 名字取它，群留空。
+        """
         raw = str(self.store.state_get("known_people", "") or "")
         if not raw.strip():
             return {}
@@ -181,7 +374,31 @@ class Giftia:
             data = json.loads(raw)
         except ValueError:
             return {}
-        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        out: dict[str, dict] = {}
+        for uid, value in data.items():
+            if isinstance(value, dict):
+                name = str(value.get("name") or "").strip()
+                raw_groups = value.get("groups") or []
+                groups = [str(g) for g in raw_groups if str(g)] if isinstance(raw_groups, list) else []
+                last = str(value.get("last") or "")
+                try:
+                    n = int(value.get("n") or 0)
+                except (TypeError, ValueError):
+                    n = 0
+            else:
+                name, groups, last, n = str(value).strip(), [], "", 0
+            if name:
+                out[str(uid)] = {"name": name, "groups": groups, "last": last, "n": n}
+        return out
+
+    def known_people(self) -> dict[str, str]:
+        """uid → 名字（老接口，值就是名字）。
+
+        想知道"在哪个群见过"用 `_people_meta()`；注入提示词用 `_people_for_prompt()`。
+        """
+        return {uid: str(info.get("name") or "") for uid, info in self._people_meta().items()}
 
     def people_stats(self) -> dict[str, dict]:
         """活跃成员表：openid → {"n": 说过几句, "last": 最后说话时间}。
@@ -208,27 +425,64 @@ class Giftia:
         stats[str(user_id)] = row
         self.store.state_set("people_stats", json.dumps(stats, ensure_ascii=False))
 
-    def remember_person(self, user_id: str, name: str) -> bool:
-        """记住某个人的名字（群里自我介绍时用）。返回是否是新认识。"""
+    def remember_person(self, user_id: str, name: str, *, group_id: str = "") -> bool:
+        """记住某个人的名字（群里自我介绍时用）。返回是否真的学到了新东西。
+
+        P1-12：同时记下"在哪个群见过"（`groups`），并且只在名字/群变化、
+        或者"最近活跃"这个时间戳过了一小时才写库——不用每条消息都读改写一遍。
+        """
         name = (name or "").strip()[:16]
         if not user_id or not name:
             return False
-        people = self.known_people()
-        if people.get(str(user_id)) == name:
+        uid = str(user_id)
+        gid = str(group_id or "")
+        people = self._people_meta()
+        row = people.get(uid)
+        if row is None:
+            row = {"name": name, "groups": [], "last": "", "n": 0}
+        new_name = row.get("name") != name
+        new_group = bool(gid) and gid not in row.get("groups", [])
+        stale = True
+        last = str(row.get("last") or "")
+        if last:
+            try:
+                age_min = (self.clock.now() - datetime.fromisoformat(last)).total_seconds() / 60.0
+                stale = age_min >= PERSON_LAST_REFRESH_MINUTES
+            except (TypeError, ValueError):
+                stale = True
+        if not (new_name or new_group or stale):
             return False
-        people[str(user_id)] = name
+        row["name"] = name
+        if new_group:
+            row["groups"] = [*row.get("groups", []), gid][-8:]  # 一个人待过的群也封个顶
+        row["n"] = int(row.get("n") or 0) + 1
+        row["last"] = self.clock.iso()
+        people[uid] = row
         self.store.state_set("known_people", json.dumps(people, ensure_ascii=False))
-        return True
+        return new_name or new_group
 
-    def learn_name(self, text: str, user_id: str, *, owner: bool) -> str:
+    def learn_name(
+        self,
+        text: str,
+        user_id: str,
+        *,
+        owner: bool,
+        allow_llm: bool = True,
+        group_id: str = "",
+    ) -> str:
         """从自我介绍里学名字。
 
         两层：先走保守的正则（只认「我叫X」「叫我X」，宁可漏不可错），
         没认出来才让模型再判一次——「我是小雨」和「我是来问你个事的」
         句式一模一样，只有模型分得清。
         「别叫我X」这种否定句两层都会跳过（那是在否掉旧称呼，不是自我介绍）。
+
+        allow_llm=False：**只走正则**。旁听（log_only）走的就是这条路——
+        "没命中的消息零 token"必须字面成立（P1-14），不该为一句
+        「我是来看热闹的」多花一次模型调用。
         """
         text = text or ""
+        gid = group_id or self.group_id
         for pattern in self.INTRO_PATTERNS:
             for match in pattern.finditer(text):
                 candidate = match.group(1).strip()
@@ -246,13 +500,13 @@ class Giftia:
                         self.store.state_set("handler_name", candidate)
                         self.notices.append(f"[称呼] 她自己学会了：以后叫你「{candidate}」")
                     return candidate
-                if self.remember_person(user_id, candidate):
+                if self.remember_person(user_id, candidate, group_id=gid):
                     self.notices.append(f"[认得] 她记住了群里有人叫「{candidate}」")
                 return candidate
 
         # 正则没认出来 → 让模型再判一次。只在这种短句且带自我介绍的标志词时才多花一次调用。
         # 「我是小雨」和「我是来问你个事的」长得一样，只有模型分得清。
-        if len(text) <= 30 and any(m in text for m in self.NAME_MARKERS):
+        if allow_llm and len(text) <= 30 and any(m in text for m in self.NAME_MARKERS):
             name = ""
             try:
                 name = self.llm.extract_self_name(text) if self.llm else ""
@@ -265,7 +519,7 @@ class Giftia:
                         self.store.state_set("handler_name", name)
                         self.notices.append(f"[称呼] 她自己学会了：以后叫你「{name}」")
                     return name
-                if self.remember_person(user_id, name):
+                if self.remember_person(user_id, name, group_id=gid):
                     self.notices.append(f"[认得] 她记住了有人叫「{name}」")
                 return name
         return ""
@@ -305,29 +559,37 @@ class Giftia:
         ]
 
     def impressions_block(
-        self, text: str = "", *, per_person: int = 3, max_people: int = 15, line_chars: int = 44
+        self,
+        text: str = "",
+        *,
+        per_person: int = 3,
+        max_people: int = 15,
+        line_chars: int = 44,
+        present_only: bool = False,
     ) -> str:
         """【你对他们的印象】——每人一份档案的紧凑版，随提示词注入。
 
-        和"检索式的记忆"不同：这一块**不靠 query 命中**，而是"在场的人"各带几条。
+        和"检索式的记忆"不同：这一块**不靠 query 命中**，而是按人各带几条。
         这样她不会因为这次没问到就把人忘干净，也天然封顶（每人 3 条、最多 15 人），
         不会把上下文吃光。
 
-        借鉴 QQ-agent 的注入策略：只带本轮真的出现过的人。
+        `present_only=True`（**注入路径**，见 `_prepare`）时只带本轮真的出现过的人：
+        说话的这位、搭档、这条消息里点到的人。P1-13 之前这里有个"兜底循环"，
+        会把 `by_person` 里剩下的人全部补进来——群 G 里只有一个人在说话，
+        提示词里却带了另外 14 个人的印象，正好绕过了 `_filter_by_presence` 要防的事。
+        默认的 False 是"看整份档案"的语义（`/impressions`、调试），仍然按人封顶。
         """
         view = self.memory_view
-        by_person = self.store.memories_by_person(self.instance_no, view=view)
+        by_person = self._visible_by_person(view)
         if not by_person:
             return ""
         present: list[tuple[str, list[dict]]] = []
         # 在场的人优先（说话的这位、搭档、这条消息里点到的人）
+        names = self._present_names(text) if present_only else None
         for name, mems in by_person.items():
-            if name in self._present_names(text) or name in (
+            if names is None or name in names or name in (
                 self.speaker_name, self.handler_name, "搭档", "群里",
             ):
-                present.append((name, mems))
-        for name, mems in by_person.items():
-            if not any(name == n for n, _ in present):
                 present.append((name, mems))
         lines: list[str] = []
         for name, mems in present[:max_people]:
@@ -365,13 +627,20 @@ class Giftia:
 
         用**搭档视角**（私聊 + 你自己 + 所有群）——这是你看她的记忆，
         不是在群里当众念。
+
+        契约 §三.4：`/profile` 是搭档专属。没有搭档时（`/unbind` 之后、还没认主）
+        这里**一个字都不输出**：指令闸门在适配器那一层，核心这一层也要防住——
+        否则"未绑定时群成员一条 /profile 就能把档案打进群"还会从别的入口复用。
+        另外这一份同样过绑定时刻遮蔽（P0-3b）：换人之后新搭档读不到前任的私事。
         """
+        if not self.handler_id:
+            return "（她还没有搭档——先 /bind 认个亲，才有档案可看。）"
         owner_view = [
             ("private", ""),
             ("person", self.handler_id or "handler"),
             ("group", "*"),
         ]
-        by_person = self.store.memories_by_person(self.instance_no, view=owner_view)
+        by_person = self._visible_by_person(owner_view)
         if not by_person:
             return "她还没对谁形成印象（多聊几次就有了）。"
         if name:
@@ -414,7 +683,7 @@ class Giftia:
     def forget_memory(self, memory_id: int) -> bool:
         return self.store.forget_memory(int(memory_id))
 
-    def _people_for_prompt(self) -> list[tuple[str, bool]]:
+    def _people_for_prompt(self, group_id: str | None = None) -> list[tuple[str, bool]]:
         """群聊花名册。搭档本人也算其中一员（他的名字存在 handler_name，不在名单里）。
 
         **搭档在群里显示的是 QQ 昵称，而她叫他的是另一个名字**——两个都要给她，
@@ -422,24 +691,48 @@ class Giftia:
         "搭档与群友习惯微笑i相识满一天"（把同一个人当成了两个）。
 
         备注名（你给群友起的名字）优先于平台昵称——昵称会变、会重名，备注不会。
+
+        P1-12：**只带"在这个群里见过的人" + 搭档**，并按最近活跃排序、最多
+        `ROSTER_MAX` 个。以前是整份全局花名册进每一个群的提示词：只在群 B 自我介绍过的
+        阿伟会在群 A 被叫出来，认识的人越多 system 越长（301 人 → 2463 字）。
+        group_id=None 用当前场景的 `self.group_id`。
         """
-        people = self.known_people()
+        gid = self.group_id if group_id is None else str(group_id or "")
+        meta = self._people_meta()
         notes = self.store.all_notes()
         owner_id = self.handler_id
         owner_name = self.handler_name
+
+        def display_of(uid: str, fallback: str = "") -> str:
+            return notes.get(uid) or str(meta.get(uid, {}).get("name") or "") or fallback
+
         rows: list[tuple[str, bool]] = []
-        for uid, name in people.items():
-            display = notes.get(uid) or name
-            if uid == owner_id and owner_name:
-                if display and display != owner_name:
-                    rows.append((f"{owner_name}（群里叫「{display}」，是同一个人）", True))
-                else:
-                    rows.append((owner_name, True))
-            else:
-                rows.append((display, bool(owner_id) and uid == owner_id))
-        if owner_id and owner_name and all(not is_owner for _n, is_owner in rows):
-            rows.append((owner_name, True))
-        return rows
+        # 搭档永远排在第一个（他在哪个群都是他）
+        if owner_id:
+            shown = display_of(owner_id, owner_name)
+            if owner_name and shown and shown != owner_name:
+                rows.append((f"{owner_name}（群里叫「{shown}」，是同一个人）", True))
+            elif owner_name or shown:
+                rows.append((owner_name or shown, True))
+
+        others: list[tuple[str, str]] = []
+        for uid, info in meta.items():
+            if owner_id and uid == owner_id:
+                continue
+            groups = info.get("groups") or []
+            if gid:
+                if gid not in groups:
+                    continue  # 只在别的群见过：这个群里她不认得他
+            elif groups:
+                # 没有群上下文（私聊 / 群消息忘带 group_id）：只列"不在群里认识的"人，
+                # 免得把别的群的人带进来
+                continue
+            shown = display_of(uid, str(info.get("name") or ""))
+            if shown:
+                others.append((str(info.get("last") or ""), shown))
+        others.sort(key=lambda row: row[0], reverse=True)  # 最近活跃的排前面
+        rows.extend((shown, False) for _last, shown in others)
+        return rows[:ROSTER_MAX]
 
     # ── 基本属性 ──────────────────────────────────────────
     @property
@@ -462,7 +755,29 @@ class Giftia:
 
     def history(self, limit: int = 40) -> list[dict]:
         """最近的聊天记录（跨天，含她自己的回复）——和她在 QQ 里看到的视角一致。"""
-        return self.store.messages_by_prefix(self.history_prefix, limit)
+        return self._since_floor(self.store.messages_by_prefix(self.history_prefix, limit))
+
+    def _since_floor(self, rows: list[dict]) -> list[dict]:
+        """"我们之间没有共同的过去"——换人之后，工作记忆里也不该有前任的话（P0-3b）。
+
+        记忆那一层有 `_memory_visible` 遮着，但**聊天记录窗口是另一条路**：
+        搭档私聊的 session_id 对每一任都是 `i<n>-m-<日期>`，同一天换人时，
+        新搭档的工作记忆里就摆着前任刚说的话（探针 lead_v2 的 B2 正是从这里漏的）。
+        判据与记忆同一套：消息 id 水位线（精确）+ 时间戳严格晚于绑定时刻（兜底）。
+        只裁搭档私聊会话；群聊记录是公开的，不受"换人"影响。
+        """
+        floor = self._private_floor()
+        if not floor or self.scope_key != "m":
+            return rows
+        watermark = self._int_meta("handler_bound_msg_id")
+        kept: list[dict] = []
+        for row in rows:
+            if watermark and int(row.get("id") or 0) <= watermark:
+                continue  # 绑定之前就发出来的：藏着
+            if str(row.get("ts") or "") <= floor and not watermark:
+                continue  # 没有水位线时才退回时间比较（严格晚于才算"之后的"）
+            kept.append(row)
+        return kept
 
     @property
     def is_mock(self) -> bool:
@@ -470,6 +785,26 @@ class Giftia:
 
     def status(self) -> LifeStatus:
         return self.lifespan.status()
+
+    def _auto_bind(self, uid: str) -> bool:
+        """核心路径的"自动认主"（`[runtime] auto_bind`，与适配器同一开关）。
+
+        适配器会先认主再调 core；但本地 CLI / 直接调 core 的调用方没有适配器去认人，
+        所以这里补上同一件事：**第一条私聊的人就是搭档**。
+        关掉 auto_bind（`auto_bind = false`）时返回 False —— 那就老老实实走
+        "未绑定 = 未确认"路径：不检索私事、不写私事、不推进关系，工具也不开放。
+        """
+        if not bool(getattr(self.settings.runtime, "auto_bind", False)):
+            return False
+        if not uid:
+            return False
+        # 本地/单机调用方（uid 就是默认哨兵值）= 本机的搭档本人：
+        # 不设遮蔽下界，他看的是自己留下的记忆（见 set_handler_id）。
+        self.set_handler_id(uid, local=(uid == LOCAL_USER_ID))
+        self.notices.append(
+            f"[认主] 从现在起你就是她的搭档（想换人：/unbind）。"
+        )
+        return True
 
     # ── 主入口（平台无关）─────────────────────────────────
     def handle(
@@ -492,8 +827,10 @@ class Giftia:
           guest —— 同 group，语义上强调"不是搭档"（兼容旧调用）
 
         group_id / speaker_name：群里分清"谁在哪个群说的"，隐私分区靠它。
-        is_handler：说话的人是不是搭档。None = 自己判断（绑过就按绑定判，
-                    没绑过则私聊算、群里不算）。
+        is_handler：说话的人是不是搭档。None = 自己判断——
+                    绑过就按绑定判（`user_id == handler_id`）；
+                    没绑过时私聊会先"认主"（见 `_auto_bind`，与适配器的 auto_bind 同一开关），
+                    认主后就按搭档处理；群里一律不算（群里只有群主认主或 /bind 才算）。
         log_only：只把这句话记进聊天记录、不回复（群里全量模式下的"旁听"）。
         """
         self.notices = []
@@ -507,10 +844,20 @@ class Giftia:
         if not text:
             return ""
 
-        uid = user_id or "handler"
+        uid = user_id or LOCAL_USER_ID
         owner = self.handler_id
         if is_handler is None:
-            is_handler = (uid == owner) if owner else (self.last_scene != "group")
+            if owner:
+                # 契约 §三.1：有搭档时，只有他本人是搭档
+                is_handler = (uid == owner)
+            elif self.last_scene == "c2c" and self._auto_bind(uid):
+                # 未绑定 + 私聊：先认主，再按搭档处理（契约 §三.1 的"自动认主"）。
+                # 认主会经过 §二 的绑定时刻遮蔽，所以带不出前任的私事。
+                owner = uid
+                is_handler = True
+            else:
+                # 没有搭档，又不是认主那一条 → 未确认/客人路径（见下面的视角分支）
+                is_handler = False
         self.is_handler = bool(is_handler)
         self.speaker_id = uid
         self.speaker_name = speaker_name or self.known_people().get(uid, "")
@@ -518,12 +865,12 @@ class Giftia:
         # 平台每条消息都带昵称 —— 顺手记进花名册（适配器也做，这里兜底：
         # 直接调 core 的路径没有适配器，不记的话她永远认不出人）
         if speaker_name and uid:
-            self.remember_person(uid, speaker_name)
+            self.remember_person(uid, speaker_name, group_id=group_id)
 
         # ★ 隐私的闸门：谁在说话，决定她此刻能想起谁的事。
         #   群里 → 只有"这个群里公开发生过的事"（别人的私聊记忆根本查不出来）
         #   搭档 → 你的私事 + 你自己 + 所有群
-        #   别人私聊 → 只有"他和她之间"的事
+        #   别人私聊 / 未绑定的私聊 → 只有"他和她之间"的事（private 一条都进不来）
         if self.last_scene in ("group", "guest") and group_id:
             self.scope_key = f"g{group_id[:12]}"
             self.memory_view = [("group", group_id)]
@@ -537,8 +884,10 @@ class Giftia:
             self.memory_view = [("person", uid)]
             self.memory_scope = ("person", uid)
 
-        # 学名字：谁都可以自我介绍（搭档、群友、私聊来的客人）
-        self.learn_name(text, uid, owner=self.is_handler)
+        # 学名字：谁都可以自我介绍（搭档、群友、私聊来的客人）。
+        # 旁听（log_only）**只走正则**：不为一句「我是来看热闹的」多花一次模型调用（P1-14）。
+        self.learn_name(text, uid, owner=self.is_handler, allow_llm=not log_only,
+                        group_id=group_id)
 
         if log_only:
             # 旁听：记下这句话就走（不进检索、不回复、不推进任何东西）
@@ -554,27 +903,88 @@ class Giftia:
                 self.memory_scope[1],
                 self.current_mid,
             )
-            # 攒够了就把"听见的话"整理成这个群归属的记忆 ——
-            # 不然"听得见"永远只是聊天记录，不会变成会随时间模糊的记忆。
-            # consolidate 会先数条数，不够就直接返回，几乎不花钱。
-            self.consolidate()
+            # P1-14：这里**不当场整理**。以前每攒够 consolidate_every 条旁听消息
+            # 就是一次模型调用（全量大群里每 6 条一次），与"零 token"直接相反。
+            # 现在只留一个待整理标记，由搭档那一轮（_post_turn）或退出路径统一处理——
+            # 群聊记忆照样会生成，只是不在这里花那份钱。
+            self._mark_listen_pending()
             return ""
 
         # 到期回收只跟搭档有关（别人说话不该触发她的回收流程）
         if self.is_handler and self.lifespan.is_expired():
             try:
                 last_words = self._chat(text)
-            except LLMError:
+            except Exception as exc:
+                # 到期那一轮也不能把回收流程吞掉：先留一句台词，再照常回收
                 last_words = "……"
-            self.consolidate(force=True)
+                self._note_error("到期前的最后一轮", exc)
+            try:
+                self.consolidate(force=True)
+            except Exception as exc:
+                self._note_error("到期整理记忆", exc)
             return f"{last_words}\n\n{self.run_recycle('寿命结束')}"
 
-        reply = self._chat(text)
-        if self.is_handler:
-            self._post_turn()
-        else:
-            self.consolidate()
+        try:
+            reply = self._chat(text)
+        except Exception as exc:
+            # 最后一道兜底：一轮**一定**要有回复，异常不许冒到适配器（那会断连）
+            self._note_error("这一轮", exc)
+            reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
+        try:
+            if self.is_handler:
+                self._post_turn()
+            else:
+                self.consolidate()
+        except Exception as exc:
+            # 整理失败不该让用户看不到她刚才那句回复（回复已经生成了）
+            self._note_error("每一轮之后的整理", exc)
         return reply
+
+    # ── 旁听攒下来的记忆（P1-14）───────────────────────────
+    def _listen_pending(self) -> dict[str, str]:
+        raw = str(self.store.state_get(LISTEN_PENDING_KEY, "") or "")
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items()}
+
+    def _mark_listen_pending(self) -> None:
+        """旁听攒着不整理，只留一个标记（P1-14）。
+
+        语义：`listen_pending` 里列出的会话"还有旁听来的话没变成记忆"，
+        由搭档那一轮（`_post_turn` → `flush_listen_pending`）
+        或退出路径（`close` → `flush_sessions`）统一补整理。
+        """
+        rows = self._listen_pending()
+        rows[self.session_id] = self.clock.iso()
+        if len(rows) > 50:  # 只留最近 50 个会话，别让 state 无界增长
+            for key in sorted(rows, key=lambda k: rows[k])[:-50]:
+                rows.pop(key, None)
+        self.store.state_set(LISTEN_PENDING_KEY, json.dumps(rows, ensure_ascii=False))
+
+    def flush_listen_pending(self) -> int:
+        """把旁听攒下来的会话补整理成记忆（P1-14）。返回新增条数。
+
+        没有标记时什么都不做（零成本）。只在搭档那一轮 / 退出路径调用。
+        """
+        if not self._listen_pending():
+            return 0
+        added = flush_sessions(
+            self.store,
+            self.llm,
+            self.settings,
+            now_iso=self.clock.iso(),
+            exclude_session=self.session_id,   # 当前会话有自己的阈值节奏
+            stale_minutes=0.0,
+            min_pending=1,
+        )
+        self.store.state_set(LISTEN_PENDING_KEY, "")
+        return added
 
     # ── 一次对话 ──────────────────────────────────────────
     def current_bond(self, now=None) -> Bond:
@@ -611,12 +1021,16 @@ class Giftia:
         """
         life = self.status()
         now = self.clock.now()
-        recent = self.store.recent_messages(
-            self.session_id, self.settings.memory.session_window
+        # 工作记忆也过绑定时刻遮蔽：换人之后，新搭档看不到前任留下的对话窗口（P0-3b）
+        recent = self._since_floor(
+            self.store.recent_messages(
+                self.session_id, self.settings.memory.session_window
+            )
         )
         query = self._recall_query(recent, text)
-        # ★ 只在她"此刻能看到"的记忆里检索 —— 群聊时检索不到别人私聊的内容
-        memories = self.store.active_memories(self.instance_no, view=self.memory_view)
+        # ★ 只在她"此刻能看到"的记忆里检索 —— 群聊时检索不到别人私聊的内容，
+        #   换人之后也检索不到前任的私事（visible_memories 里含绑定时刻遮蔽）
+        memories = self.visible_memories()
         recalled = recall(query, memories, life.stage, self.settings.memory, now)
 
         # 检索太弱时才多花一次调用去改写查询（常见情况下不增加延迟）
@@ -651,11 +1065,8 @@ class Giftia:
             )
 
         # 今天是不是特别的日子 / 有没有还没讲过的梦
-        self.last_occasions = find_occasions(
-            self.settings,
-            self.store,
+        self.last_occasions = self._find_occasions(
             now=now,
-            instance_no=self.instance_no,
             days_known=self.current_bond(now).days_known,
             mark=mark,
             view=self.memory_view,   # 大日子也按归属过滤，别把私事带进群里
@@ -683,7 +1094,10 @@ class Giftia:
             speaker_name=self.speaker_name,
             is_handler=self.is_handler,
             group_chat=self._render_group_chat() if self.group_id else "",
-            impressions=self.impressions_block(text),
+            # P1-13：注入路径只带在场的人（私聊不设这道闸门——你本来就有权知道所有人的事）
+            impressions=self.impressions_block(
+                text, present_only=self.last_scene in ("group", "guest")
+            ),
             tool_rules=agent_tools.TOOL_RULES if agent_tools.specs(self) else "",
         )
         messages: list[dict] = [{"role": "system", "content": system}]
@@ -785,67 +1199,103 @@ class Giftia:
             pass  # 记账失败不该影响对话
 
     def _chat(self, text: str) -> str:
+        """一轮对话。**从模型请求到记账，任何一步出错都不许冒穿**（P1-3）。
+
+        适配器那一层一旦接到异常就是整条 WS 重连，用户那句话落了库却永远没有回复，
+        `note_reply_delivery` 的回滚也不会执行。所以这里的原则是：
+        能回一句就先回一句，出的事写进 notices + diary。
+        """
         now = self.clock.now()
         # 只有跟搭档说话才推进关系与心情 —— 别人刷不动你们的亲密度
         # （但记忆照记：这一轮说的话一样会被整理成属于他们的记忆）
         if self.is_handler:
-            self._tick_inner(text, now)
+            try:
+                self._tick_inner(text, now)
+            except Exception as exc:
+                self._note_error("推进关系与心情", exc)
         messages, recalled = self._prepare(text)
         # 做梦放在回复之后：这一场梦下次说话时再讲，免得"刚做完就讲"
         if self.is_handler:
-            self._maybe_dream(now)
+            try:
+                self._maybe_dream(now)
+            except Exception as exc:
+                self._note_error("做梦", exc)
         self.last_recalled = recalled
         if recalled:
             # 被塞进提示词 ≠ 被想起。这里只记账，强化要等她真的说出口。
-            self.store.mark_injected(
-                [r.memory["id"] for r in recalled], self.clock.iso(now)
-            )
+            try:
+                self.store.mark_injected(
+                    [r.memory["id"] for r in recalled], self.clock.iso(now)
+                )
+            except Exception as exc:
+                self._note_error("记录被注入的记忆", exc)
 
-        self.store.add_message(
-            self.session_id,
-            self.instance_no,
-            "user",
-            text,
-            self.clock.iso(now),
-            self.speaker_id,
-            self.speaker_name,
-            self.memory_scope[0],
-            self.memory_scope[1],
-            self.current_mid,
-        )
+        try:
+            self.store.add_message(
+                self.session_id,
+                self.instance_no,
+                "user",
+                text,
+                self.clock.iso(now),
+                self.speaker_id,
+                self.speaker_name,
+                self.memory_scope[0],
+                self.memory_scope[1],
+                self.current_mid,
+            )
+        except Exception as exc:
+            # 你的话没记下来是遗憾，但不该让她这一轮哑掉
+            self._note_error("记下你说的这句话", exc)
+
         try:
             reply = self._reply_with_tools(messages)
         except LLMError as exc:
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
             self.notices.append(f"[模型请求失败] {exc}")
-        self.last_reply_id = self.store.add_message(
-            self.session_id,
-            self.instance_no,
-            "assistant",
-            reply,
-            self.clock.iso(now),
-            "",
-            "",
-            self.memory_scope[0],
-            self.memory_scope[1],
-        )
+        except Exception as exc:
+            # 工具写库失败 / 模型层抛的不是 LLMError（换 provider、库内部错误）……
+            # 都不能冒穿：给一句兜底台词 + 留痕（P1-3）
+            reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
+            self._note_error("生成回复", exc)
+        if not str(reply or "").strip():
+            # 空回复不能写成一条空的 assistant 记录：她"以为自己说了句空话"（P3）
+            reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
+            self.notices.append("[回复] 模型返回了空回复，已用兜底台词顶上")
+        try:
+            self.last_reply_id = self.store.add_message(
+                self.session_id,
+                self.instance_no,
+                "assistant",
+                reply,
+                self.clock.iso(now),
+                "",
+                "",
+                self.memory_scope[0],
+                self.memory_scope[1],
+            )
+        except Exception as exc:
+            self.last_reply_id = None
+            self._note_error("记下她说的这句话", exc)
         self.last_reply_text = reply
 
-        # 召回强化：她真的把哪几条说出口了，哪几条就记得更久
-        self.last_cited = mark_cited(
-            self.store, recalled, reply, self.settings.memory, self.clock.iso(now)
-        )
-        if self.last_cited:
-            self.notices.append(
-                f"[记忆强化] 说出口了 {len(self.last_cited)} 条记忆，它们会记得更久"
+        try:
+            # 召回强化：她真的把哪几条说出口了，哪几条就记得更久
+            self.last_cited = mark_cited(
+                self.store, recalled, reply, self.settings.memory, self.clock.iso(now)
             )
+            if self.last_cited:
+                self.notices.append(
+                    f"[记忆强化] 说出口了 {len(self.last_cited)} 条记忆，它们会记得更久"
+                )
 
-        # 她把梦讲出来了才算讲过（复用"被引用"的判定）
-        if self.last_dream is not None and is_cited(
-            reply, self.last_dream.content, self.settings.memory
-        ):
-            self.store.mark_dream_told(self.last_dream.id)
-            self.notices.append("[做梦] 她把那个梦讲给你听了")
+            # 她把梦讲出来了才算讲过（复用"被引用"的判定）
+            if self.last_dream is not None and is_cited(
+                reply, self.last_dream.content, self.settings.memory
+            ):
+                self.store.mark_dream_told(self.last_dream.id)
+                self.notices.append("[做梦] 她把那个梦讲给你听了")
+        except Exception as exc:
+            self._note_error("回复之后的记账", exc)
         # 运行档案：这一轮她看到了什么、想了多少、提示词多大
         self._log_run(text=text, reply=reply, recalled=recalled, prompt_chars=len(messages[0]["content"]))
         return reply
@@ -889,25 +1339,74 @@ class Giftia:
             self.store, self.instance_no, bond.days_known, self.settings.occasions.milestones
         )
 
+    # ── 大日子（纪念日 / 他的大日子）───────────────────────
+    def _outreach_view(self, for_group: bool) -> list[tuple[str, str]]:
+        """主动联系时"她此刻能提到哪些大日子"。
+
+        发群里 → 只算**这个群**公开发生过的事（你的私事不外泄）；
+        发给你 → 搭档视角（你的私事 + 你自己 + 所有群）。
+
+        P0-4 的根因就是"同一个函数里两处查询用了两套口径"：
+        `outreach_plan` 传了 view、`compose_outreach` 第二次查询忘传 (`view=None`
+        = 不过滤) → 群发提示词里混进别人的私聊大日子。现在两处都用这一个函数。
+        """
+        if for_group:
+            return [("group", self.last_group_id or "")]
+        return [("private", ""), ("person", self.handler_id or "handler"), ("group", "*")]
+
+    def _find_occasions(
+        self,
+        *,
+        now,
+        days_known: float,
+        mark: bool,
+        view: list[tuple[str, str]],
+    ) -> list[Occasion]:
+        """查大日子，并过一遍 P0-3b 的绑定时刻遮蔽：**换人之后，新搭档不该被提醒
+        前任的大日子**（大日子是从记忆里派生的，记忆遮了、派生结果也得遮）。"""
+        found = find_occasions(
+            self.settings,
+            self.store,
+            now=now,
+            instance_no=self.instance_no,
+            days_known=days_known,
+            mark=mark,
+            view=view,
+        )
+        return self._filter_occasions_by_floor(found)
+
+    def _filter_occasions_by_floor(self, occasions: list[Occasion]) -> list[Occasion]:
+        floor = self._private_floor()
+        if not floor or not occasions:
+            return occasions
+        try:
+            blocked = {
+                int(m["id"])
+                for m in self.store.active_memories(
+                    self.instance_no, view=[("private", "")]
+                )
+                if str(m.get("happened_ts") or "") < floor
+            }
+        except Exception:
+            return occasions
+        if not blocked:
+            return occasions
+        return [
+            o for o in occasions
+            if o.memory_id is None or int(o.memory_id) not in blocked
+        ]
+
     # ── 主动联系 ──────────────────────────────────────────
     def outreach_plan(
         self, *, force: bool = False, for_group: bool = False
     ) -> OutreachPlan | None:
         now = self.clock.now()
         bond = self.current_bond(now)
-        if for_group:
-            # 发群里：只看这个群里公开的"大日子"，你的私事不外泄
-            view = [("group", self.last_group_id or "")]
-        else:
-            view = [("private", ""), ("person", self.handler_id or "handler"), ("group", "*")]
-        occasions = find_occasions(
-            self.settings,
-            self.store,
+        occasions = self._find_occasions(
             now=now,
-            instance_no=self.instance_no,
             days_known=bond.days_known,
             mark=False,
-            view=view,
+            view=self._outreach_view(for_group),
         )
         result = outreach_plan(
             self.settings,
@@ -936,13 +1435,13 @@ class Giftia:
         if record and not can_send(self.settings, self.store, now):
             return plan_, ""
         bond = self.current_bond(now)
-        occasions = find_occasions(
-            self.settings,
-            self.store,
+        # ★ 与 outreach_plan 用**同一套视角**（P0-4）：发群里只算这个群公开的大日子。
+        #   这里原来漏传 view，等于把所有人（含别人私聊）的大日子写进了要发群里的提示词。
+        occasions = self._find_occasions(
             now=now,
-            instance_no=self.instance_no,
             days_known=bond.days_known,
             mark=False,
+            view=self._outreach_view(for_group),
         )
         dream = latest_untold(self.settings, self.store, self.clock, self.instance_no)
         system = build_system_prompt(
@@ -955,7 +1454,7 @@ class Giftia:
             handler_name=self.handler_name,
             # 发群里时走 group 情境：多一段"别当众说私事"的约束
             scene="group" if for_group else "c2c",
-            people=self._people_for_prompt(),
+            people=self._people_for_prompt(self.last_group_id if for_group else ""),
             occasions=occasions,
             dream=None if for_group else dream,
         )
@@ -1122,6 +1621,13 @@ class Giftia:
         )
         if stale:
             self.notices.append(f"[记忆整理] 补整理了 {stale} 条之前没记下的")
+        # 旁听攒下来的话（P1-14）：搭档这一轮到了，顺手把它们变成记忆。
+        # 没有标记时零成本；有标记时也只在这里花一次整理调用（不是每 N 条群消息一次）。
+        listened = self.flush_listen_pending()
+        if listened:
+            self.notices.append(
+                f"[记忆整理] 把群里旁听到的话整理成了 {listened} 条记忆"
+            )
         if added:
             self.notices.append(f"[记忆整理] 新增 {added} 条长期记忆")
         if stats.get("skipped"):
@@ -1258,7 +1764,9 @@ class Giftia:
         )
 
     def status_text(self) -> str:
-        mems = self.store.active_memories(self.instance_no)
+        # 自检/状态汇总：这一任的**全部**记忆只用来数条数（不展示内容），
+        # 所以显式看全量（契约 §一：ALL_SCOPES 只给导出/自检/迁移用）。
+        mems = self.store.active_memories(self.instance_no, view=Store.ALL_SCOPES)
         counts = {"core": 0, "important": 0, "normal": 0}
         for m in mems:
             counts[str(m.get("layer") or "normal")] = counts.get(
@@ -1342,7 +1850,12 @@ class Giftia:
         return f"心情已设为「{mood.label}」。下一条消息她就会按这个状态说话。"
 
     def memories_text(self, limit: int = 30) -> str:
-        mems = self.store.active_memories(self.instance_no)
+        """/memories：把这个库里她记得的所有事摊给你看（排障用）。
+
+        显式看全量（契约 §一）：这是"你看她的记忆"的自检入口，不是注入路径——
+        真正进提示词的那条路是 `visible_memories()`（带视角与绑定时刻遮蔽）。
+        """
+        mems = self.store.active_memories(self.instance_no, view=Store.ALL_SCOPES)
         if not mems:
             return "（她还没有任何长期记忆条目。多聊一会儿，或输入 /remember 强制整理。）"
         now = self.clock.now()
@@ -1368,12 +1881,17 @@ class Giftia:
         return "\n".join(lines)
 
     def recall_text(self, query: str) -> str:
+        """/recall：手输一句话，看她会想起什么（排障用）。
+
+        显式看全量（契约 §一）：这是让人核对"检索算法本身"的工具，
+        不受视角/绑定时刻影响；真实一轮走的是 `visible_memories()`。
+        """
         if not query.strip():
             return "用法：/recall <一句话>"
         st = self.status()
         recalled = recall(
             query,
-            self.store.active_memories(self.instance_no),
+            self.store.active_memories(self.instance_no, view=Store.ALL_SCOPES),
             st.stage,
             self.settings.memory,
             self.clock.now(),

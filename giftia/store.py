@@ -7,10 +7,36 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# 显式的"我要看全量"视角（见 active_memories）。
+# **只允许导出 / 自检 / 迁移使用**，调用点必须写一句注释说明为什么可以看全量——
+# 默认值方向错误的 API（view=None = 不过滤）正是 P0-1 / P0-4 的共同根因。
+ALL_SCOPES = "all"
+
+# 孤立代理字符（\ud800-\udfff）：平台 JSON 里的 "\ud83d" 是合法 JSON，
+# json.loads 会产出它，而 SQLite 编码不了 → UnicodeEncodeError（P0-5）。
+_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def sanitize_text(value: Any) -> Any:
+    """写库前的文本归一化：孤立代理字符 → U+FFFD，其余原样返回。
+
+    为什么要在这里做：解码层拦不住它（它根本不是非法 UTF-8 字节），
+    只有落到 SQLite 绑定参数的那一刻才会炸。炸的后果是一条消息丢掉 +
+    适配器把异常当断线、整条连接重来（P0-5）。归一化是**幂等**的：
+    正常文本一个字节都不会变。
+    """
+    if not isinstance(value, str):
+        return value
+    if _LONE_SURROGATE_RE.search(value):
+        return _LONE_SURROGATE_RE.sub("\ufffd", value)
+    return value
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -94,18 +120,28 @@ CREATE TABLE IF NOT EXISTS state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
 
+# 索引单独一份、在 _migrate() **之后**建：
+# 老库可能连索引用到的列都还没有（mid 是后加的），先建索引会直接
+# `no such column` 打不开库。索引不是数据，晚一步没有任何代价。
+INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_msg_session  ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_msg_open     ON messages(instance_no, consolidated);
+CREATE INDEX IF NOT EXISTS idx_msg_mid      ON messages(mid);
 CREATE INDEX IF NOT EXISTS idx_mem_instance ON memories(instance_no, sealed);
 """
 
 
 class Store:
+    # 模块级常量的别名：`Store.ALL_SCOPES` 与 `giftia.store.ALL_SCOPES` 两种写法都成立
+    ALL_SCOPES = ALL_SCOPES
+
     # 旧版本数据库缺的列在这里补齐（ALTER TABLE ADD COLUMN 不影响已有数据）
     _MIGRATIONS: dict[str, dict[str, str]] = {
         "memories": {
             "layer": "TEXT NOT NULL DEFAULT 'normal'",
+            "sealed": "INTEGER NOT NULL DEFAULT 0",
             "strength": "REAL NOT NULL DEFAULT 1.0",
             "recall_count": "INTEGER NOT NULL DEFAULT 0",
             "last_recalled_at": "TEXT",
@@ -169,6 +205,9 @@ class Store:
             "emotion", "importance", "source_session", "layer", "strength",
             "recall_count", "last_recalled_at", "injected_at", "sealed", "event_date",
             "scope", "subject_id", "speaker_id", "about", "merged_into",
+            # forgotten 漏了会怎样：快照恢复后被明确要求"别提了"的记忆**复活**，
+            # 又回到检索里 —— 和 forget_memory 的语义正好相反（§5.2）。
+            "forgotten",
         ]
         self.conn.execute("DELETE FROM memories")
         for row in rows:
@@ -213,15 +252,59 @@ class Store:
     def __init__(self, db_path: Path | str) -> None:
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        # check_same_thread=True 是**现状语义的显式化**（也正好是 sqlite3 的默认值）：
+        # 一个连接只在一个线程里用。适配器侧是多线程的（收消息 / 发消息 / 后台整理），
+        # 跨线程复用同一个连接会 ProgrammingError —— 保持"谁开谁用"，
+        # 但写明白，别让后来的人以为默认是 False 就随手跨线程传。
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=True)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        # 多个写入口（收消息、整理记忆、后台记账）撞在一起时不要立刻抛
+        # "database is locked"：等最多 5 秒再失败。没有它，一次抖动就会顺着
+        # P1-3 那条链冒穿到适配器、把整条连接重来。
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        # WAL 是"读写不互相阻塞"的前提。**失败不能静默降级**：
+        # 静默变成 delete 模式之后，表现是随机的 database is locked，最难查。
+        mode = str(self.conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+        if mode != "wal" and str(self.path) != ":memory:":
+            raise RuntimeError(
+                f"SQLite 无法为 {self.path} 启用 WAL（journal_mode={mode}）。"
+                "WAL 是并发读写的前提，静默降级会让适配器写入随机失败。"
+                "请把 data/ 放在本地磁盘（网络盘/部分只读挂载不支持 WAL）。"
+            )
         self.conn.executescript(SCHEMA)
         self._migrate()
+        # 索引在补列之后建（见 INDEXES 的注释：老库可能连 mid 列都还没有）
+        self.conn.executescript(INDEXES)
         self.conn.commit()
 
+    # ── 显式事务 ──────────────────────────────────────────
+    # Python 3.14 的 sqlite3 默认 autocommit=False（legacy 事务控制）：
+    # 每条 DML 自己开一个隐式事务，而本类的每个写方法又各自 commit ——
+    # 于是"写记忆 + 标已整理 + 推游标"这种多步写入中途失败会留下撕裂状态（P1-7）。
+    # 需要"要么全成、要么全不成"的地方用 begin()/commit()/rollback() 自己圈起来。
+    def begin(self) -> None:
+        """开一个显式写事务（BEGIN IMMEDIATE）。
+
+        用 IMMEDIATE 而不是默认的 DEFERRED：立刻拿写锁，冲突当场失败并走
+        busy_timeout 等待，而不是拖到 commit 时才报 "database is locked"。
+        不支持嵌套——嵌套说明调用方理解错了事务边界。
+        """
+        if self.conn.in_transaction:
+            raise RuntimeError("Store.begin()：已经在一个事务里了，不支持嵌套事务")
+        self.conn.execute("BEGIN IMMEDIATE")
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
     def _migrate(self) -> None:
-        """给老库补列。她的记忆比 schema 重要，升级不能丢数据。"""
+        """给老库补列。她的记忆比 schema 重要，升级不能丢数据。
+
+        清单要覆盖"最老的 schema 也缺"的列：`sealed` 看着像原始字段，
+        但最早的库里没有，而 idx_mem_instance 依赖它 —— 缺了它老库根本打不开。
+        """
         for table, columns in self._MIGRATIONS.items():
             existing = {
                 row["name"] for row in self._rows(f"PRAGMA table_info({table})")
@@ -249,13 +332,14 @@ class Store:
         row = self._one("SELECT value FROM meta WHERE key = ?", (key,))
         return row["value"] if row else default
 
-    def meta_set(self, key: str, value: Any) -> None:
+    def meta_set(self, key: str, value: Any, *, commit: bool = True) -> None:
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
+            (sanitize_text(key), sanitize_text(str(value))),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def meta_get_float(self, key: str, default: float = 0.0) -> float:
         try:
@@ -288,16 +372,16 @@ class Store:
             "speaker_id, speaker_name, scope, subject_id, mid) "
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                session_id,
+                sanitize_text(session_id),
                 instance_no,
-                role,
-                content,
-                ts,
-                speaker_id,
-                speaker_name,
-                scope,
-                subject_id,
-                str(mid or ""),
+                sanitize_text(role),
+                sanitize_text(content),
+                sanitize_text(ts),
+                sanitize_text(speaker_id),
+                sanitize_text(speaker_name),
+                sanitize_text(scope),
+                sanitize_text(subject_id),
+                sanitize_text(str(mid or "")),
             ),
         )
         self.conn.commit()
@@ -315,44 +399,91 @@ class Store:
     def update_message_content(self, message_id: int, content: str) -> None:
         """把一条消息改成实际送达的内容（分段发送只成功了一部分时用）。"""
         self.conn.execute(
-            "UPDATE messages SET content = ? WHERE id = ?", (content, message_id)
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (sanitize_text(content), message_id),
         )
         self.conn.commit()
 
+    @staticmethod
+    def _session_scope_key(session_id: str) -> tuple[str, str]:
+        """从会话名解析归属：返回 (scope, token)。
+
+        会话名形如 `i{实例号}-{scope_key}-{日期}`，scope_key 是
+        `m`（搭档私聊）/ `g{group_id[:12]}` / `p{openid[:12]}`。
+        token 是截断到 12 位的标识（私聊时为 ""）。
+
+        注意：标识里**可能带 "-"**（合成数据、少数平台的 openid），所以不能
+        简单按 "-" 切第一段——那样 `i1-gGROUP-A-20261001` 会被解析成 "GROUP"，
+        再与 last_group 做前缀比对就会**误确认**成别的群。这里先按
+        `i{n}-[gp]…` 取出整段，再去掉末尾的日期段（`-YYYYMMDD`）。
+        """
+        sid = str(session_id or "")
+        m = re.match(r"^i\d+-([gp])(.+)$", sid)
+        if not m:
+            return "private", ""
+        scope = "group" if m.group(1) == "g" else "person"
+        token = re.sub(r"-\d{8}$", "", m.group(2))  # 去掉结尾的日期段
+        if not token:
+            return "private", ""
+        return scope, token
+
     def backfill_message_scopes(self) -> int:
-        """给历史消息补 scope/subject_id。
+        """给历史消息补 scope/subject_id。返回改动的行数。
 
         scope 这一列是后加的，老数据全是默认值 'private' —— 于是**昨天群里的话
         会被当成"你的私事"存进私聊记忆**。这里按会话名把它们归位：
           i<n>-m-…  搭档私聊（不动）
-          i<n>-g-…  群聊 → subject 用最近活跃的那个群
-          i<n>-p-…  某人的私聊 → subject 用发言人的 id
-        只在库里还没有标记时做一次。
+          i<n>-g<群id前12位>-…  群聊 → subject 用 session_id 里那个群
+          i<n>-p<openid前12位>-…  某人的私聊 → subject 用发言人 id
+
+        **群标识只从 session_id 解析**，不再用全局的 state['last_group_openid']：
+        她可以同时在多个群里，用"最近活跃的那个群"会把群 A 的历史标成群 B，
+        接着整理成"群 B 的记忆"并在群 B 里当众说出来（P0-2）。
+        session 里存的是截断值，所以要与 last_group_openid 做前缀比对**确认**；
+        解析不出来或对不上的老行**保持 private**——宁可不给她看，也别看错人。
+
+        跑两遍：v1（旧实现）可能已经把群 A 标成了群 B，那些行不是 private，
+        只认 `msg_scope_backfilled` 就再也不会被纠正。所以新标记
+        `msg_scope_backfill_v2` 独立判断，并把"能证明标错"的行撤回 private。
         """
-        if self.meta_get_int("msg_scope_backfilled", 0):
+        if self.meta_get_int("msg_scope_backfill_v2", 0):
             return 0
-        group_id = str(self.state_get("last_group_openid", "") or "")
+        last_group = str(self.state_get("last_group_openid", "") or "")
         rows = self._rows(
-            "SELECT id, session_id, speaker_id FROM messages "
-            "WHERE scope = 'private' AND subject_id = ''"
+            "SELECT id, session_id, speaker_id, scope, subject_id FROM messages "
+            "WHERE (scope = 'private' AND subject_id = '') "
+            "   OR scope IN ('group', 'person')"
         )
         updated = 0
         for row in rows:
-            sid = str(row["session_id"])
-            if "-g" in sid and group_id:
-                self.conn.execute(
-                    "UPDATE messages SET scope = 'group', subject_id = ? WHERE id = ?",
-                    (group_id, int(row["id"])),
-                )
-                updated += 1
-            elif "-p" in sid and str(row["speaker_id"] or ""):
-                self.conn.execute(
-                    "UPDATE messages SET scope = 'person', subject_id = ? WHERE id = ?",
-                    (str(row["speaker_id"]), int(row["id"])),
-                )
-                updated += 1
+            scope, token = self._session_scope_key(str(row["session_id"]))
+            cur_scope = str(row["scope"] or "")
+            cur_subject = str(row["subject_id"] or "")
+            target: tuple[str, str] | None = None
+            if scope == "group" and token:
+                if last_group and (last_group.startswith(token) or token.startswith(last_group)):
+                    # 比对确认是同一个群：session 里只有 12 位截断值，存完整的 openid
+                    target = ("group", last_group)
+                elif cur_scope == "group" and not cur_subject.startswith(token):
+                    # 已经标成 group 但它不属于这个会话里的群 → v1 标错了，撤回 private
+                    target = ("private", "")
+            elif scope == "person" and token:
+                speaker = str(row["speaker_id"] or "")
+                if speaker and (speaker.startswith(token) or token.startswith(speaker)):
+                    target = ("person", speaker)
+                elif cur_scope == "person" and not cur_subject.startswith(token):
+                    target = ("private", "")
+            if target is None or target == (cur_scope, cur_subject):
+                continue
+            self.conn.execute(
+                "UPDATE messages SET scope = ?, subject_id = ? WHERE id = ?",
+                (target[0], target[1], int(row["id"])),
+            )
+            updated += 1
         self.conn.commit()
+        # 老标记保留（别的代码可能读它），新标记独立判断"要不要重跑一遍"
         self.meta_set("msg_scope_backfilled", 1)
+        self.meta_set("msg_scope_backfill_v2", 1)
         return updated
 
     def sessions_with_pending(self, instance_no: int) -> list[dict[str, Any]]:
@@ -409,6 +540,19 @@ class Store:
             (instance_no, session_id, after_id),
         )
 
+    def first_open_message_id(self, instance_no: int, session_id: str) -> int | None:
+        """这个会话里最早一条还没整理的消息 id（没有则 None）。
+
+        给"新会话第一次建整理游标"用：游标必须从这个会话自己的起点往回退，
+        不能直接继承全局游标——否则这个会话更早的消息会永久落在窗口外（P1-10）。
+        """
+        row = self._one(
+            "SELECT MIN(id) AS n FROM messages WHERE instance_no = ? AND session_id = ? "
+            "AND consolidated = 0 AND recalled = 0",
+            (instance_no, session_id),
+        )
+        return int(row["n"]) if row and row["n"] is not None else None
+
     def mark_recalled(self, msg_id: str) -> int:
         """标记一条消息被撤回了。返回标记了几条。
 
@@ -424,14 +568,15 @@ class Store:
         self.conn.commit()
         return int(cur.rowcount or 0)
 
-    def mark_consolidated(self, ids: list[int]) -> None:
+    def mark_consolidated(self, ids: list[int], *, commit: bool = True) -> None:
         if not ids:
             return
         marks = ",".join("?" * len(ids))
         self.conn.execute(
             f"UPDATE messages SET consolidated = 1 WHERE id IN ({marks})", tuple(ids)
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def count_messages(self, instance_no: int | None = None) -> int:
         if instance_no is None:
@@ -487,6 +632,7 @@ class Store:
         subject_id: str = "",
         speaker_id: str = "",
         about: str = "",
+        commit: bool = True,
     ) -> int:
         cur = self.conn.execute(
             "INSERT INTO memories(instance_no, created_ts, happened_ts, summary, tags, "
@@ -495,23 +641,25 @@ class Store:
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 instance_no,
-                created_ts,
-                happened_ts,
-                summary,
-                tags,
-                emotion,
+                sanitize_text(created_ts),
+                sanitize_text(happened_ts),
+                sanitize_text(summary),
+                sanitize_text(tags),
+                sanitize_text(emotion),
                 float(importance),
-                source_session,
-                layer,
+                sanitize_text(source_session),
+                sanitize_text(layer),
                 float(strength),
-                event_date or None,
-                scope,
-                subject_id,
-                speaker_id,
-                about,
+                sanitize_text(event_date) or None,
+                sanitize_text(scope),
+                sanitize_text(subject_id),
+                sanitize_text(speaker_id),
+                sanitize_text(about),
             ),
         )
-        self.conn.commit()
+        # commit=False：调用方已开显式事务（见 begin()），由它统一提交/回滚
+        if commit:
+            self.conn.commit()
         return int(cur.lastrowid)
 
     def update_memory(
@@ -523,6 +671,7 @@ class Store:
         importance: float | None = None,
         layer: str | None = None,
         about: str | None = None,
+        commit: bool = True,
     ) -> None:
         """让已经记下的那条长大（记忆演进），而不是再记一条重复的。"""
         sets: list[str] = []
@@ -536,12 +685,13 @@ class Store:
         ):
             if val is not None:
                 sets.append(f"{col} = ?")
-                args.append(val)
+                args.append(sanitize_text(val) if isinstance(val, str) else val)
         if not sets:
             return
         args.append(memory_id)
         self.conn.execute(f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", tuple(args))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     # ── dreams ────────────────────────────────────────────
     def add_dream(
@@ -552,8 +702,8 @@ class Store:
             "VALUES(?, ?, ?, ?)",
             (
                 instance_no,
-                created_ts,
-                content,
+                sanitize_text(created_ts),
+                sanitize_text(content),
                 ",".join(str(i) for i in (source_ids or [])),
             ),
         )
@@ -598,16 +748,30 @@ class Store:
         self.conn.commit()
 
     @staticmethod
-    def _view_clause(view: list[tuple[str, str]] | None) -> tuple[str, list]:
+    def _view_clause(view: list[tuple[str, str]] | str) -> tuple[str, list]:
         """"她此刻能想起哪些记忆" → SQL 片段。
 
         view 是 [(scope, subject), ...]：
           ("private", "")            搭档的私事
           ("person", "<openid>")     某个人的私聊
           ("group", "<group_openid>")某个群里公开发生的事（"*" = 所有群）
-        None = 不过滤（导出/自检用）；[] = 什么都不给看。
+        view=ALL_SCOPES 是**显式**看全量（导出/自检/迁移专用）；
+        view=[] 表示什么都不给看。
+
+        view=None **不再是"不过滤"**：那个默认值是 P0-1/P0-4 以及 /days、
+        should_dream 的共同根因（忘传 = 把所有人的事摊开）。现在它按编程错误
+        处理，直接抛 TypeError —— fail-loud，不 fail-open。
         """
         if view is None:
+            raise TypeError(
+                "active_memories(instance_no, view=...) 的 view 不能是 None："
+                "None 曾经表示'不过滤'，正是隐私越界的根因。"
+                "要看全量请显式传 store.ALL_SCOPES 并注明用途（导出/自检/迁移）；"
+                "要看某个视角传 [(scope, subject), ...]；什么都看不到传 []。"
+            )
+        if isinstance(view, str):
+            if view != ALL_SCOPES:
+                raise ValueError(f"未知的 view：{view!r}（字符串只接受 ALL_SCOPES）")
             return "", []
         if not view:
             return " AND 0", []
@@ -623,12 +787,13 @@ class Store:
         return " AND (" + " OR ".join(parts) + ")", args
 
     def active_memories(
-        self, instance_no: int, view: list[tuple[str, str]] | None = None
+        self, instance_no: int, view: list[tuple[str, str]] | str
     ) -> list[dict[str, Any]]:
         """当前这一任的她能想起来的记忆（不含已封存的前任记忆）。
 
-        view 决定"此刻她能看到谁的事"——见 _view_clause。
-        这是隐私的闸门：群聊场景只给 group 视角，别人的私聊记忆根本查不出来。
+        view 决定"此刻她能看到谁的事"——见 _view_clause。**必填**，没有默认值：
+        这是隐私的闸门，忘传就等于把所有人的事摊开给她。view=ALL_SCOPES
+        只给导出/自检/迁移用（调用点要写一句为什么可以看全量）。
         """
         extra, args = self._view_clause(view)
         return self._rows(
@@ -640,12 +805,13 @@ class Store:
         )
 
     def memories_by_person(
-        self, instance_no: int, view: list[tuple[str, str]] | None = None
+        self, instance_no: int, view: list[tuple[str, str]] | str
     ) -> dict[str, list[dict[str, Any]]]:
         """按"关于谁"分组 —— **每人一份档案**（她对这个人的长期印象）。
 
         不用另立一张表：记忆本来就有 `about` 字段，分组就是档案。
         这样"她记得你什么"和"她记得你的事"是同一份数据，不会两处打架。
+        view 与 active_memories 同语义（必填）。
         """
         out: dict[str, list[dict[str, Any]]] = {}
         for mem in self.active_memories(instance_no, view=view):
@@ -704,7 +870,7 @@ class Store:
     def add_diary(self, ts: str, content: str, kind: str = "handler", title: str = "") -> int:
         cur = self.conn.execute(
             "INSERT INTO diary(ts, kind, title, content) VALUES(?, ?, ?, ?)",
-            (ts, kind, title, content),
+            (sanitize_text(ts), sanitize_text(kind), sanitize_text(title), sanitize_text(content)),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -725,13 +891,14 @@ class Store:
         row = self._one("SELECT value FROM state WHERE key = ?", (key,))
         return row["value"] if row else default
 
-    def state_set(self, key: str, value: Any) -> None:
+    def state_set(self, key: str, value: Any, *, commit: bool = True) -> None:
         self.conn.execute(
             "INSERT INTO state(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
+            (sanitize_text(key), sanitize_text(str(value))),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     # ── 危险操作（仅 --reset 使用）────────────────────────
     def wipe(self) -> None:

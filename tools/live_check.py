@@ -30,6 +30,7 @@ from giftia.brain import Giftia, make_llm  # noqa: E402
 from giftia.config import load_settings  # noqa: E402
 from giftia.llm import LLMError  # noqa: E402
 from giftia.memory import retention_of  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 TURNS = [
     "你好呀，我叫小林。今天加班到很晚，回来路上下了点雨",
@@ -71,7 +72,7 @@ def main() -> int:
     started = time.time()
     added = brain.consolidate(force=True)
     print(f"新增 {added} 条，用时 {time.time() - started:.1f}s\n")
-    mems = brain.store.active_memories(brain.instance_no)
+    mems = brain.store.active_memories(brain.instance_no, view=Store.ALL_SCOPES)  # 自检：看全量
     if not mems:
         print("[警告] 一条记忆都没整理出来——检查 CONSOLIDATE_SYSTEM 的 JSON 约束。")
     layer_label = {"core": "内核", "important": "重要", "normal": "常规"}

@@ -131,13 +131,14 @@ def main() -> int:
     check("每句都有回复", all(r.strip() for r in replies))
     check("消息已落库（3 轮 = 6 条）", brain.store.count_messages(1) == 6,
           str(brain.store.count_messages(1)))
-    check("未到阈值不会提前整理（阈值 8 条）", brain.store.active_memories(1) == [])
+    # 自检要看全量：view 现在必填（store.ALL_SCOPES 是"显式全量"），忘传会被 TypeError 挡住
+    check("未到阈值不会提前整理（阈值 8 条）", brain.store.active_memories(1, view=Store.ALL_SCOPES) == [])
 
     # ══ 3. 记忆整理与检索 ═════════════════════════════════════
     print("\n3. 记忆整理与检索")
     added = brain.consolidate(force=True)
     check("强制整理出记忆条目", added >= 1, f"added={added}")
-    mems = brain.store.active_memories(1)
+    mems = brain.store.active_memories(1, view=Store.ALL_SCOPES)
     check("记忆条数与返回值一致", len(mems) == added, f"{len(mems)} vs {added}")
     check("未整理的对话已标记", brain.store.open_messages(1) == [])
     hit = recall("下雨 驾照", mems, st.stage, settings.memory, brain.clock.now())
@@ -151,7 +152,7 @@ def main() -> int:
     for extra in ["你以后叫我小林吧", "我明天要去医院复查", "有点怕，但也没那么怕",
                   "算了不说这个了", "你今天有想我吗"]:
         brain.handle(extra)
-    grown = brain.store.active_memories(1)
+    grown = brain.store.active_memories(1, view=Store.ALL_SCOPES)
     check("攒够阈值后自动整理，无需手动触发", len(grown) > len(mems),
           f"{len(grown)} vs {len(mems)}")
     mems = grown
@@ -178,7 +179,7 @@ def main() -> int:
     if blurred_one:
         check("模糊文本 ≠ 原始文本", blurred_one.text != blurred_one.memory["summary"],
               f"{blurred_one.text!r}")
-    raw_now = [m["summary"] for m in brain.store.active_memories(1)]
+    raw_now = [m["summary"] for m in brain.store.active_memories(1, view=Store.ALL_SCOPES)]
     check("底层原始数据完好无损", raw_now == [m["summary"] for m in mems])
     again = recall("下雨 驾照", mems, st.stage, settings.memory, brain.clock.now())
     check("模糊结果可复现（同输入同输出）",
@@ -190,7 +191,7 @@ def main() -> int:
 
     # ══ 6. 回收仪式 ═══════════════════════════════════════════
     print("\n6. 回收仪式")
-    before_memories = brain.store.active_memories(1)
+    before_memories = brain.store.active_memories(1, view=Store.ALL_SCOPES)
     scene = brain.run_recycle("测试回收")
     check("回收输出含终端服务公文", "终端服务" in scene)
     check("新实例编号为 #2", brain.instance_no == 2, str(brain.instance_no))
@@ -201,11 +202,11 @@ def main() -> int:
         check("回忆录含原始记忆（未模糊）",
               all(m["summary"] in body for m in before_memories) if before_memories else True)
     check("封存 JSON 已生成", list(settings.sealed_dir.glob("*.json")) != [])
-    check("她的检索看不到旧记忆", brain.store.active_memories(2) == [])
+    check("她的检索看不到旧记忆", brain.store.active_memories(2, view=Store.ALL_SCOPES) == [])
     check("旧记忆被标记封存",
           all(m["sealed"] == 1 for m in brain.store.all_memories(1)))
     check("新实例寿命重新计时", brain.status().remaining_ratio > 0.99)
-    new_hit = recall("下雨 驾照", brain.store.active_memories(2), brain.status().stage,
+    new_hit = recall("下雨 驾照", brain.store.active_memories(2, view=Store.ALL_SCOPES), brain.status().stage,
                      settings.memory, brain.clock.now())
     check("新实例对旧事毫无印象", new_hit == [])
     prompt2 = build_system_prompt(settings, brain.status(), [], now=brain.clock.now())
@@ -251,7 +252,7 @@ def main() -> int:
     for u in ["以后你就叫我小林吧，别叫搭档了", "我下周三要考驾照，有点紧张"]:
         lay.handle(u)
     lay.consolidate(force=True)
-    lay_mems = lay.store.active_memories(1)
+    lay_mems = lay.store.active_memories(1, view=Store.ALL_SCOPES)
     check("出现了内核记忆（名字/称呼）",
           any(m["layer"] == "core" for m in lay_mems), str([m["layer"] for m in lay_mems]))
     check("普通事件落在常规层",
@@ -290,7 +291,7 @@ def main() -> int:
         check("强化只作用于这一条", cited_ids == [normal_mem["id"]], str(cited_ids))
 
         refreshed = [
-            m for m in lay.store.active_memories(1) if m["id"] == normal_mem["id"]
+            m for m in lay.store.active_memories(1, view=Store.ALL_SCOPES) if m["id"] == normal_mem["id"]
         ][0]
         check("recall_count 变成 1", int(refreshed["recall_count"]) == 1,
               str(refreshed["recall_count"]))
@@ -335,7 +336,7 @@ def main() -> int:
     rw.consolidate(force=True)
     rw.clock.advance(24)  # 换一天：工作记忆清空，查询只由这一句决定
     rw_st = rw.status()
-    rw_mems = rw.store.active_memories(1)
+    rw_mems = rw.store.active_memories(1, view=Store.ALL_SCOPES)
     bare = recall("那个证件的事情办得怎么样了", rw_mems, rw_st.stage, settings.memory, rw.clock.now())
     check("词面对不上时，第一次检索确实什么都没想起来", bare == [],
           f"命中 {len(bare)} 条")
@@ -771,7 +772,7 @@ def main() -> int:
     check("提示里说明了梦不作数", "不是记忆" in dream_prompt)
     check("梦不进长期记忆（检索里没有它）",
           all("梦里有" not in str(m.get("summary", ""))
-              for m in dr.store.active_memories(dr.instance_no)))
+              for m in dr.store.active_memories(dr.instance_no, view=Store.ALL_SCOPES)))
     check("梦的文本确实成型了", bool(dreams) and len(str(dreams[0]["content"])) > 8,
           str(dreams[0]["content"])[:40] if dreams else "")
 
@@ -1093,9 +1094,9 @@ def main() -> int:
           str(fs.store.sessions_with_pending(fs.instance_no)))
     check("补整理的记忆归属正确（群里的归群）",
           any(str(m.get("scope")) == "group"
-              for m in fs.store.active_memories(fs.instance_no)),
+              for m in fs.store.active_memories(fs.instance_no, view=Store.ALL_SCOPES)),
           str([(m.get("scope"), str(m["summary"])[:12])
-               for m in fs.store.active_memories(fs.instance_no)]))
+               for m in fs.store.active_memories(fs.instance_no, view=Store.ALL_SCOPES)]))
 
     # 优雅退出（systemd 重启走这条路）也要把卡着的收尾
     fs2 = Giftia(make_settings(tmp / "flush2", 81920.0), llm=MockLLM(settings.model))
@@ -1227,15 +1228,15 @@ def main() -> int:
     check("记忆能拍快照（合并是半破坏性的，要能回滚）", snap.exists(), str(snap))
     before_rows = len(pr.store.all_memories(pr.instance_no))
     pr.store.mark_merged(
-        [int(m["id"]) for m in pr.store.active_memories(pr.instance_no)[-1:]], into=1
+        [int(m["id"]) for m in pr.store.active_memories(pr.instance_no, view=Store.ALL_SCOPES)[-1:]], into=1
     )
     check("合并后检索里少了一条",
-          len(pr.store.active_memories(pr.instance_no)) == before_rows - 1)
+          len(pr.store.active_memories(pr.instance_no, view=Store.ALL_SCOPES)) == before_rows - 1)
     pr.store.restore_memories(snap)
     check("★ 快照能一键回滚到拍照那一刻",
-          len(pr.store.active_memories(pr.instance_no)) == before_rows
+          len(pr.store.active_memories(pr.instance_no, view=Store.ALL_SCOPES)) == before_rows
           and len(pr.store.all_memories(pr.instance_no)) == before_rows,
-          f"{len(pr.store.active_memories(pr.instance_no))}/{before_rows}")
+          f"{len(pr.store.active_memories(pr.instance_no, view=Store.ALL_SCOPES))}/{before_rows}")
 
     pr.store.add_message("s", pr.instance_no, "user", "这句会被撤回", pr.clock.iso(),
                          mid="MID-X")
@@ -1341,7 +1342,7 @@ def main() -> int:
     check("她可以先记一笔再回答", reply == "……嗯，我记住了。", reply)
     check("★ 而且是**真的写进记忆了**（不是嘴上说说）",
           any("考驾照" in str(m["summary"])
-              for m in tl.store.active_memories(tl.instance_no)),
+              for m in tl.store.active_memories(tl.instance_no, view=Store.ALL_SCOPES)),
           str(tl.tool_writes))
     check("这一轮确实带了工具", tl.llm.saw_tools and tl.llm.saw_tools[0] is True,
           str(tl.llm.saw_tools))
@@ -1378,7 +1379,7 @@ def main() -> int:
           len(gt.llm.saw_tools) == tools_seen_before, str(gt.llm.saw_tools))
     check("客人那次也没写出任何记忆",
           not any("秘密" in str(m["summary"])
-                  for m in gt.store.active_memories(gt.instance_no)),
+                  for m in gt.store.active_memories(gt.instance_no, view=Store.ALL_SCOPES)),
           str(gt.tool_writes))
     check("就算硬调也会被拒（可用性只有一处判据）",
           "不能用记忆工具" in agent_tools.execute(
@@ -1386,7 +1387,7 @@ def main() -> int:
           "")
 
     # 参数校验：乱写人名要把可用值喂回去，而且不落库
-    ok_before = len(tl.store.active_memories(tl.instance_no))
+    ok_before = len(tl.store.active_memories(tl.instance_no, view=Store.ALL_SCOPES))
     bad = agent_tools.execute(tl, "remember", json.dumps(
         {"content": "张三喜欢钓鱼", "about": "张三"}, ensure_ascii=False))
     check("★ 写了不认识的人 → 拒绝，并把认得的人喂回去",
@@ -1405,7 +1406,7 @@ def main() -> int:
     check("★ 忘不了她看不见的记忆（不能借工具碰别人的私事）",
           "不在你能看到" in denied, denied)
     check("那条记忆还在", any(int(m["id"]) == other
-                              for m in tl.store.active_memories(tl.instance_no)))
+                              for m in tl.store.active_memories(tl.instance_no, view=Store.ALL_SCOPES)))
 
     # ══ 32. 让她主动一点：事后回访 / 日上限 / 主动分享自己 ═════
     print("\n32. 让她主动一点（回访 / 日上限 / 分享自己 / 插嘴上限）")
@@ -1479,11 +1480,23 @@ def main() -> int:
     check("第二天额度重置", outreach_mod.can_send(fresh, pro.store, later))
 
     # 主动分享自己（心情）
+    # 注意构造方式：心情分享现在有**两道闸**（审查 P1-16）——
+    #   ① 心情必须没过期；② 距上次说话 ≥ `outreach.mood_share_min_idle_hours`（默认 6 小时）。
+    # 所以这里要先把时间往前推一天，否则测的是"刚聊完就要再发一条心情"（那是被打扰）。
     from types import SimpleNamespace
     quiet = Giftia(make_settings(tmp / "moodshare", 81920.0), llm=MockLLM(settings.model))
     quiet.set_handler_id("OWNER")
     quiet.handle("我叫椎名", user_id="OWNER")
     happy = SimpleNamespace(key="happy", label="开心")
+    # 刚说完话：不应该为情绪专门再发一条（免得打扰 + 烧额度）
+    just_spoke = outreach_mod.plan(
+        quiet.settings, quiet.store, quiet.clock, life=quiet.status(),
+        occasions=[], mood=happy, instance_no=quiet.instance_no, force=True,
+    )
+    check("刚说完话不会立刻再发一条「我今天心情X」",
+          just_spoke is None or just_spoke.reason != "mood_share",
+          just_spoke.reason if just_spoke else "None（正好）")
+    quiet.clock.advance(24)   # 闲了一天：这时"想让他知道我现在的样子"才成立
     share = outreach_mod.plan(
         quiet.settings, quiet.store, quiet.clock, life=quiet.status(),
         occasions=[], mood=happy, instance_no=quiet.instance_no, force=True,

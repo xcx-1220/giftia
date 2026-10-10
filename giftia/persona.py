@@ -37,6 +37,11 @@ CONFIDENCE_MARK = {
     "associate": "[只是隐约觉得]",
 }
 
+# 花名册（【群里你认得的人】）最多带几个人。
+# 认识的人会随群成员自我介绍无界增长，而这份 system 每轮都要发一遍：
+# 实测 301 人 → 2463 字稳定吃上下文（P1-12）。注入前按"本群 + 最近活跃"截断。
+ROSTER_MAX = 30
+
 # 规则块第一句要跟着场景变 —— 群聊里说"你在和你的搭档一对一说话"是错的，
 # 会让她在群里说得太长、太亲密。
 SCENE_LINES = {
@@ -207,11 +212,13 @@ def _render_people(people: list[tuple[str, bool]]) -> str:
 
     搭档那一行的名字可能已经写明了"群里叫某某，是同一个人"，
     所以这里不重复追加"（你的搭档）"。
+    硬上限 `ROSTER_MAX`（调用方也会截断，这里是第二道闸）：
+    花名册会随认识的人无界增长，而 system 每轮都要发一遍。
     """
     if not people:
         return ""
     lines = ["你在群里认得这些人，别叫错："]
-    for person, is_owner in people:
+    for person, is_owner in people[:ROSTER_MAX]:
         if is_owner and "你的搭档" not in person:
             lines.append(f"- {person}（你的搭档）")
         else:

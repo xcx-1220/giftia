@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from .config import Settings
 from .store import Store
@@ -49,11 +50,80 @@ def _keys(instance_no: int) -> tuple[str, str]:
     return (f"occasion:i{instance_no}:milestone", f"occasion:i{instance_no}:bigday")
 
 
-def _parse_event_date(raw: str) -> date | None:
-    try:
-        return date.fromisoformat(str(raw or "").strip()[:10])
-    except (TypeError, ValueError):
+def _parse_event_date(raw: str, today: date | None = None) -> date | None:
+    """从记忆的 `event_date` 文本里认出那一天。
+
+    容忍常见写法（模型/整理链路写出来的不一定是严格 ISO）：
+
+    - `2026-10-11`、`2026-10-11T09:00:00`、`20261011`、` 2026-10-11 `
+    - `2026/10/11`、`2026.10.11`、`2026年10月11日`
+    - `10月20号` / `10月20日`（缺年份 → 按 `today` 补，已过则算明年）
+    - `下周三` / `这周三` / `周三` / `星期六`（相对 `today` 解析）
+
+    认不出来就返回 `None`，**不报错**——那天她不会想起来，仅此而已。
+    `today` 只用于相对/缺年份的写法；不传时按系统今天算。
+    """
+    text = str(raw or "").strip()
+    if not text:
         return None
+    base = today or date.today()
+
+    # 1) ISO（含 `2026-10-11T09:00`）与紧凑写法 `20261011`
+    for candidate in (text[:10], text):
+        try:
+            return date.fromisoformat(candidate)
+        except (TypeError, ValueError):
+            pass
+    if re.fullmatch(r"\d{8}", text):
+        try:
+            return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+        except ValueError:
+            return None
+
+    # 2) 数字分隔符：2026/10/11、2026.10.11、2026年10月11日、10月20号、10/20
+    m = re.search(
+        r"(?:(\d{4})\s*[-/.年]\s*)?(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*[日号]?", text
+    )
+    if m:
+        year_s, month_s, day_s = m.group(1), m.group(2), m.group(3)
+        try:
+            month, day = int(month_s), int(day_s)
+            if year_s:
+                return date(int(year_s), month, day)
+            guess = date(base.year, month, day)
+            # 只写了"10月20号"：过了就算明年的那一天
+            return guess if guess >= base else date(base.year + 1, month, day)
+        except ValueError:
+            return None
+
+    # 3) 相对星期：下周三 / 这周三 / 周三 / 星期天 / 下星期日
+    m = re.search(r"(下下|下|这|本)?\s*(?:周|星期|礼拜)\s*([一二三四五六日天1-7])", text)
+    if m:
+        week = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7}
+        target = int(m.group(2)) if m.group(2) in "1234567" else week.get(m.group(2))
+        if target is None:
+            return None
+        prefix = m.group(1) or ""
+        delta = (target - base.isoweekday()) % 7
+        if prefix == "下":
+            delta += 7
+        elif prefix == "下下":
+            delta += 14
+        return base + timedelta(days=delta)
+
+    return None
+
+
+def _handler_view(store: Store) -> list[tuple[str, str]]:
+    """搭档视角：他自己的私事 + 他本人的私聊（**不含群**）。
+
+    与 `brain.memory_view`、`recycle._handler_view`、`dream` 的默认口径一致。
+    """
+    handler_id = str(store.state_get("handler_id", "") or "")
+    view: list[tuple[str, str]] = [("private", "")]
+    if handler_id:
+        view.append(("person", handler_id))
+    return view
 
 
 def find_occasions(
@@ -70,9 +140,12 @@ def find_occasions(
 
     view 决定"能看到谁的大日子"——**和记忆检索用同一道闸门**。
     否则你私聊里说的"下周三考试"会变成她在群里惦记的事，等于当众说出来。
+    不传 → 搭档视角（`_handler_view`），与 `brain.memory_view` / `/days` 同一口径。
     """
     if not settings.occasions.enabled:
         return []
+    if view is None:
+        view = _handler_view(store)
     found: list[Occasion] = []
     mkey, bkey = _keys(instance_no)
 
@@ -108,13 +181,15 @@ def find_occasions(
     except ValueError:
         told = set()
     for mem in store.active_memories(instance_no, view=view):
-        when = _parse_event_date(mem.get("event_date") or "")
+        when = _parse_event_date(mem.get("event_date") or "", today)
         if when is None:
             continue
         delta = (when - today).days
         if delta < 0 or delta > settings.occasions.big_day_lookahead_days:
             continue
-        token = f"{mem['id']}:{when.isoformat()}"
+        # 去重键带上"今天"：前一天提过「明天考试」之后，正日子当天还要再提一次
+        # （“明天”和“今天”是两句话）；否则只提一次就永远不说了。
+        token = f"{mem['id']}:{when.isoformat()}:{today.isoformat()}"
         if token in told:
             continue
         what = str(mem.get("summary", "")).strip()
@@ -140,13 +215,14 @@ def find_occasions(
     # 「今天要考驾照」只是提醒，「昨天考得怎么样」才像真的在惦记。
     # 这是"她主动一点"里最动人的一块，而且数据早就有（记忆的 event_date）。
     for mem in store.active_memories(instance_no, view=view):
-        when = _parse_event_date(mem.get("event_date") or "")
+        when = _parse_event_date(mem.get("event_date") or "", today)
         if when is None:
             continue
         back = (today - when).days
         if back <= 0 or back > settings.occasions.follow_up_days:
             continue
-        token = f"back:{mem['id']}:{when.isoformat()}"
+        # 同样带上"今天"：事后第 1 天问过之后，第 2 天还要能再回访一次。
+        token = f"back:{mem['id']}:{when.isoformat()}:{today.isoformat()}"
         if token in told:
             continue
         what = str(mem.get("summary", "")).strip()
@@ -182,9 +258,21 @@ def render_occasions(occasions: list[Occasion]) -> str:
 
 
 def days_together_text(
-    store: Store, instance_no: int, days_known: float, milestones: tuple[int, ...] | list[int]
+    store: Store,
+    instance_no: int,
+    days_known: float,
+    milestones: tuple[int, ...] | list[int],
+    *,
+    view: list[tuple[str, str]] | None = None,
 ) -> str:
-    """给 /days 用的时间线。"""
+    """给 /days 用的时间线。
+
+    `view` = 这份清单读到谁的"大日子"：不传 → **搭档视角**
+    `[("private",""), ("person", handler_id)]`（不含群，也不含别人的私聊）。
+    `/days` 是搭档在自己终端上看的东西，别人的私聊约定与其它群的事不该列在这里（P1-11）。
+
+    `view` 是**可选关键字参数**，调用点（`brain.days_text()`）不用改。
+    """
     lines = [f"你们认识：{days_known:.1f} 天（约 {days_known / 30.0:.1f} 个月）"]
     mkey, bkey = _keys(instance_no)
     try:
@@ -195,11 +283,12 @@ def days_together_text(
     next_ms = next((m for m in sorted(milestones) if m > int(days_known)), None)
     if next_ms:
         lines.append(f"下一个纪念日：第 {next_ms} 天（还有 {next_ms - int(days_known)} 天）")
-    memories = store.active_memories(instance_no)
+    effective_view = view if view is not None else _handler_view(store)
+    today = date.today()
     big = [
-        (m, _parse_event_date(m.get("event_date") or ""))
-        for m in memories
-        if _parse_event_date(m.get("event_date") or "")
+        (m, when)
+        for m in store.active_memories(instance_no, view=effective_view)
+        if (when := _parse_event_date(m.get("event_date") or "", today)) is not None
     ]
     if big:
         lines.append("")
