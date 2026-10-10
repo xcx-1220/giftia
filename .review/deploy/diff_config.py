@@ -35,14 +35,16 @@ def flatten(data: dict, prefix: str = "") -> dict[str, object]:
 
 def main() -> int:
     remote_script = (
-        "import json,sys,tomllib;"
+        "import json,tomllib;"
         "d={};"
-        "[d.update({p: tomllib.load(open(f'/opt/giftia/config/{p}','rb'))}) for p in ('settings.toml','persona.toml')];"
+        "[d.update({p: tomllib.load(open(f'/opt/giftia/config/{p}','rb'))}) "
+        "for p in ('settings.toml','persona.toml')];"
         "print(json.dumps(d))"
     )
+    # config/*.toml 在服务器上是 600（giftia 属主），借 sudo 读
     proc = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", TARGET,
-         f"python3 -c \"{remote_script}\""],
+         f"sudo python3 -c \"{remote_script}\""],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if proc.returncode != 0:
