@@ -117,13 +117,18 @@ def main() -> int:
     s = base_settings("cli-bad-restart", 500.0)
     b = ProbeBrain(s, llm=MockLLM(s.model))
     from giftia.cli import _handle_command
+    first = None
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             _handle_command(b, "/time nan")
     except BaseException as exc:
         first = exc
     offset = b.store.meta_get("virtual_offset_hours")
-    print(f"\n    /time nan 之后：offset={offset!r}，异常={type(first).__name__}: {first}")
+    print(f"\n    /time nan 之后：offset={offset!r}，异常={type(first).__name__ if first else '无'}: {first}")
+    # 期望（修复后）：非有限值被**当场拦下**、不写库、不抛异常——时钟仍然可用。
+    check("★ /time nan 被拦下，虚拟时钟没有被写坏",
+          first is None and offset not in ("nan", "inf", "-inf"),
+          f"offset={offset!r} 异常={first!r}")
     b.store.close()
     # 重启：同一个库再构造一次
     err2 = None

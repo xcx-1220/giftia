@@ -81,14 +81,46 @@ def main() -> int:
     print(f"    backfill 更新 {updated} 条：")
     for r in rows:
         print(f"      #{r['id']} {r['session_id']:<24} scope={r['scope']:<8} subject={r['subject_id']!r}")
-    wrong = [r for r in rows if "gGROUP-A" in r["session_id"] and r["subject_id"] != "GROUP-A"]
+    # ── 判据修订（Lead 2026-10-10 裁定，只改断言、不改 store 语义）──────────
+    # 契约（FIX_BATCH1_INTERFACE §一 / P0-2 修法）：群标识从 session_id 解析出来之后，
+    # 还要与 state['last_group_openid'] 做前缀比对**确认**；对不上的老行**保持 private**
+    # —— "宁可不给她看，也别看错人"。所以这里**不能**要求"每条 -g 行都正向归属"
+    # （那会把"确认不了就不猜"的正确行为判成错）。正确的判据是两条：
+    #   ① 没有任何一行被归属到**别的群**（= 跨群泄漏，P0-2 的真正危害）；
+    #   ② 能确认的行必须归属正确（这里 = 用完整 openid 归到最近的群 B）。
+    last_group = "GROUP-B"
+    leaks = []
+    for r in rows:
+        sid = str(r["session_id"])
+        if "-g" not in sid:
+            continue
+        token = sid.split("-g", 1)[1].rsplit("-", 1)[0]   # session 里那段（可能是 12 位截断）
+        subj = str(r["subject_id"] or "")
+        if r["scope"] == "group":
+            if not (subj.startswith(token) or token.startswith(subj)):
+                leaks.append(r)          # 标成了别的群 → 跨群泄漏
+        elif not (r["scope"] == "private" and subj == ""):
+            leaks.append(r)              # 既不是本群、也不是 private → 不该出现
     check(
-        "P0-7 群 A 的历史消息不得被归属成群 B",
-        not wrong,
-        (f"#{wrong[0]['id']}（群 A 的消息）被标成 subject={wrong[0]['subject_id']!r}"
-         " —— 她最近活跃的是群 B") if wrong else "归属正确",
+        "P0-7 群 A 的历史消息没有跨群泄漏（对不上的行按契约保持 private）",
+        not leaks,
+        (f"#{leaks[0]['id']}（{leaks[0]['session_id']}）被标成 scope={leaks[0]['scope']!r} "
+         f"subject={leaks[0]['subject_id']!r} —— 那是别的群") if leaks else "无跨群归属",
     )
-    if wrong:
+    if leaks:
+        failures += 1
+
+    confirmed = [r for r in rows
+                 if "-g" in str(r["session_id"])
+                 and str(r["session_id"]).split("-g", 1)[1].rsplit("-", 1)[0] == last_group]
+    check(
+        "能确认的行归属正确（用完整 openid，而不是 session 里的截断值）",
+        bool(confirmed) and all(r["scope"] == "group" and r["subject_id"] == last_group
+                                for r in confirmed),
+        str([(r["session_id"], r["scope"], r["subject_id"]) for r in confirmed]),
+    )
+    if not (bool(confirmed) and all(r["scope"] == "group" and r["subject_id"] == last_group
+                                    for r in confirmed)):
         failures += 1
 
     title("2. 错误归属会不会变成「在群 B 说得出口」的记忆")

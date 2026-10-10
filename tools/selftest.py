@@ -593,8 +593,17 @@ def main() -> int:
     nm2.consolidate(force=True)
     check("模型那条路（整理记忆时）也能改口", nm2.handler_name == "小林", nm2.handler_name)
     nm2.run_recycle("测试换代")
-    check("换代后称呼仍保留（终端服务档案里有）", nm2.handler_name == "小林")
-    check("但新的她不记得你们的关系", nm2.current_bond().affinity == 0.0)
+    # 契约（README §2/§9）：「回收换代时关系清零——新的她不认识你」，`after_recycle_line`
+    # 念的也是"档案上还是空的"。所以称呼必须随换代清零，否则新实例第一句话就叫得出
+    # "小林"，而同一份提示词里还写着"你不知道他叫什么"（审查 P2 / qa-verifier B4）。
+    # 名字不会真的丢：它已经写进回忆录与回收档案（下面两条断言守着这一点）。
+    check("换代后称呼清零（新的她不认识你）", nm2.handler_name == "",
+          repr(nm2.handler_name))
+    _memo_dir = nm2.settings.memoir_dir
+    _memos = sorted(_memo_dir.glob("*.md")) if _memo_dir.exists() else []
+    _memo_text = _memos[-1].read_text(encoding="utf-8") if _memos else ""
+    check("但终端服务档案里留着那个名字", "小林" in _memo_text, _memos[-1].name if _memos else "（没有档案）")
+    check("而新的她不记得你们的关系", nm2.current_bond().affinity == 0.0)
 
     # ══ 20. 群聊情境 ═══════════════════════════════════════════
     print("\n20. 群聊：她不能把你的私事当众说出去")

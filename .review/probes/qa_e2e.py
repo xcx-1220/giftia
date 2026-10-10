@@ -18,6 +18,7 @@ from qa_harness import (  # noqa: E402
 )
 
 from giftia import memory as memory_mod  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 C = Checker("Stream E · 端到端集成场景（激活→对话→整理→退化→做梦→主动→回收→换代）")
 
@@ -218,7 +219,6 @@ plan, text = brain.compose_outreach(record=True)
 C.check("闲置 3 天后有主动理由", plan is not None, str(plan))
 C.info(f"理由 = {plan.reason if plan else None}；文本 = {text[:60]!r}")
 from giftia.outreach import can_send, sent_today  # noqa: E402
-from giftia.store import Store  # noqa: E402
 now = brain.clock.now()
 C.check("第 1 条发出后今日计数 = 1", sent_today(store, now) == 1, str(sent_today(store, now)))
 for _ in range(5):

@@ -281,6 +281,58 @@ def main() -> int:
           == [r.memory["id"] for r in recall("驾照 考试", pool, stage,
                                              dataclasses.replace(cfg, min_raw_score=0.0), NOW)])
 
+    # ── 8. 第 2 波 B4：时间 / 模糊台阶 / max_chars / LIKE 转义 / 撤回按会话 ──
+    title("8. B4：tz-aware 时间戳 / blur 单调 / max_chars 长度与标记 / LIKE 转义 / 撤回按会话")
+    from datetime import timezone
+
+    from giftia.memory import _age_hours, blur_text
+
+    aware = "2026-10-10T08:23:59+08:00"
+    naive_now = datetime(2026, 10, 10, 9, 0, 0)
+    got = _age_hours(aware, naive_now)
+    check("_age_hours 遇到 tz-aware 时间戳不再抛 TypeError（§5.1）",
+          abs(got - 0.6003) < 0.01, str(got))
+    check("_age_hours 对 aware-now / naive-ts 也不抛异常（只做 tz 归一，不做时区换算）",
+          isinstance(_age_hours("2026-10-10T08:00:00",
+                                datetime(2026, 10, 10, 1, 0, tzinfo=timezone.utc)), float))
+
+    text = "甲乙丙丁，戊己庚辛，壬癸子丑。"
+    erased = [blur_text(text, r, seed=7)[0].count("……")
+              for r in (0.10, 0.25, 0.375, 0.5, 0.625, 0.75)]
+    check(f"blur_text 的擦除量随 ratio 单调不回退（P3-2，擦除点 {erased}）",
+          all(b >= a for a, b in zip(erased, erased[1:])), str(erased))
+
+    terminal = settings.stage_for(0.0)   # max_chars=80
+    long_core = [{"id": 1, "summary": "他叫小林。" + "（补充说明）" * 40, "tags": "", "emotion": "",
+                  "about": "", "importance": 0.9, "layer": "core", "strength": 1.0,
+                  "recall_count": 0, "created_ts": "2026-10-10T09:00:00",
+                  "happened_ts": "2026-10-10T09:00:00", "last_recalled_at": None}]
+    hit = recall("小林", long_core, terminal, cfg, NOW)[0]
+    check(f"截断后长度不超过 stage.max_chars={terminal.max_chars}（P2-1 off-by-one）",
+          len(hit.text) <= terminal.max_chars, f"len={len(hit.text)}")
+    check("core 记忆（blur=0）被截断后不再被标成『已模糊』（P2-1 标记语义）",
+          hit.blur == 0.0 and not hit.blurred, f"blur={hit.blur} blurred={hit.blurred}")
+    hit1 = recall("小林", long_core, dataclasses.replace(terminal, max_chars=1), cfg, NOW)[0]
+    check("max_chars=1 这种极端值也不超长", len(hit1.text) <= 1, repr(hit1.text))
+
+    st_settings = settings_for("like")
+    store = Store(st_settings.db_path)
+    store.add_message("i1-pus_er-20261010", 1, "user", "带下划线的会话", "2026-10-10T09:00:00")
+    store.add_message("i1-pusXer-20261010", 1, "user", "另一个会话", "2026-10-10T09:01:00")
+    got_like = [m["content"] for m in store.messages_by_prefix("i1-pus_er-")]
+    check("前缀里的 _ 按字面匹配（P3-4：转义而不是删掉）",
+          got_like == ["带下划线的会话"], str(got_like))
+    check("前缀里的 % 也不再是通配符", store.messages_by_prefix("i1-%") == [])
+    store.add_message("s1", 1, "user", "撤回 A", "2026-10-10T09:02:00", mid="MID-DUP")
+    store.add_message("s2", 1, "user", "撤回 B", "2026-10-10T09:03:00", mid="MID-DUP")
+    check("按会话撤回只标记那个会话（P3-1 语义）",
+          store.mark_recalled("MID-DUP", session_id="s1") == 1)
+    rows = {r["session_id"]: r["recalled"] for r in store._rows(
+        "SELECT session_id, recalled FROM messages WHERE mid = 'MID-DUP'")}
+    check("另一个会话里同 mid 的消息没被误伤", rows == {"s1": 1, "s2": 0}, str(rows))
+    check("不传 session_id 时保持旧行为（兼容既有调用方）", store.mark_recalled("MID-DUP") == 2)
+    store.close()
+
     print()
     print(f"memory 探针：通过 {PASS} 项，失败 {FAIL} 项")
     return 1 if FAIL else 0

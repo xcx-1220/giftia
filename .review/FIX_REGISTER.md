@@ -52,7 +52,7 @@
 
 | 批次 | 主题 | 负责人 | 状态 |
 |---|---|---|---|
-| B4 | 数值/时间/边界（/time nan、/forget 大整数、tone_of、blur 舍入、max_chars） | lead(第2波) | 待修 |
+| B4 | 数值/时间/边界（/time nan、/forget 大整数、tone_of、blur 舍入、max_chars） | team-store（本轮指派）+ lead(第2波) | **部分**（team-store 已修：`blur_text` 用 `math.floor` 替银行家舍入（P3-2）、`max_chars` 截断不再推翻 `blurred` 且长度真的 ≤ 配置值（`……` 占 2 字符已算进预算，P2-1）、`_age_hours` tz 归一化（§5.1）、`messages_by_prefix` LIKE 用 `ESCAPE '\'` 转义（P3-4）、`mark_recalled` 增加可选 `session_id`（P3-1 语义；**适配器 `qq_official.py:642` 需传 session 才生效**）。验证：`fix_memory_p1.py` §8 十一条全 PASS、`mm_degradation.py` 0 失败。**仍待修**：`/time nan|inf`（cli.py+clock.py）、`/forget <超大整数>`（cli.py）、`tone_of` 否定句（mood.py）、`event_date` 解析（occasions.py）—— 不在 team-store 文件范围） |
 | B4 | occasions 日期解析与去重键 + dream 计数口径（`_parse_event_date` 容忍 `2026/10/11`/`10月20号`/`下周三`；`big_day`/`follow_up` token 带上"提醒发生在哪一天"；`should_dream`/`make_dream` 同一视角；`fragments=0` 不再 `[-0:]`） | team-recycle | 已修（见文末"团队补充"） |
 | B4 | 配置校验（settings.toml 零校验、degradation fail-open、keywords 类型、.env 解析） | team-store | 已修（`_sub()` 未知键→stderr 警告（persona.toml 的 `[bond]`/`[moods]` 用 ignore 排除）；`[[degradation.stages]]` 缺整段/为空/缺字段/blur 越界→`配置错误：…` 并写清后果；`response_tier` 夹到 0~100 并提示；`speak_max_per_day` 等上限为负→报错；`keywords` 必须是字符串列表（出厂三项继续可用）；memory/dream/mood/relationship/model 的计数与 0~1 字段一并校验；`.env` 用 utf-8-sig、去 `export `、行内 `#`（引号内不算）、只剥成对引号、CRLF/空值/值内 `=`。另按 Lead 要求给 `OutreachConfig` 加 `mood_share_min_idle_hours=6.0`、`wakeup_max_per_30_days=4` 并同步 settings.toml。验证：`fix_config_lifespan.py` 49 项全 PASS） |
 | B5 | ws 加固（分片总量上限、close 真关、控制帧规则、握手严格） | lead | 已修（`max_message=32MB`；`_sock_closed` 让 close() 真关；控制帧 FIN/长度校验；状态行严格 + Upgrade/Connection 校验 + Host 带端口） |
@@ -156,18 +156,25 @@ pa_qq_probe.py → 通过 8 项，失败 3 项（§5 那条按 lead 指示不动
 | `python .review\probes\lead_v3_p0_occasions.py` | B / C / D 段全 `[PASS]`（`不该出现的私事：[]`） |
 | `python .review\probes\team_brain_fixes.py`（我新增） | **PASS=56 FAIL=0** |
 | `bc_prompt.py` / `bc_growth.py` / `bc_trigger.py` | 10/0（2a、3a 翻绿）；301 人花名册 1 行/63 字；旁听 `name_calls 0`、`extract` 曲线全 0 |
+| `bc_tools.py` / `bc_branches.py` | 迁移 `view` 后 **20/0**、**32/0**（C2 期望已按 lead 授权翻转） |
+| `bc_flow.py` / `bc_fault.py` / `bc_growth.py` | 期望全部翻转后 **26/0**、**17/0**、**5/0**（`bc_*` 家族合计 **143/0**） |
 
-**三条交回 lead 的结论**
+**第 1 波交回 lead 的结论（已全部落地）**
 
 1. `giftia/brain.py` 的 `active_memories` 旧签名调用点（迁移期清单里的 **1261/1345/1376**）已全部显式化：
    `status_text` / `memories_text` / `recall_text` → `view=Store.ALL_SCOPES`（自检/排障，行内有注释说明），
    真实注入路径改走 `visible_memories()`（视角 + 换人遮蔽）。
-2. `bc_tools.py`、`bc_fault.py`（部分）等旧探针自身还带裸 `active_memories(instance_no)`
-   （例：`bc_tools.py:127`），现在直接 `TypeError: missing 'view'`；属于探针侧迁移，我没有动别人的探针文件。
-3. `bc_branches.py` 的 **C2 由 PASS 变 FAIL**，但性质是"病没了"：C2 断言"客人拿得到本群公开记忆"，
-   修前这条只靠**印象块的兜底循环**（把不在场的阿伟补进提示词）才成立；P1-13 删掉那个循环后，
-   客人那一轮的检索按 query 正常为空。客人**视角**仍是本群 `[("group", gid)]`，问对了事照样检索得到。
-   探针标签写的是病象、判定条件其实是 `"豆豆" in system`，建议 lead 顺手把 C2 的注释/期望对齐契约。
+2. `bc_*` 探针的裸 `active_memories` 已按 lead 第 2 波授权迁移（4 个文件 9 处，只加 `view` + import + 注释，
+   未改断言期望）：`bc_tools` 20/0、`bc_branches` 32/0、`bc_trigger` 33/0、`bc_prompt` 10/0。
+3. **期望翻转（第 2+3 波，全部按 lead 授权）**：`bc_branches` C2、`bc_trigger` 4b/4c，
+   以及第 3 波授权的 `bc_flow` 6 条（0a/1c/1d/1e/2a/2b）与 `bc_fault` 2 条（5b/7a）——
+   每条都改写成"新契约下的正确行为"＋理由注释，并配正向对照
+   （C2b、4c'/4c''、0c、1f/1g、2a'、5a、7b）。
+   两处按 `bc_flow` 2b 的裁定：断言改成"回的是群聊婉拒「……这个我们私下说。」"（契约 §三.4）。
+   **顺带报备**：`bc_growth` 1a/1b 是同一类（我当时列在报告 §9.4 表、未进那 8 条清单），
+   也一并翻成"≤ ROSTER_MAX 行 / ≤300 字"＋1c 对照（搭档仍在第一行）；如要严格只动那 8 条可回退。
+4. 其余探针家族（`qa_*` 13 处、`beh_*`、`mm_*` 等，见 team-store 附录第 2 条）仍带裸 `active_memories`，
+   已由 lead 分派给 team-store 批量迁移。
 
 ## 团队补充：team-store 第 1 波（2026-10-10）
 
@@ -207,3 +214,34 @@ pa_qq_probe.py → 通过 8 项，失败 3 项（§5 那条按 lead 指示不动
 **明确留给下一批（不在本批任务清单）**：`_age_hours` 的 tz 归一化（§5.1）、`mark_recalled` 的 session 条件（P3-1 语义半条，
 本轮只加了索引）、`messages_by_prefix` 的 LIKE 转义（P3-4）、`blur_text` 银行家舍入 / `max_chars` 二次截断与 +1（P2-1，文件是我的、
 但登记册把它算在 B4「数值/时间/边界」名下——请明确归谁，避免两人同时改 `memory.py`）。
+
+### 追加：team-store 第 2 波（2026-10-10，Lead 验收后指派）
+
+产品代码（`giftia/store.py`、`giftia/memory.py`）：
+`_age_hours` tz 归一化、`blur_text` → `math.floor`、`max_chars` 截断不再置 `blurred` 且长度 ≤ 配置值、
+`messages_by_prefix` LIKE `ESCAPE '\'` 转义、`mark_recalled(msg_id, session_id=None)` 会话条件。
+
+探针：
+- `mm_scope_backfill.py` 判据按 Lead 裁定重写（断言"无跨群泄漏" + "能确认的行归属正确"，store 语义未动）→ **失败计数 0**；
+- `mm_store_sqlite.py` 替身 `flaky_meta_set(key, value, *a, **kw)` 适配 `commit=` → 完整跑完，事务回滚可见（`memories=0 / consolidated=0`）；
+- 裸 `active_memories` 迁移（只加 `view=Store.ALL_SCOPES` + 必要 import，未改断言）：9 个文件 28 处
+  （`qa_e2e` 13、`beh_dream` 4、`mm_multi_query_scale` 3、`mm_snapshot_injection` 2、`mm_store_sqlite` 1、
+  `mm_unfiltered_paths2` 1、`qa_bugs` 1、`qa_time` 2、`mm_recall_reinforce` 1）；`mm_unfiltered_paths.py:113` 的
+  `view=None` 一并迁到 `ALL_SCOPES` 并注明契约；`fix_store_p0.py:73` 是故意漏传 view 的 fail-loud 测试，保持原样+注释；
+- `pa_config_probe.py`：`toml_case()` 给缺 stages 的用例补一档合法 stage（自带 stages 的 2a/2f 不动）、
+  2e keywords 用例接受"抛配置错误"（意图不变）→ 22 通过 / 1 失败（唯一失败是 2d 的既有陈旧期望，未动）。
+- 迁移事故如实记录：第一版脚本把 `ast` 的字节列偏移当字符下标，中文行插错位置；已 `git checkout` 回滚重做，现全部探针可 `ast.parse`。
+
+| 命令 | 真实数字 |
+|---|---|
+| `python .review\run_tests.py tools/selftest.py` | **通过 303 项，失败 0 项** |
+| `tools/audit.py` / `ws_selftest.py` / `qq_protocol_selftest.py` | 10/0（4 提示）、17/0、72/0 |
+| `fix_store_p0.py` / `fix_memory_p1.py` / `fix_config_lifespan.py` | 46/0、**51/0**、49/0 |
+| `mm_scope_backfill.py` | 失败计数 **0** |
+| `mm_store_sqlite.py` | 完整跑完；崩溃后 `memories=0`、`messages=[{consolidated:0}]` |
+| 全量探针清扫（39 个） | 只剩 3 个 traceback，且都不是本层：`mm_consolidate_time.py`（5c 按契约 fail-loud）、`beh_outreach.py:156`（`reason=None` 格式化，P1-16 行为变更后探针没跟上）、`beh_cli.py:126`（探针自身 `UnboundLocalError`） |
+
+**交回 Lead**：① `mark_recalled` 需要在 `adapters/qq_official.py:642` 传 `session_id` 才拿到 P3-1 的收益（我没改适配器）；
+② `beh_outreach.py:156` / `beh_cli.py:126` 两个探针自身的问题请转给行为侧；
+③ `mm_unfiltered_paths.py` 仍有的两条 FAIL（dreaming 计数口径、封存 JSON 含 person）属"判据过期/已被 Lead 裁定为分层期望"，是否像
+`mm_scope_backfill` 一样改判据请你裁定。详见 `.review/fix-reports/team-store.md` 第 2 波章节。

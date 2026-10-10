@@ -1873,9 +1873,19 @@ class Giftia:
             reason=reason,
             extra_context=extra,
         )
-        # 换代：新的她不认识你，关系与心情一并清零
+        # 换代：新的她不认识你，关系与心情一并清零。
+        # **称呼也要清**（审查 P2 / qa-verifier B4）：README 承诺"新的她不认识你"、
+        # `after_recycle_line` 念的是"档案上还是空的"，但以前 handler_name 留在全局 state 里，
+        # 新实例第一句话就叫得出"小林"，而同一份提示词里还写着"你不知道他叫什么"（自相矛盾）。
+        # 绑定关系一并回到未绑定：新一任要重新 /bind（或私聊自动认主）。
         self.bond.reset(old_instance)
         self.mood.reset(old_instance)
+        self.store.state_set("handler_name", "")
+        self.store.state_set("handler_id", "")
+        # 绑定水位线跟着换代清空：新一代的 private 记忆是全新的一批，
+        # 不该继承上一任的"遮蔽下界"（否则新搭档自己在绑定前说的话会被误遮）。
+        for key in ("handler_bound_at", "handler_bound_mem_id", "handler_bound_msg_id"):
+            self.store.meta_set(key, "")
         self.last_bond = None
         self.last_mood = None
         self.notices.append(

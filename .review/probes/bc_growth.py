@@ -58,7 +58,7 @@ def env(name: str, hours: float = 81920.0):
     return dataclasses.replace(base, root=d)
 
 
-print("== 1. 花名册（known_people）无上限地进群提示词 ==")
+print("== 1. 花名册（known_people）进群提示词的条数上限 ==")
 h = Giftia(env("growth"), llm=Rec(env("growth").model))
 h.set_handler_id("OWNER")
 h.set_handler_name("椎名")
@@ -71,8 +71,15 @@ roster = [b for b in h.llm.system.split("\n\n") if b.startswith("【群里你认
 roster_block = roster[0] if roster else ""
 lines = [l for l in roster_block.splitlines() if l.startswith("- ")]
 print(f"      认识 301 人 → 提示词里花名册 {len(lines)} 行 / {len(roster_block)} 字")
-check("1a ★ 花名册没有条数上限，全部进提示词", len(lines) >= 300, str(len(lines)))
-check("1b 单条提示词里花名册占比明显（>2000 字）", len(roster_block) > 2000, str(len(roster_block)))
+# ★ 期望翻转（lead 授权，2026-10-10）：原来这两条断言"花名册无上限、全部进提示词"（>2000 字），
+#   那是 P1-12 的缺陷（认识的人越多，每轮 system 越长）。修后 persona.ROSTER_MAX=30 硬截断，
+#   并且只带"本群见过的人 + 搭档"（这 300 人是 record 时没带 group_id 的，所以本群 GBIG 里
+#   只有搭档一行——群隔离与上限同时生效）。正向对照：搭档永远在名单里。
+check("1a ★ 花名册有条数上限（≤ ROSTER_MAX 行，不再 301 行全进）",
+      0 < len(lines) <= 30, str(len(lines)))
+check("1b 花名册不再吃掉上下文（≤ 300 字）", len(roster_block) <= 300, str(len(roster_block)))
+check("1c 对照：搭档仍然在名单第一行（截断不会把搭档挤掉）",
+      lines and "椎名" in lines[0], str(lines[:1]))
 print(f"      整条 system 长度：{len(h.llm.system)} 字")
 
 print("\n== 2. people_stats：每条群消息都全量重写，而且没人读 ==")

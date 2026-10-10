@@ -162,9 +162,15 @@ check("5a 空白输入直接返回空，不落库", r5 == "" and h5.store.count_
       f"{r5!r} rows={h5.store.count_messages(h5.instance_no)}")
 r5b = h5.handle("在吗", user_id="OWNER")
 rows5 = h5.store.all_messages(h5.instance_no)
-check("5b 模型返回空串时仍会写一条空的 assistant 记录（observed）",
-      len(rows5) == 2 and rows5[-1]["content"] == "", str([(r['role'], r['content']) for r in rows5]))
-print(f"      空回复被当成'她说过了'的文本：{r5b!r}")
+# ★ 期望翻转（lead 授权，2026-10-10）：原来这条断言"模型返回空串时仍会写一条空的 assistant
+#   记录"（observed 缺陷：她"以为自己说了句空话"，note_reply_delivery("") 还会因为
+#   "" == "" 把空记录当成"完整送达"）。修后空回复用 FAILURE_LINES 兜底：既不写空记录，
+#   也不把空串当成送达文本。正向对照见 5a（空白**输入**仍然直接返回空、不落库）。
+check("5b ★ 模型返回空串 → 不写空的 assistant 记录，落库的是 FAILURE_LINES 兜底台词",
+      len(rows5) == 2 and rows5[-1]["content"] in FAILURE_LINES
+      and str(rows5[-1]["content"]).strip() != "",
+      str([(r["role"], r["content"][:16]) for r in rows5]))
+print(f"      空回复被兜底成的文本：{r5b!r}")
 
 print("\n== 6. runs.jsonl 不记对话内容（README 3.7 的宣称）==")
 h6 = fresh("runs", Flaky(env("runs").model, fail_times=0))
@@ -218,8 +224,12 @@ mems_after = [m["summary"] for m in h7.store.active_memories(h7.instance_no, vie
 open_after = len(h7.store.open_messages(h7.instance_no))
 print(f"      add_memory 调用次数={calls['n']}，consolidate 抛出：{raised or '（无）'}")
 print(f"      已写进记忆：{mems_after}；仍处于未整理的消息：{open_before} -> {open_after}")
-check("7a 半写：第一条记忆已经落库，但消息没标已整理（没有事务）",
-      bool(mems_after) and open_after > 0 and bool(raised),
+# ★ 期望翻转（lead 授权，2026-10-10）：原来这条断言"半写：第一条记忆已经落库、消息却没标已整理
+#   （没有事务）"——那是 P1-7 的缺陷。修后 consolidate 的"写记忆 + 标消息 + 推游标"在一个
+#   事务里（team-store），中途失败整批回滚：一条记忆都不该留下，消息仍然是未整理状态，
+#   异常照旧抛出来（fail-loud，调用方知情）。正向对照见 7b：重试后能正常落库且不重复。
+check("7a ★ 事务回滚：失败时一条记忆都没落库、消息仍未整理、异常照旧抛出",
+      not mems_after and open_after > 0 and bool(raised),
       f"raised={raised!r} mems={mems_after} open={open_after}")
 added2 = h7.consolidate(force=True)
 mems2 = [m["summary"] for m in h7.store.active_memories(h7.instance_no, view=Store.ALL_SCOPES)]

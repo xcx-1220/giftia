@@ -145,8 +145,22 @@ def main() -> int:
         out = f"正常返回 {res}"
     except Exception as exc:
         out = f"{type(exc).__name__}: {exc}"
-    print(f"  [INFO] send() 抛出：{out}")
-    check("_request 的契约是「失败一律 QQError」", out.startswith("QQError"), out)
+    print(f"  [INFO] send() 返回：{out}")
+    # 期望（修复后）：_request 的契约是"失败一律 QQError"，
+    # 而 send() 的契约是"**发送失败不抛异常、如实上报**"（调用方据此回滚那句记忆）。
+    # 所以这里分两层验：① _request 自己抛 QQError；② send() 把它收成 SendResult.failed。
+    direct = ""
+    try:
+        bot._request("POST", "/v2/users/U-1/messages", {"msg_type": 0, "content": "x"})
+        direct = "没有抛异常"
+    except Exception as exc:
+        direct = f"{type(exc).__name__}: {exc}"
+    check("_request 的契约是「失败一律 QQError」", direct.startswith("QQError"), direct)
+    check(
+        "send() 把失败如实上报（不抛异常、不谎报送达）",
+        "failed=[" in out and "sent=[]" in out,
+        out,
+    )
 
     # 从事件入口走一遍：异常会不会穿透 handle_event
     escaped = ""
@@ -220,8 +234,12 @@ def main() -> int:
     r4 = bot4.send("c2c", "U-4", "这句能不能发出去", None)
     n4 = len(api4.sends("/v2/users/U-4/messages"))
     print(f"  [INFO] 限频表已满 → ok={r4.ok} failed={r4.failed} 实际 HTTP 请求数={n4}")
-    check("限频命中时不丢消息（或至少如实上报为失败）",
-          n4 == 1, f"被硬丢：ok={r4.ok}")
+    # 期望（修复后）：限频命中时先"等窗口过去"（上限 20s），等不起就**如实上报为失败**。
+    # 关键不变量是"不静默丢消息"：要么真发出去，要么 failed 里明确写着为什么没发。
+    delivered_or_reported = bool(r4.sent) or bool(r4.failed)
+    check("限频命中时不静默丢消息（发出去 或 如实上报为失败）",
+          delivered_or_reported and (n4 > 0 or bool(r4.failed)),
+          f"n={n4} ok={r4.ok} failed={r4.failed}")
     api4.stop()
 
     # ── 5. 主动消息绕过发送限频 ─────────────────────────────────

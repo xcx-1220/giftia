@@ -153,7 +153,7 @@ def main() -> int:
             _, text = c.compose_outreach(record=True, force=True)
             sent = bool(text.strip())
         used, left, next_ok = quota_state(c.settings, c.store, c.clock.now())
-        print(f"    第 {day} 天 idle={day}天 reason={r:<11} can_send={ok} 真发={sent} "
+        print(f"    第 {day} 天 idle={day}天 reason={str(r):<11} can_send={ok} 真发={sent} "
               f"已用={used}/{ctx.max_per_30_days} 下次={next_ok[:16]}")
         if r:
             reasons.append(r)

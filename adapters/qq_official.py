@@ -246,6 +246,8 @@ class QQBot:
         self._sent_recently: dict[str, tuple[str, float, str]] = {}
         # 这一次 send() 是否要带官方的「互动召回」字段（is_wakeup），只对单聊有意义
         self._wakeup_once = False
+        # 每个 msg_id 已经回出去几条（平台按 msg_id 计数：群 5 / 单聊 4）
+        self._replies_sent: dict[str, int] = {}
 
     # ══ 退出 ═════════════════════════════════════════════════
     def request_stop(self, *_args: object) -> None:
@@ -373,6 +375,28 @@ class QQBot:
             return result
         key = f"{kind}:{openid}"
 
+        # ★ 平台硬限是**按 msg_id 计数**的：群 5 条 / 单聊 4 条（不是"每条回复"）。
+        # 所以这里检查的是"这个 msg_id 已经发出去几条"，把**系统通知**也算进同一本账——
+        # 否则"5 段回复 + 1 条终端服务通知"= 6 条，第 6 条必被平台拒掉（审查 P1-21）。
+        if msg_id:
+            limit = PASSIVE_REPLY_LIMIT_GROUP if kind == "group" else PASSIVE_REPLY_LIMIT_C2C
+            already = int(self._replies_sent.get(msg_id, 0))
+            if already >= limit:
+                reason = f"同一个 msg_id 已经回过 {already} 条（平台上限 {limit}），这条不发了"
+                print(f"[发送] {reason}", file=sys.stderr)
+                result.failed.append((pieces[0], reason))
+                return result
+            budget = limit - already
+            if len(pieces) > budget:
+                keep = pieces[: budget - 1] if budget > 1 else []
+                tail = "".join(pieces[budget - 1 :])
+                pieces = [*keep, tail]
+                print(
+                    f"[发送] 这条回复超过平台上限（同一 msg_id 最多 {limit} 条，"
+                    f"已回 {already} 条），已把尾巴并成一段（{len(pieces)} 段）",
+                    file=sys.stderr,
+                )
+
         # 同文去重（8 秒）：**按 msg_id 分桶**。
         # 以前不看 msg_id：两个不同的 msg_id（平台侧两条独立的被动回复）文本相同且在 8 秒内，
         # 第二条不会发出却进了 result.sent → 调用方以为"用户看见了"，而屏幕上什么都没有。
@@ -392,21 +416,7 @@ class QQBot:
             result.sent.extend(pieces)
             return result
 
-        # 平台硬限：同一个 msg_id 的被动回复条数（群 5 / 单聊 4）。
-        # 超出的段落不会被平台接受，与其"发 5 段被拒 1 段"，不如把尾巴并进最后一段。
-        if msg_id:
-            limit = PASSIVE_REPLY_LIMIT_GROUP if kind == "group" else PASSIVE_REPLY_LIMIT_C2C
-            budget = limit - self._seqs.get(msg_id, 0)
-            if budget > 0 and len(pieces) > budget:
-                keep = pieces[: budget - 1] if budget > 1 else []
-                tail = "".join(pieces[budget - 1 :])
-                pieces = [*keep, tail]
-                print(
-                    f"[发送] 这条回复超过平台上限（同一 msg_id 最多 {limit} 条），"
-                    f"已把尾巴并成一段（{len(pieces)} 段）",
-                    file=sys.stderr,
-                )
-
+        # 平台硬限已经在上面的 budget 里处理过了（含系统通知），这里不再重复
         for index, piece in enumerate(pieces):
             if index:  # 分段之间隔一下，别顶着风控
                 time.sleep(random.uniform(
@@ -444,6 +454,11 @@ class QQBot:
                 self._request("POST", path, body)
                 result.sent.append(piece)
                 self._note_send(key)          # 成功才记账
+                if msg_id:
+                    # 平台按 msg_id 计数被动回复条数，成功一条记一条
+                    self._replies_sent[str(msg_id)] = int(self._replies_sent.get(str(msg_id), 0)) + 1
+                    if len(self._replies_sent) > 500:
+                        self._replies_sent.pop(next(iter(self._replies_sent)))
                 if len(pieces) == 1:
                     self._sent_recently[key] = (piece, time.time(), str(msg_id or ""))
             except QQError as exc:
@@ -639,7 +654,17 @@ class QQBot:
                     or payload.get("id")
                     or ""
                 )
-                hit = brain_mod.get_default(self.settings).store.mark_recalled(mid)
+                # 撤回要限定在同一个会话里：msg_id 理论上可能跨群重复（P3-1），
+                # 撤回一个群的消息不该把另一个群里同 id 的消息一起标掉。
+                hub_rc = brain_mod.get_default(self.settings)
+                gid = str(payload.get("group_openid") or "")
+                session = (
+                    f"i{hub_rc.instance_no}-g{gid[:12]}-"
+                    f"{hub_rc.clock.now().strftime('%Y%m%d')}"
+                    if gid
+                    else ""
+                )
+                hit = hub_rc.store.mark_recalled(mid, session_id=session or None)
                 print(f"[撤回] {mid[:16]}… 已标记 {hit} 条（不再进入她的记忆）")
             return
 

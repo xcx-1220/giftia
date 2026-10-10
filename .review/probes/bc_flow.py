@@ -94,18 +94,30 @@ def group_event(i, content, uid="STRANGER", who="阿伟", mentions=None, role=""
     }
 
 
-# ══ 0. 前置可达性：CLI 路径聊出来的私聊记忆，handler_id 仍然是空的 ══
-print("== 0. 前置：本地 CLI（run.py → cli.py:85 brain.handle(text)）不写 handler_id ==")
+# ══ 0. 前置可达性：本地 CLI 的私聊记忆落在 private，并且第一条私聊会认主 ══
+# ★ 期望翻转（lead 授权，2026-10-10）：原来这里断言"CLI 聊过之后 handler_id 仍然是空的"，
+#   那是 P0-3a 的入口之一（未绑定 = 谁都能在群里 /profile 出来那批记忆）。
+#   修后核心 path 也会**认主**（`_auto_bind`，与适配器同一个 [runtime] auto_bind 开关），
+#   所以 handler_id 会被写上本地哨兵值 —— 这是设计行为，不是泄漏：认主必经 §二 的遮蔽。
+print("== 0. 前置：本地 CLI（run.py → cli.py:85 brain.handle(text)）也会认主 ==")
 st0, hub0, bot0 = new_bot("cli_pre")
 hub0.handle("我今天加班到很晚，回来路上下了点雨")   # 不带 user_id，等价 cli.py:85
 hub0.consolidate(force=True)
 scopes0 = [m["scope"] for m in hub0.store.active_memories(hub0.instance_no,
                                                           view=Store.ALL_SCOPES)]
-check("0a CLI 聊过之后 handler_id 仍是空", hub0.handler_id == "", repr(hub0.handler_id))
-check("0b 记忆落在 private（谁都能在群里 /profile 出来的那批）", set(scopes0) == {"private"},
+check("0a ★ 本地 CLI 第一条私聊会认主（核心认主，与适配器同一 auto_bind 开关）",
+      hub0.handler_id == "handler", repr(hub0.handler_id))
+check("0b 记忆落在 private（P0-3b 的遮蔽下界保证换人后看不到）", set(scopes0) == {"private"},
       str(scopes0))
+check("0c 认主之后这一轮走搭档口径（is_handler=True、搭档视角）",
+      hub0.is_handler is True
+      and hub0.memory_view == [("private", ""), ("person", "handler"), ("group", "*")],
+      f"is_handler={hub0.is_handler} view={hub0.memory_view}")
 
 # ══ 1. 未绑定状态：指令闸门是否放行陌生人 ═══════════════════════
+# ★ 期望翻转（lead 授权，2026-10-10）：这一节原来断言"未绑定时陌生人的 /profile 被执行、
+#   能 /forget 掉搭档的记忆、能 /impress 写东西"——那是 P0-3a 的缺陷本身。
+#   修后适配器采用白名单语义（qq_official.handle_command ①②③），下面是新契约下的正确行为。
 print("\n== 1. 未绑定（handler_id='') 时群里的指令闸门 ==")
 st, hub, bot = new_bot("cmd_unbound", response_tier=0, wake_delay_seconds=0.0)
 hub.store.add_memory(instance_no=hub.instance_no, created_ts=hub.clock.iso(),
@@ -121,27 +133,46 @@ with contextlib.redirect_stdout(buf):
     handled = bot.handle_command("group", "G-CMD", "/profile", "STRANGER", "m1")
 out = buf.getvalue()
 print(f"      陌生人 /profile 被当成指令处理：{handled}")
-check("1b ★ 未绑定时陌生人的 /profile 被执行（应当挡下）", handled is True)
-check("1c ★ 搭档视角的私聊档案被发进群里", SECRET in out,
-      out.strip().splitlines()[-1][:80] if out.strip() else "(无输出)")
-print(f"      输出片段：{[l for l in out.splitlines() if SECRET in l][:1]}")
+check("1b 指令仍然被消费（回一句婉拒，不再交给她当聊天）", handled is True)
+check("1c ★ 未绑定时陌生人的 /profile 不再输出任何档案（契约 §三.4：群里一律拒绝）",
+      SECRET not in out, out.strip().splitlines()[-1][:80] if out.strip() else "(无输出)")
+print(f"      她回的是：{out.strip().splitlines()[-1][:60] if out.strip() else '(无输出)'}")
 
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     bot.handle_command("group", "G-CMD", f"/forget {mem_id}", "STRANGER", "m2")
 alive = any(int(m["id"]) == mem_id
             for m in hub.store.active_memories(hub.instance_no, view=Store.ALL_SCOPES))
-check("1d ★ 未绑定时陌生人能 /forget 掉搭档的记忆", alive is False, f"memory #{mem_id} 还在={alive}")
+check("1d ★ 未绑定时陌生人 /forget 无效：那条记忆还在", alive is True,
+      f"memory #{mem_id} 还在={alive}")
 
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     bot.handle_command("group", "G-CMD", "/impress 张三 他欠我钱", "STRANGER", "m3")
 imp = [m for m in hub.store.active_memories(hub.instance_no, view=Store.ALL_SCOPES)
        if "欠我钱" in str(m["summary"])]
-check("1e ★ 未绑定时陌生人能 /impress 往记忆里写东西", bool(imp), str(len(imp)))
+check("1e ★ 未绑定时陌生人 /impress 无效：什么都没写进去", not imp, str(len(imp)))
 
-# ══ 2. 已绑定：同样的指令被挡 ══════════════════════════════════
-print("\n== 2. 指令不需要被 @（群里任何一条以 / 开头的消息都会进指令处理）==")
+# 正向对照：闸门判的是**身份**，不是"一律拒绝"——同一个人 /bind 之后，私聊里就查得到档案。
+# （这也是 P0-3b 的对照：绑定之后写下的记忆看得见；绑定之前留下的仍然被遮蔽。）
+print("      对照：同一个人 /bind 之后再查（c2c）")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    bot.handle_command("c2c", "STRANGER", "/bind", "STRANGER", "m4")
+check("1f 未绑定时 /bind 仍然可用（白名单：/bind、/help、/unbind）",
+      hub.handler_id == "STRANGER", repr(hub.handler_id))
+hub.add_impression("阿伟", "他欠我钱")
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    bot.handle_command("c2c", "STRANGER", "/profile", "STRANGER", "m5")
+check("1g 搭档本人在私聊里 /profile 照常输出档案（闸门不是全拒）",
+      "欠我钱" in buf.getvalue(), buf.getvalue().strip()[-60:])
+
+# ══ 2. 群里的指令要先 @ 她，而且群里不输出"看记忆"的视角 ════════
+# ★ 期望翻转（lead 授权，2026-10-10）：原来这里断言"未被 @ 的群里 /profile 也被执行了
+#   （没走触发判定）"——那是缺陷。修后群里的指令要**先被 @**才进指令处理，
+#   未被 @ 的 `/` 消息只旁听；被 @ 之后也只会拿到群聊婉拒（契约 §三.4）。
+print("\n== 2. 群里的指令要先 @ 她（未被 @ 的 / 消息只旁听）==")
 st_u, hub_u, bot_u = new_bot("cmdat", response_tier=0, wake_delay_seconds=0.0)
 hub_u.store.add_memory(instance_no=hub_u.instance_no, created_ts=hub_u.clock.iso(),
                        happened_ts=hub_u.clock.iso(),
@@ -152,19 +183,28 @@ with contextlib.redirect_stdout(buf):
     bot_u.handle_event("GROUP_MESSAGE_CREATE",
                        group_event(90, "/profile", uid="STRANGER", who="阿伟"))  # 没有 mentions
 out_u = buf.getvalue()
-fired_trigger = any(l.startswith("[旁听]") or l.startswith("[待答]") or l.startswith("[聚批]")
-                    for l in out_u.splitlines())
-check("2a ★ 未被 @ 的群里 /profile 也被执行了（没走触发判定）",
-      SECRET in out_u and not fired_trigger, out_u.strip()[:200])
+replied_u = any(f"[{bot_u.settings.persona.name}]" in l for l in out_u.splitlines())
+check("2a ★ 未被 @ 的群指令不再被执行：不下档案、也不回答（走旁听）",
+      SECRET not in out_u and not replied_u, out_u.strip()[:200])
 
-print("\n== 2b. 已绑定后同样的指令被挡（对照组）==")
+# 正向对照：被 @ 之后同一条指令会进指令处理（拿到的是群聊婉拒，仍然不输出档案）
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    bot_u.handle_event("GROUP_AT_MESSAGE_CREATE",
+                       group_event(91, "/profile", uid="STRANGER", who="阿伟",
+                                   mentions=[{"bot": True}]))
+out_at = buf.getvalue()
+check("2a' 对照：被 @ 之后同一条 /profile 进入指令处理（回群聊婉拒，仍不输出档案）",
+      "私下说" in out_at and SECRET not in out_at, out_at.strip()[-80:])
+
+print("\n== 2b. 已绑定时同一个人在群里发同样的指令（对照组）==")
 st, hub, bot = new_bot("cmd_bound", response_tier=0, wake_delay_seconds=0.0)
 hub.set_handler_id("OWNER")
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     bot.handle_command("group", "G-CMD", "/profile", "STRANGER", "m4")
-check("2b 已绑定时陌生人的 /profile 被挡回", DEFLECT.strip()[:8] in buf.getvalue(),
-      buf.getvalue().strip()[-60:])
+check("2b 群里回的是群聊婉拒「……这个我们私下说。」（契约 §三.4：这些指令只在私聊里可用）",
+      "私下说" in buf.getvalue(), buf.getvalue().strip()[-60:])
 
 # ══ 3. 陌生人私聊：绑定前 vs 绑定后 ════════════════════════════
 print("\n== 3. 陌生人私聊（自动认主开关）==")

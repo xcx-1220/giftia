@@ -117,10 +117,14 @@ private 记忆：id <= 水位线             → 藏着（精确，与秒级时�
   本条消息里点到的人（P1-13 的根因）；
 - 默认 `False`（直接调用 = "查看整份档案"）→ 保持按人封顶的全量。
 
-**偏差说明**：Lead 的指令是"删掉第二个循环"，我照做删掉了——但注入路径才用 `present_only=True`，
-因为 `tools/selftest.py:1266` 明确要求**直接调用** `impressions_block("你好")` 时"小雨："也要在
+**偏差说明（Lead 已裁定「保持现状」）**：Lead 的指令是"删掉第二个循环"，我照做删掉了——
+但注入路径才用 `present_only=True`，因为 `tools/selftest.py:1266` 明确要求**直接调用**
+`impressions_block("你好")` 时"小雨："也要在
 （`check("印象块按人分组", "阿伟：" in imp and "小雨：" in imp)`），而小雨在本轮不在场；
 `bc_prompt` 2a 检查的是**注入进 system 的那一份**，两条因此可以同时满足。
+Lead 验收时的裁定：安全的边界是**注入路径**，直接调用是内部 API，不改测试期望；
+按此要求在 `impressions_block` 的 docstring 里加了一张表，写明"注入路径 = 只带在场的人 /
+直接调用 = 整份档案（按人封顶）"，并注明"别把两条合成一条"。
 如果 Lead 要的是"直接调用也只带在场的人"，那就得改 selftest 那条期望（我没动 `tools/`）。
 
 ## 7. P1-14：「零 token」与旁听整理
@@ -141,6 +145,8 @@ private 记忆：id <= 水位线             → 藏着（精确，与秒级时�
 `status_text()`（只数条数）、`memories_text()`（`/memories` 排障）、`recall_text()`（`/recall` 排障）
 → `view=Store.ALL_SCOPES`。真实注入路径走 `visible_memories()`（视角 + 遮蔽）。
 `agent_tools` 的 `_search` / `_forget` 也从"直接查 store"改成 `hub.visible_memories()`。
+
+第 2 波按 Lead 授权把同样的机械迁移做进了 4 个 `bc_*` 探针（9 处裸调用），见 §11.1。
 
 ---
 
@@ -234,21 +240,63 @@ D. /days … [PASS] /days 只应列搭档自己的大日子 → 泄漏 []
 | `bc_growth.py` | 1a/1b PASS（301 人 → 301 行 / 2463 字） | 1a/1b **FAIL = 病没了**：301 人 → **1 行 / 63 字**，整条 system 2447 字 |
 | `bc_trigger.py` | 4b/4c PASS（旁听调了一次名字模型 / 每 6 条旁听一次整理） | 4b/4c **FAIL = 病没了**：`name_calls 0 -> 0`、`extract_calls` 曲线全 0 |
 | `bc_branches.py` | D2 PASS（前任私事进了新人提示词） | D2 **PASS = 没有泄漏**（该探针的标签写的是病象、判定条件是 `SECRET not in system`） |
-| `bc_fault.py` | 3a FAIL（非 LLMError 抛穿） | 3a **PASS**（被兜住） |
-| `bc_tools.py` | 6a/6b FAIL（DB 写失败抛穿） | 6a/6b 覆盖在我探针的 G 段（同一条路径，PASS）；`bc_tools.py` 本身现在跑不完——见下 |
+| `bc_fault.py` | 3a FAIL（非 LLMError 抛穿） | 3a **PASS**（被兜住）；另有 5b/7a 两条 FAIL = 病没了（见 §11） |
+| `bc_tools.py` | 6a/6b FAIL（DB 写失败抛穿） | 6a/6b 覆盖在我探针的 G 段（同一条路径，PASS）；探针本身已迁移 `view`，**20/0** |
 
 ---
 
-## 10. 已知残余 / 不在我范围 / 需要 Lead 决策
+## 11. 第 2 波收尾（lead 授权，2026-10-10）
 
-1. **`bc_*` 检出探针有几处会因为 team-store 的 `view` 必填契约而崩**
-   （例如 `bc_tools.py:127` `active_memories(h3.instance_no)` → `TypeError: missing 'view'`）。
-   这是探针侧的适配（补 `view=Store.ALL_SCOPES`），不在我拥有的文件范围内，我没有改它们。
-2. **`bc_branches.py` C2 由 PASS 变 FAIL**，但性质是"病没了"：C2 断言"客人拿得到本群公开记忆"，
-   修前它是靠**印象块的兜底循环**（把不在场的阿伟补进提示词）才成立的；P1-13 修掉之后，
-   客人那一轮的检索结果按 query 正常为空。客人的**视角**仍然是本群 `[("group", gid)]`，
-   问对了事照样检索得到。
-3. **`auto_bind = false` + 未绑定**才是"没有搭档"的完整语义。默认 `auto_bind = true` 下，
+Lead 验收通过后授权我改 `.review/probes/*.py`：**只加 `view=Store.ALL_SCOPES`（+ import + 注释），
+不许改断言期望**；随后又授权把"病没了"的期望统一翻转成"新契约下的正确行为"。
+
+### 11.1 `view` 迁移（机械改动，语义与原 `view=None` 完全一致 = 不过滤）
+
+改了 4 个 `bc_*` 文件（`bc_tools` / `bc_fault` / `bc_flow` / `bc_branches`），
+每个文件加 `from giftia.store import Store` + 一句注释，9 处裸调用补 `view=Store.ALL_SCOPES`：
+
+```
+bc_tools.py    :127 h3 / :156 h5b
+bc_fault.py    :153 h4 / :217 h7 / :225 h7
+bc_flow.py     :100 hub0 / :113 hub / :129 hub / :135 hub
+bc_branches.py :233 j
+```
+
+### 11.2 期望翻转（全部注明理由，每条配正向对照）
+
+| 位置 | 原期望（PASS = 缺陷存在） | 新期望（PASS = 修好后的行为）+ 正向对照 |
+|---|---|---|
+| `bc_branches.py` C2 | "客人拿得到本群公开记忆"（`"豆豆" in system`） | **"不在场的人（阿伟）不该出现在注入提示词里"**；修前成立靠的是 P1-13 的兜底循环，不是检索。对照 **C2b**：客人问对了事（「阿伟家的猫叫什么来着」）本群记忆照样检索得到 |
+| `bc_trigger.py` 4b | "旁听一句「我是来看热闹的」也调了模型" | **"不再调模型"**（`name_calls` 不变、`total` 不变） |
+| `bc_trigger.py` 4c | "旁听到第 8 条当场触发一次整理" | **"旁听期间一次整理都不做"**；对照 **4c'/4c''**：待整理标记存在 + 搭档那一轮补整理出 group 记忆 |
+| `bc_flow.py` 0a | "CLI 聊过之后 handler_id 仍是空" | **"本地 CLI 第一条私聊会认主"**（`handler_id == "handler"`，与适配器同一 auto_bind 开关）；对照 **0c**：认主后 `is_handler=True` 且视角是搭档视角 |
+| `bc_flow.py` 1c | "搭档视角的私聊档案被发进群里" | **"未绑定时陌生人的 /profile 不再输出任何档案"**（契约 §三.4）；对照 **1f/1g**：同一个人 `/bind` 之后，私聊里 `/profile` 照常输出（闸门判身份，不是全拒） |
+| `bc_flow.py` 1d / 1e | "陌生人能 /forget / /impress" | **"无效：那条记忆还在 / 什么都没写进去"**（同上对照） |
+| `bc_flow.py` 2a | "未被 @ 的群里 /profile 也被执行了" | **"未被 @ 的群指令不再被执行：不下档案、也不回答（走旁听）"**；对照 **2a'**：被 @ 之后同一条进入指令处理，拿到群聊婉拒、仍不输出档案 |
+| `bc_flow.py` 2b | "已绑定时陌生人的 /profile 被挡回"（断言写死 `DEFLECT[:8]`） | **"回的是群聊婉拒「……这个我们私下说。」"**（契约 §三.4：`/profile` `/impress` `/forget` `/reconcile` 只在私聊里可用） |
+| `bc_fault.py` 5b | "模型返回空串时仍写一条空的 assistant 记录" | **"不写空记录，落库的是 `FAILURE_LINES` 兜底台词"**；对照 **5a**：空白**输入**仍然直接返回空、不落库 |
+| `bc_fault.py` 7a | "半写：第一条记忆落库但消息没标已整理" | **"事务回滚：一条都没落库、消息仍未整理、异常照旧抛出"**（team-store P1-7）；对照 **7b**：重试后正常落库且不重复 |
+
+### 11.3 顺带翻转 `bc_growth` 1a/1b（同一类，**已向 lead 报备**）
+
+这两条我在 §9.4 表里标过"病没了"，但没有进那 8 条清单。它们与上表同类（断言的是 P1-12 的缺陷本身：
+"花名册无上限、>2000 字"），一并翻成"≤ ROSTER_MAX 行 / ≤300 字"，并加**1c 对照**：搭档仍在名单第一行
+（截断不会把搭档挤掉）。如果 lead 希望严格只动那 8 条，回退这两行即可。
+
+### 11.4 翻转后的探针全貌（第 3 波验收时的真实数字）
+
+```
+bc_flow 26/0   bc_fault 17/0   bc_growth 5/0   bc_tools 20/0
+bc_branches 32/0   bc_trigger 33/0   bc_prompt 10/0      （bc_* 家族合计 143/0）
+team_brain_fixes 56/0   lead_v2 B2 [PASS]   lead_v3 B/C/D [PASS]
+selftest 303/0   qq 72/0   ws 17/0   audit 10/0（4 提示）
+```
+
+`bc_growth` §2（`people_stats` 只写不读、无界）仍是**检出**断言（P2，不在本波清单，未动）。
+
+---
+
+## 12. 已知残余 / 不在我范围
    核心会在第一条私聊上**认主**（与适配器同一开关、同一行为），所以"未绑定 + 私聊"在生产里
    只在关掉认主或适配器明确传 `is_handler=False` 时出现。这一条是对任务书字面的**有意偏差**：
    若核心不认主，`tools/selftest.py` 里大量"不带 user_id 直接 `brain.handle()`"的用例
@@ -265,4 +313,9 @@ D. /days … [PASS] /days 只应列搭档自己的大日子 → 泄漏 []
    但如果将来给"搭档私聊"也注入群聊记录，要记得那条路已经有 `_since_floor`。
 7. **`reconcile_memories()` / `make_dream()`** 仍然会在 private 全桶上做合并/做梦取材（不对外输出内容），
    换人后的那条下界没有参与它们的选择；这是记忆维护路径，不是注入路径，未在本波范围内。
-8. `imprint`（印象块）直接调用语义见 §6 的偏差说明——**需要 Lead 确认**是保留（现状）还是改 selftest 期望。
+8. **印象块的直接调用语义：Lead 已裁定保持现状**（不改 `tools/selftest.py:1266`）。
+   `impressions_block` 的 docstring 现在用一张表写明两条语义——"注入路径只带在场的人 / 直接调用是整份档案（按人封顶）"，
+   并注明"安全的边界是注入路径，别把两条合成一条"。
+9. **`bc_flow` / `bc_fault` / `bc_growth` 的"病没了"FAIL 已全部翻转**（§11.2、§11.3）：
+   现在 `bc_*` 家族全绿（143/0），剩下唯一的检出断言是 `bc_growth` §2 的 `people_stats`
+   （只写不读、无界，P2，不在本波清单）。

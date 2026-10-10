@@ -410,12 +410,15 @@ def recall(
             # 截断只是"显示空间不够"，**不是**"被模糊了"：blurred 只由 blur_text 决定。
             # 以前截断后强行置 blurred=True，于是 core 记忆在 terminal 阶段明明 blur=0
             # 却被标成"已模糊"，和 README「内核记忆永不含糊」相反（P2-1）。
-            # 长度也要真的不超过配置值：预算是 max_chars-1 加一个省略号。
-            budget = int(stage.max_chars)
-            if budget >= 2:
-                text = text[: budget - 1].rstrip() + "……"
+            # 长度也要真的不超过配置值：省略号本身占 2 个字符，要把它算进预算。
+            suffix = "……"
+            budget = max(0, int(stage.max_chars))
+            if budget >= len(suffix) + 1:
+                text = text[: budget - len(suffix)].rstrip() + suffix
+            elif budget >= len(suffix):
+                text = suffix
             else:
-                text = text[: max(0, budget)]
+                text = text[:budget]
         retention = retention_of(mem, cfg, now)
         results.append(
             Recalled(

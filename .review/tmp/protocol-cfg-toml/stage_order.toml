@@ -1,0 +1,18 @@
+
+[[degradation.stages]]
+name = "low"
+label = "低"
+min_ratio = 0.1
+top_k = 4
+min_score = 0.1
+blur = 0.5
+max_chars = 200
+
+[[degradation.stages]]
+name = "high"
+label = "高"
+min_ratio = 0.9
+top_k = 8
+min_score = 0.2
+blur = 0.0
+max_chars = 400

@@ -1,5 +1,5 @@
 $ python .review/run_tests.py tools/qq_protocol_selftest.py
-exit_code=0  elapsed=8.9s
+exit_code=0  elapsed=9.1s
 ----------------------------------------------------------------------
 STDOUT
 ----------------------------------------------------------------------
@@ -7,7 +7,7 @@ QQ 适配器协议自测（本地假网关，无凭据、不联网）
 
   [PASS] SIGTERM 已接到 request_stop（systemd 停止服务时走这条路）
   [PASS] SIGINT 已接到 request_stop
-[连接] ws://127.0.0.1:9949/
+[连接] ws://127.0.0.1:12165/
 [心跳] 周期 0.5 秒
 [鉴权] 已获取 access_token（7200 秒后过期，自动续期）
 [鉴权] 已发送 identify（订阅群@与单聊事件）

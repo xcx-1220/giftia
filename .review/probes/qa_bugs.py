@@ -81,8 +81,12 @@ C.check("★ 她没有讲梦（回复里没有梦的内容）却被标记 told=1
 b2.close()
 rm_dir(tmp2)
 
-# ══ B3. 孤立代理对 → UnicodeEncodeError（handle 抛出）════════════
-C.info("── B3：平台 JSON 里的 \\ud83d（孤立代理）会让 handle() 抛异常 ──")
+# ══ B3. 孤立代理对 → 修复后应当**不崩、且正常落库** ════════════
+# 原缺陷（审查 P0-5）：平台 JSON 里合法的 `"\ud83d"` 让 sqlite3 抛 UnicodeEncodeError，
+# 从 handle() 冒到适配器顶层 → 被当成"断开"重连，这一轮消息彻底丢失。
+# 修复后：store 层在 SQLite 编码前把孤立代理归一成 U+FFFD，所以这里断言的是
+# **"不抛异常 + 消息照常落库 + 下一轮照常回复"**（期望随契约翻转，不是放宽）。
+C.info("── B3：平台 JSON 里的 \\ud83d（孤立代理）不再让 handle() 崩 ──")
 tmp3 = make_dir("bug-surrogate")
 s3 = make_settings(tmp3, hours=9000.0)
 b3 = make_brain(s3, RecordingLLM(s3.model))
@@ -93,21 +97,22 @@ text = json.loads(r'{"content":"hello \ud83d world"}')["content"]
 C.info(f"json.loads 得到的文本：{text!r}（这是平台 JSON 里合法的一个转义）")
 rows_before = b3.store._one("SELECT COUNT(*) AS n FROM messages")["n"]
 err = ""
+reply = ""
 try:
-    b3.handle(text, "u_owner", scene="c2c")
+    reply = b3.handle(text, "u_owner", scene="c2c")
 except Exception as exc:  # noqa: BLE001
     err = f"{type(exc).__name__}: {exc}"
     tb = traceback.format_exc().strip().splitlines()
     C.info("异常位置：" + " | ".join(tb[-4:]))
 rows_after = b3.store._one("SELECT COUNT(*) AS n FROM messages")["n"]
-C.check("★ handle() 抛出 UnicodeEncodeError（这一轮彻底丢失，用户收不到回复）",
-        "UnicodeEncodeError" in err, err)
-C.check("消息没有落库（写库失败在最前面）", rows_after == rows_before,
+C.check("★ handle() 不再抛 UnicodeEncodeError（这一轮不再丢失）",
+        "UnicodeEncodeError" not in err, err or "没有异常")
+C.check("消息正常落库（孤立代理被归一成 U+FFFD）", rows_after > rows_before,
         f"{rows_before} → {rows_after}")
+C.check("回复非空（用户拿得到一句话）", bool(reply.strip()), repr(reply[:40]))
 C.check("进程还能继续（下一次正常消息没问题）",
         bool(b3.handle("你还在吗", "u_owner", scene="c2c").strip()), "")
-C.info("适配器侧：adapters/qq_official.py 的 _respond/_run_batch 没有 try/except，"
-       "异常会冒到 run() → 打印 [断开] 并重连（5s 起退避），这一批消息丢失")
+C.info("适配器侧：_respond/_run_batch 现在走 respond_safely()，单条坏消息不再拆连接")
 b3.close()
 rm_dir(tmp3)
 
@@ -127,9 +132,17 @@ p = b4.preview_prompt("你好，我们见过吗")
 line = [ln for ln in p.splitlines() if "你怎么称呼他" in ln or "他叫" in ln or "还不知道" in ln]
 C.info(f"换代后实例 #{b4.instance_no}，handler_name = {b4.handler_name!r}")
 C.info("新实例 system 里的称呼块：" + str(line[:2]))
-C.check("★ 换代后新实例仍然用「小林」称呼你（称呼没有随实例清零）",
-        b4.handler_name == "小林" and "小林" in p,
+# 期望（修复后）：README §2/§9 与 `after_recycle_line` 的契约是"新的她不认识你、
+# 档案上还是空的"，所以换代要**同时**清掉称呼与绑定（原缺陷：handler_name 留在全局
+# state 里，新实例叫得出"小林"，而同一份提示词里还写着"你不知道他叫什么"）。
+# 名字不会真的丢——它留在回忆录/回收档案里，这一点由下面的归档断言守着。
+C.check("★ 换代后称呼清零（新的她不认识你）", b4.handler_name == "",
         f"handler_name={b4.handler_name!r} 出现在新实例提示词：{'小林' in p}")
+memo_dir = s4.memoir_dir
+memos = sorted(memo_dir.glob("*.md")) if memo_dir.exists() else []
+memo_text = memos[-1].read_text(encoding="utf-8") if memos else ""
+C.check("对照：名字留在了终端服务档案里（她没有真的丢掉你）", "小林" in memo_text,
+        memos[-1].name if memos else "（没有档案）")
 C.check("对照：新实例确实没有前任的记忆条目（记忆这一半做到了）",
         "◆" not in p and len(b4.store.active_memories(2, view=Store.ALL_SCOPES)) == 0, "")
 b4.close()

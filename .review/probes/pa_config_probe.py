@@ -84,10 +84,28 @@ def env_matrix() -> None:
 
 
 # ══ 2. settings.toml 校验 ════════════════════════════════════════
+# §8 契约（2026-10-10）：settings.toml 必须带 [[degradation.stages]]，缺了会 fail-loud
+# （否则她会永远不模糊）。所以下面那些"只测某一个字段"的用例要带上最小合法 stage，
+# 否则报错会停在"缺 stages"上、盖住真正被测的字段。已经自带 stages 的用例（2a/2f）不动。
+STAGE_MIN = """
+[[degradation.stages]]
+name = "clear"
+label = "记忆清晰"
+min_ratio = 0.0
+top_k = 6
+min_score = 0.15
+blur = 0.0
+max_chars = 400
+"""
+
+
 def toml_case(name: str, body: str) -> Path:
     d = workdir("toml")
     p = d / f"{name}.toml"
-    p.write_text(body, encoding="utf-8")
+    text = body
+    if "[[degradation.stages]]" not in text:
+        text += "\n" + STAGE_MIN
+    p.write_text(text, encoding="utf-8")
     return p
 
 
@@ -147,13 +165,23 @@ def toml_cases() -> None:
           st.runtime.response_tier == 100, "静默忽略")
 
     # 2e keywords 类型
+    # 判据修订（team-store 2026-10-10）：§8 配置校验的契约是"keywords 必须是**字符串列表**"，
+    # 写成字符串现在直接报"配置错误…"（fail-loud），而不是悄悄变成逐字匹配。
+    # 所以两种结果都算正确：① 抛配置错误；② 读成字符串列表。唯独 `tuple("晚安")`
+    # 那种逐字匹配（('晚','安')）必须判失败 —— 检查的意图没变。
     p = toml_case("kw", '[runtime]\nkeywords = "晚安"\n')
-    st = cfg.load_settings(settings_path=p)
-    kw = st.runtime.keywords
-    print(f"  [INFO] keywords = \"晚安\" → settings 里是 {kw!r}（{type(kw).__name__}），"
-          f"适配器 tuple(它) = {tuple(kw)!r}")
-    check("keywords 写错类型（字符串）不能悄悄变成逐字匹配",
-          tuple(kw) == ("晚安",), f"tuple()={tuple(kw)!r}")
+    try:
+        st = cfg.load_settings(settings_path=p)
+        kw = st.runtime.keywords
+        print(f"  [INFO] keywords = \"晚安\" → settings 里是 {kw!r}（{type(kw).__name__}），"
+              f"适配器 tuple(它) = {tuple(kw)!r}")
+        check("keywords 写错类型（字符串）不能悄悄变成逐字匹配",
+              isinstance(kw, (list, tuple)) and tuple(kw) != tuple("晚安"),
+              f"tuple()={tuple(kw)!r}")
+    except Exception as exc:
+        print(f"  [INFO] keywords = \"晚安\" 被配置校验拒绝：{type(exc).__name__}: {exc}")
+        check("keywords 写错类型（字符串）不能悄悄变成逐字匹配",
+              "keywords" in str(exc), f"{type(exc).__name__}: {exc}")
 
     # 2f 顺序与空 stages
     p = toml_case("stage_order", """

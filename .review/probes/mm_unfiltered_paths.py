@@ -36,6 +36,7 @@ from giftia import dream as dream_mod  # noqa: E402
 from giftia import occasions as occ_mod  # noqa: E402
 from giftia import recycle as rec_mod  # noqa: E402
 from giftia.llm import MockLLM  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 SECRET_PERSON = "SECRET-BRAVO-4402"
 SECRET_GROUP = "SECRET-CHARLIE-9915"
@@ -110,7 +111,9 @@ def main() -> int:
     failures = 0
 
     title("路径 A：dream.should_dream() —— 用全量记忆计数决定做不做梦")
-    n_all = len(store.active_memories(inst, view=None))
+    # 接口契约（FIX_BATCH1_INTERFACE §一）：全量必须**显式**写 ALL_SCOPES；
+    # view=None 现在是编程错误（TypeError），不再表示"不过滤"。
+    n_all = len(store.active_memories(inst, view=Store.ALL_SCOPES))
     n_owner = len(store.active_memories(inst, view=[("private", ""), ("person", "handler-openid-0001")]))
     print(f"    全量 active 记忆 = {n_all}，搭档可见 = {n_owner}")
     should = dream_mod.should_dream(brain.settings, store, brain.clock, inst)

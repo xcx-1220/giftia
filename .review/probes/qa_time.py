@@ -19,6 +19,7 @@ from qa_harness import (  # noqa: E402
 )
 
 from giftia.llm import MemoryDraft, MockLLM  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 C = Checker("Stream E · 时间纵轴仿真（400+ 天 / 近万小时）")
 
@@ -206,7 +207,6 @@ C.check("第 3 天不再回访（窗口关闭）",
 
 # 群里看不到搭档的私人大日子（view 过滤）
 from giftia.occasions import find_occasions  # noqa: E402
-from giftia.store import Store  # noqa: E402
 g = find_occasions(settings_c, brain_c.store, now=brain_c.clock.now(), instance_no=1,
                    days_known=10, mark=False, view=[("group", "groupX")])
 C.check("★ 搭档私聊的大日子不会在群里被惦记（view 过滤）",
