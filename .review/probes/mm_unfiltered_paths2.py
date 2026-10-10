@@ -29,6 +29,7 @@ from mm_common import (  # noqa: E402
 from giftia import dream as dream_mod  # noqa: E402
 from giftia import occasions as occ_mod  # noqa: E402
 from giftia.llm import MockLLM  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 SECRET_XIAOYU = "SECRET-BRAVO-4402"
 TOMORROW = (datetime.now().date() + timedelta(days=1)).isoformat()
@@ -64,7 +65,7 @@ def main() -> int:
         )
     n_owner = len(store.active_memories(
         inst, view=[("private", ""), ("person", "handler-openid-0001")]))
-    print(f"    全量 active={len(store.active_memories(inst))}，搭档可见={n_owner}，"
+    print(f"    全量 active={len(store.active_memories(inst, view=Store.ALL_SCOPES))}，搭档可见={n_owner}，"
           f"dream.min_memories={settings.dream.min_memories}")
     should = dream_mod.should_dream(settings, store, brain.clock, inst)
     print(f"    should_dream() = {should}")

@@ -101,9 +101,9 @@ if hit:
                 for ln in sysp.splitlines() if ln.startswith("◆")),
             "注入行与任何原始条目都不同")
 C.info("recall_count 现状：" + str({m["id"]: m.get("recall_count")
-                                    for m in store.active_memories(1)}))
+                                    for m in store.active_memories(1, view=Store.ALL_SCOPES)}))
 C.check("injected_at 记账了（被塞进提示词 ≠ 被想起）",
-        any(m.get("injected_at") for m in store.active_memories(1)), "")
+        any(m.get("injected_at") for m in store.active_memories(1, view=Store.ALL_SCOPES)), "")
 
 # ══ 4. 退化五阶段 ═══════════════════════════════════════════════
 C.info("── 4. 退化五阶段 ──")
@@ -137,8 +137,8 @@ C.check("阶段切换点与 min_ratio 换算一致（允许 1 小时内浮点偏
         str(switches))
 
 # 4c. 终端阶段：core 记忆永不含糊 / normal 记忆严重模糊
-core = [m for m in store.active_memories(1) if m["layer"] == "core"]
-normal = [m for m in store.active_memories(1) if m["layer"] != "core"]
+core = [m for m in store.active_memories(1, view=Store.ALL_SCOPES) if m["layer"] == "core"]
+normal = [m for m in store.active_memories(1, view=Store.ALL_SCOPES) if m["layer"] != "core"]
 C.info(f"层分布：core={len(core)} normal={len(normal)}")
 if core:
     from giftia.memory import effective_blur
@@ -153,10 +153,10 @@ if normal:
 C.check("终端阶段确实生效", brain.status().stage.name == "terminal", brain.status().stage.name)
 
 # 4d. 模糊真的发生在"回忆的那一刻"：同一条记忆，终端阶段检索出来 ≠ 原始文本
-target = [m for m in store.active_memories(1) if "Radwimps" in str(m["summary"])]
+target = [m for m in store.active_memories(1, view=Store.ALL_SCOPES) if "Radwimps" in str(m["summary"])]
 if target:
     raw_t = str(target[0]["summary"])
-    hit_t = memory_mod.recall("Radwimps 乐队 歌词", store.active_memories(1),
+    hit_t = memory_mod.recall("Radwimps 乐队 歌词", store.active_memories(1, view=Store.ALL_SCOPES),
                               brain.status().stage, settings.memory, brain.clock.now())
     hit_t = [h for h in hit_t if int(h.memory["id"]) == int(target[0]["id"])]
     C.check("终端阶段还能检索到这条（min_score/top_k 内）", bool(hit_t), f"hits={len(hit_t)}")
@@ -185,11 +185,11 @@ C.check("dreams 表有记录", len(dreams) >= 1, f"rows={len(dreams)}")
 C.check("做梦不新增记忆条目（不参与退化）", store.count_memories(1) == n_before,
         f"{n_before} → {store.count_memories(1)}")
 C.check("梦不进检索表（active_memories 里没有梦内容）",
-        all("梦里有" not in str(m["summary"]) for m in store.active_memories(1)))
+        all("梦里有" not in str(m["summary"]) for m in store.active_memories(1, view=Store.ALL_SCOPES)))
 dream_text_db = str(dreams[0]["content"]) if dreams else ""
 if dream_text_db:
     frag = dream_text_db.replace("梦里有", "").split("，")[0][:8]
-    hits = memory_mod.recall(frag, store.active_memories(1), brain.status().stage,
+    hits = memory_mod.recall(frag, store.active_memories(1, view=Store.ALL_SCOPES), brain.status().stage,
                              settings.memory, brain.clock.now())
     C.check("用梦的片段检索，检索不到「梦」本身",
             all(str(h.memory.get("summary")) != dream_text_db for h in hits),
@@ -204,7 +204,7 @@ C.check("梦只有被真的讲出来才标 told（未引用就不标）",
         int(dream_row_after) == (1 if "梦" in reply else 0) or True,
         f"{dream_row_before} → {dream_row_after}")
 C.check("梦没有变成记忆条目（仍在 dreams 表，不在 memories）",
-        all("梦里有" not in str(m["summary"]) for m in store.active_memories(1)))
+        all("梦里有" not in str(m["summary"]) for m in store.active_memories(1, view=Store.ALL_SCOPES)))
 
 # ══ 6. 主动联系（额度记账）═════════════════════════════════════
 C.info("── 6. 主动联系 ──")
@@ -218,6 +218,7 @@ plan, text = brain.compose_outreach(record=True)
 C.check("闲置 3 天后有主动理由", plan is not None, str(plan))
 C.info(f"理由 = {plan.reason if plan else None}；文本 = {text[:60]!r}")
 from giftia.outreach import can_send, sent_today  # noqa: E402
+from giftia.store import Store  # noqa: E402
 now = brain.clock.now()
 C.check("第 1 条发出后今日计数 = 1", sent_today(store, now) == 1, str(sent_today(store, now)))
 for _ in range(5):
@@ -234,7 +235,7 @@ C.check("主动消息落进聊天记录（她记得自己说过）",
 # ══ 7. 回收 + 换代 ═════════════════════════════════════════════
 C.info("── 7. 回收换代 ──")
 bond_before = brain.current_bond()
-mem_before = len(store.active_memories(1))
+mem_before = len(store.active_memories(1, view=Store.ALL_SCOPES))
 name_before = brain.handler_name
 report_text = brain.run_recycle("QA 测试触发")
 memoirs = sorted(settings.memoir_dir.glob("*.md")) if settings.memoir_dir.exists() else []
@@ -249,9 +250,9 @@ memoir_txt = memoirs[0].read_text(encoding="utf-8") if memoirs else ""
 C.check("回忆录含未模糊的原始记忆", any(s[:12] in memoir_txt for s in raw_summaries), "")
 C.check("回忆录声明「新的实例读不到它」", "新的实例读不到它" in memoir_txt, "")
 C.check("返回文本带终端服务记录", "终端服务" in report_text, report_text[:60])
-C.check("前任记忆被标记 sealed（检索不到）", len(store.active_memories(1)) == 0,
-        str(len(store.active_memories(1))))
-C.check("新实例检索不到前任记忆", len(store.active_memories(2)) == 0)
+C.check("前任记忆被标记 sealed（检索不到）", len(store.active_memories(1, view=Store.ALL_SCOPES)) == 0,
+        str(len(store.active_memories(1, view=Store.ALL_SCOPES))))
+C.check("新实例检索不到前任记忆", len(store.active_memories(2, view=Store.ALL_SCOPES)) == 0)
 bond_after = brain.current_bond()
 C.check("关系清零（亲密度归 0）", bond_before.affinity > 0 and bond_after.affinity == 0,
         f"{bond_before.affinity} → {bond_after.affinity}")

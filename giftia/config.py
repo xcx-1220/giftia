@@ -289,6 +289,12 @@ class MemoryConfig:
     layer_important_weight: float = 0.5
     layer_normal_weight: float = 0.0
 
+    # 内核记忆保底注入（见 brain._core_memories）：不靠关键词命中，
+    # core 层也常驻进提示词——否则"她记得你是小林"只在你正好提到名字时才成立。
+    core_always_inject: bool = True
+    core_always_inject_max: int = 3
+    core_max_chars: int = 200
+
     # 检索细节
     relative_cutoff: float = 0.5
     # **绝对**相关度门槛：未归一化的 BM25 原始分低于它就直接丢（0.0 = 不启用）。

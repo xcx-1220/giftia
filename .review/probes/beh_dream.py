@@ -18,6 +18,7 @@ from beh_common import CaptureLLM, base_settings, check, note, report, systems  
 from giftia.brain import Giftia  # noqa: E402
 from giftia.dream import latest_untold, make_dream, should_dream  # noqa: E402
 from giftia.llm import MockLLM  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 
 class DreamSpy(CaptureLLM):
@@ -66,7 +67,7 @@ def main() -> int:
     check("A5 超过 min_hours_between → 又可以做", should_dream(s, b.store, b.clock, 1))
 
     print("\n    —— 碎片到底被模糊成什么样 ——")
-    raw = [m["summary"] for m in b.store.active_memories(1)][-s.dream.fragments:]
+    raw = [m["summary"] for m in b.store.active_memories(1, view=Store.ALL_SCOPES)][-s.dream.fragments:]
     frags = llm.fragments[0] if llm.fragments else []
     print(f"    原始记忆 1：{raw[0] if raw else '(无)'}")
     print(f"    交给模型的碎片 1：{frags[0] if frags else '(无)'}")
@@ -85,12 +86,12 @@ def main() -> int:
     print("B. 梦不进检索 / 不占保留率 / 不参与退化")
     print("=" * 78)
     mem_before = b.store.count_memories(1)
-    ids = [m["id"] for m in b.store.active_memories(1)]
+    ids = [m["id"] for m in b.store.active_memories(1, view=Store.ALL_SCOPES)]
     print(f"    做梦后记忆条数={mem_before}（做梦前 4），active_memories 里没有 dream 文本："
-          f"{all('梦里有' not in str(m.get('summary')) for m in b.store.active_memories(1))}")
+          f"{all('梦里有' not in str(m.get('summary')) for m in b.store.active_memories(1, view=Store.ALL_SCOPES))}")
     check("B1 梦不写进 memories（不占条数、不进检索、不参与退化）",
           mem_before == 4 and not any("梦里有" in str(m.get("summary"))
-                                      for m in b.store.active_memories(1)),
+                                      for m in b.store.active_memories(1, view=Store.ALL_SCOPES)),
           f"{mem_before} 条")
 
     print()

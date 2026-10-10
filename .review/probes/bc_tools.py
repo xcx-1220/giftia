@@ -25,6 +25,8 @@ from giftia import agent_tools  # noqa: E402
 from giftia.brain import Giftia  # noqa: E402
 from giftia.config import load_settings  # noqa: E402
 from giftia.llm import ChatReply, MockLLM, ToolCall  # noqa: E402
+# 探针自检用（契约 §一：active_memories 的 view 必填，全量要显式 ALL_SCOPES）
+from giftia.store import Store  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -124,7 +126,8 @@ plan = [[("remember", json.dumps({"content": f"第{i}条要多记的事", "impor
                                  ensure_ascii=False))]]
 h3 = fresh("writes", ToolLLM(env("writes").model, plan=plan))
 h3.handle("我要说四件事", user_id="OWNER")
-mems = [m for m in h3.store.active_memories(h3.instance_no) if m["source_session"] == "tool"]
+mems = [m for m in h3.store.active_memories(h3.instance_no, view=Store.ALL_SCOPES)
+        if m["source_session"] == "tool"]
 print(f"      实际写入 {len(mems)} 条：{[m['summary'] for m in mems]}")
 check("3a 一轮最多写 2 条（4 次 remember 只落 2 条）", len(mems) == 2, str(len(mems)))
 check("3b 超限的那两次没进 tool_writes", len(h3.tool_writes) == 2, str(h3.tool_writes))
@@ -153,7 +156,7 @@ ids = [h5b.store.add_memory(instance_no=h5b.instance_no, created_ts=h5b.clock.is
                             happened_ts=h5b.clock.iso(), summary=f"第{i}条", importance=0.5,
                             scope="private") for i in range(6)]
 outs = [agent_tools.execute(h5b, "forget", json.dumps({"memory_id": i})) for i in ids]
-alive = [m["id"] for m in h5b.store.active_memories(h5b.instance_no)]
+alive = [m["id"] for m in h5b.store.active_memories(h5b.instance_no, view=Store.ALL_SCOPES)]
 check("5a 一次 execute 能连删多条（没有 MAX_WRITES_PER_TURN 那样的上限）",
       all(m not in alive for m in ids), str(alive))
 print(f"      删除结果：{outs}")

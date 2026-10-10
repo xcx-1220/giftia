@@ -104,11 +104,13 @@ def main() -> int:
     orig_meta_set = s.meta_set
     boom = {"n": 0}
 
-    def flaky_meta_set(key, value):
+    # 替身要接受 *a/**kw 并原样转发：Store.meta_set 现在还有 commit= 关键字参数
+    # （consolidate 的显式事务用它做到"要么全成、要么全不成"）。
+    def flaky_meta_set(key, value, *a, **kw):
         boom["n"] += 1
         if boom["n"] >= 2:      # 第一次（last_consolidated:<sid>）成功，第二次崩
             raise sqlite3.OperationalError("disk I/O error（模拟崩溃）")
-        return orig_meta_set(key, value)
+        return orig_meta_set(key, value, *a, **kw)
 
     s.meta_set = flaky_meta_set  # type: ignore[method-assign]
     from giftia.memory import consolidate
@@ -197,7 +199,7 @@ def main() -> int:
     )
     print(f"    库里 created_ts={aware!r}")
     try:
-        got = recall("考驾照", s2.active_memories(i2), stage(settings, "clear"),
+        got = recall("考驾照", s2.active_memories(i2, view=Store.ALL_SCOPES), stage(settings, "clear"),
                      settings.memory, NOW)
         print(f"    recall 返回 {len(got)} 条")
         check("tz-aware 时间戳不得让 recall 崩", True, f"n={len(got)}")

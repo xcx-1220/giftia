@@ -32,6 +32,7 @@ from mm_common import (  # noqa: E402
     title,
 )
 from giftia.memory import recall  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 NOW = datetime.now()
 
@@ -88,7 +89,7 @@ def main() -> int:
     )
     s.conn.commit()
     t0 = time.perf_counter()
-    allm = s.active_memories(inst)
+    allm = s.active_memories(inst, view=Store.ALL_SCOPES)
     t_load = time.perf_counter() - t0
     t0 = time.perf_counter()
     hits = recall("小林 驾照 考试", allm, stage(settings, "clear"), cfg, NOW)
@@ -121,8 +122,8 @@ def main() -> int:
     mid = s._rows("SELECT MAX(id) AS m FROM memories")[0]["m"]
     s.forget_memory(mid)
     print(f"    forget_memory(#{mid}) 后 all_memories={len(s.all_memories(inst))}，"
-          f"active_memories={len(s.active_memories(inst))}")
-    check("遗忘是软删除（数据仍在，符合设计）", len(s.all_memories(inst)) > len(s.active_memories(inst)))
+          f"active_memories={len(s.active_memories(inst, view=Store.ALL_SCOPES))}")
+    check("遗忘是软删除（数据仍在，符合设计）", len(s.all_memories(inst)) > len(s.active_memories(inst, view=Store.ALL_SCOPES)))
 
     print()
     print(f"多查询/规模探针失败计数：{failures}")

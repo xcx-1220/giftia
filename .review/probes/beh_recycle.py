@@ -19,6 +19,7 @@ from beh_common import CaptureLLM, base_settings, check, note, report, systems  
 
 from giftia.brain import Giftia  # noqa: E402
 from giftia.llm import MockLLM  # noqa: E402
+from giftia.store import ALL_SCOPES as ALL_SCOPES_  # noqa: E402
 
 
 def seed(brain, n=5, secret="SECRET-ALPHA-7731"):
@@ -60,9 +61,12 @@ def main() -> int:
     print("=" * 78)
     print("B. 换代之后旧记忆是否真的检索不到")
     print("=" * 78)
-    act_new = b.store.active_memories(b.instance_no)
-    act_old = b.store.active_memories(old)
-    all_old = b.store.active_memories(old, view=None)
+    # 接口契约（FIX_BATCH1_INTERFACE §一）：view 必填，view=None 抛 TypeError。
+    # 全量必须显式写 ALL_SCOPES，不再有"省略参数 = 不过滤"。
+    # 注：契约里两种写法（`store.ALL_SCOPES` / `giftia.store.ALL_SCOPES`）都合法；
+    #     当前 store 只落了模块级常量，这里用模块级导入（已同步给 team-store 补类属性）。
+    act_new = b.store.active_memories(b.instance_no, view=ALL_SCOPES_)
+    act_old = b.store.active_memories(old, view=ALL_SCOPES_)
     raw_old = b.store.count_memories(old, only_active=False)
     print(f"    新实例 active_memories={len(act_new)} 条；旧实例 active_memories={len(act_old)} 条；"
           f"旧实例含封存在内={raw_old} 条")
@@ -82,11 +86,15 @@ def main() -> int:
     print("=" * 78)
     print("C. 崩溃窗口：封存之后、换代之前挂掉，再回收一次会怎样")
     print("=" * 78)
+    print("    【期望为何变了】C1-C4 原来是把 P1-20 的**缺陷**写成断言")
+    print("    （“重跑把 5 条覆盖成 0 条” → PASS 表示缺陷存在）。修好之后")
+    print("    这几条必须改写成**不变量**：无论重跑几次、隔不隔秒，")
+    print("    第一次封存的 5 条原始记忆都必须还在（宁可多留一份档案，绝不覆盖）。")
+    print("    崩溃续跑靠 meta:recycling_instance 标记：重启后只补换代，不重新生成档案。")
     c = Giftia(dataclasses.replace(s, root=base_settings("recy-c", 81920.0).root),
                llm=MockLLM(s.model))
     c.set_handler_id("OWNER-1")
     seed(c, 5)
-    first_run_ok = False
     boom = {"n": 0}
     original_reactivate = c.lifespan.reactivate
 
@@ -103,32 +111,45 @@ def main() -> int:
     sj1 = sorted(c.settings.sealed_dir.glob("*.json"))
     data1 = json.loads(sj1[0].read_text(encoding="utf-8"))
     print(f"    崩溃后：实例号仍是 {c.instance_no}（没换代）、"
-          f"active_memories={len(c.store.active_memories(c.instance_no))} 条、"
+          f"active_memories={len(c.store.active_memories(c.instance_no, view=[('private', '')]))} 条、"
           f"封存文件 {sj1[0].name} 里有 {len(data1['memories'])} 条记忆")
+    print(f"    封存 JSON 的口径标记：scope={data1.get('scope')!r} notes={sorted(data1)[:4]}…")
     check("C1 崩溃点：记忆已被封存（检索不到），但实例没有换代",
-          c.instance_no == 1 and len(c.store.active_memories(1)) == 0 and len(data1["memories"]) == 5)
+          c.instance_no == 1
+          and len(c.store.active_memories(1, view=[("private", "")])) == 0
+          and len(data1["memories"]) == 5)
+    check("C1b 封存 JSON 显式标注全量运维口径（scope=all_scopes + note），"
+          "且原始 memories 仍是全量（不许为了“干净”把运维资产过滤掉）",
+          data1.get("scope") == "all_scopes" and bool(str(data1.get("note") or ""))
+          and len(data1["memories"]) == 5)
 
     # 进程重启后：寿命仍然到期 → 下一条消息再次触发回收
     print(f"    重启后再触发一次回收（寿命仍到期：{c.lifespan.is_expired()}）…")
     text2 = c.run_recycle("寿命结束")
     sj2 = sorted(c.settings.sealed_dir.glob("*.json"))
-    data2 = json.loads(sj2[0].read_text(encoding="utf-8"))
-    print(f"    第二次回收：实例 {c.instance_no}，封存文件 {[p.name for p in sj2]}，"
-          f"其中 memories={len(data2['memories'])} 条")
-    print(f"    第一次封存的 {len(data1['memories'])} 条原始记忆现在还剩 "
-          f"{len(data2['memories'])} 条（同名文件被覆盖）")
-    check("C2 【数据丢失】重跑回收把 instance-01.json 覆盖成 0 条记忆，原始封存档案没了",
-          len(data2["memories"]) == 0 and len(data1["memories"]) == 5,
-          f"{len(data1['memories'])} → {len(data2['memories'])}")
+    total_kept = sum(len(json.loads(p.read_text(encoding="utf-8"))["memories"]) for p in sj2)
+    rows_first = [m for p in sj2 for m in json.loads(p.read_text(encoding="utf-8"))["memories"]
+                  if "SECRET-ALPHA-7731" in str(m.get("summary", ""))]
+    print(f"    第二次回收：实例 {c.instance_no}（续跑换代），封存文件 {[p.name for p in sj2]}")
+    print(f"    封存目录里原始 5 条记忆现在还剩 {len(rows_first)} 条"
+          f"（全目录合计 {total_kept} 条）")
+    check("C2 【P1-20 已修】重跑不再把 5 条覆盖成 0 条：原始封存档案里的 5 条一条没少",
+          len(rows_first) == 5,
+          f"保留 {len(rows_first)}/5，目录合计 {total_kept} 条")
+    check("C2b 续跑换代不再产生新的空档案（同一实例只写一份封存 JSON）",
+          len(sj2) == 1, f"{[p.name for p in sj2]}")
     mds = sorted(c.settings.memoir_dir.glob("*.md"))
-    txt = mds[0].read_text(encoding="utf-8") if mds else ""
-    print(f"    回收日志文件：{[p.name for p in mds]}（同秒重跑 → 文件名相同）")
-    print(f"    剩下的那份回忆录里还有原来的 5 条记忆吗：{'SECRET-ALPHA-7731' in txt}")
-    check("C3 同一秒内重跑连回忆录 .md 也被覆盖（文件名只精确到秒）",
-          len(mds) == 1 and "SECRET-ALPHA-7731" not in txt,
-          f"{len(mds)} 个文件，含旧秘密={'SECRET-ALPHA-7731' in txt}")
+    txts = [p.read_text(encoding="utf-8") for p in mds]
+    with_secret = sum(1 for t in txts if "SECRET-ALPHA-7731" in t)
+    print(f"    回收日志文件：{[p.name for p in mds]}（同秒重跑；续跑不再重复写回忆录）")
+    check("C3 同一秒内重跑也不会覆盖回忆录：那份写着 5 条原始记忆的 .md 还在",
+          with_secret == 1,
+          f"{len(mds)} 个文件，含旧秘密的有 {with_secret} 份")
+    check("C3b 续跑后 meta:recycling_instance 标记已清掉（不会挡住下一任回收）",
+          not str(c.store.meta_get("recycling_instance", "") or "").strip(),
+          repr(c.store.meta_get("recycling_instance", "")))
 
-    # 更真实的重启：隔一秒以上再重试，.md 会留下，但 .json 依旧被覆盖
+    # 更真实的重启：隔一秒以上再重试
     c2 = Giftia(dataclasses.replace(s, root=base_settings("recy-c2", 81920.0).root),
                 llm=MockLLM(s.model))
     c2.set_handler_id("OWNER-1")
@@ -146,12 +167,12 @@ def main() -> int:
     mds2 = sorted(c2.settings.memoir_dir.glob("*.md"))
     sj3 = sorted(c2.settings.sealed_dir.glob("*.json"))
     kept = sum(1 for p in mds2 if "SECRET-ALPHA-7731" in p.read_text(encoding="utf-8"))
-    j = json.loads(sj3[0].read_text(encoding="utf-8"))
+    kept_json = sum(len(json.loads(p.read_text(encoding="utf-8"))["memories"]) for p in sj3)
     print(f"    隔 1.2 秒重试：回忆录 {len(mds2)} 份（{kept} 份保留着原始记忆），"
-          f"instance-01.json 里 memories={len(j['memories'])} 条")
-    check("C4 隔秒重试时 .md 保住了，但 instance-01.json 仍被覆盖成空档案",
-          len(mds2) == 2 and kept == 1 and len(j["memories"]) == 0,
-          f"md={len(mds2)}/{kept} json={len(j['memories'])}")
+          f"封存目录合计 memories={kept_json} 条")
+    check("C4 隔秒重试：原始回忆录与原始封存档案都保住了（没有空档案覆盖原件）",
+          kept == 1 and kept_json >= 5 and c2.instance_no == 2,
+          f"md={len(mds2)}/{kept} json_total={kept_json} 实例={c2.instance_no}")
 
     print()
     print("=" * 78)

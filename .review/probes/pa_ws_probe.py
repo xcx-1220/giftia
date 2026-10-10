@@ -187,6 +187,27 @@ def s_stall_midframe(server: Server, conn: socket.socket) -> None:
     time.sleep(2.0)
 
 
+def s_hold_open(server: Server, conn: socket.socket) -> None:
+    """握手成功后**一个字节都不发**，并把连接保持开着（干净的空闲超时）。"""
+    conn.settimeout(6.0)
+    try:
+        while conn.recv(4096):
+            pass
+    except OSError:
+        pass
+
+
+def s_partial_frame_hold(server: Server, conn: socket.socket) -> None:
+    """只发 2 字节帧头（长度=126）然后卡住，连接保持开着（帧内超时）。"""
+    conn.sendall(bytes([0x80 | OP_TEXT, 126]))
+    conn.settimeout(6.0)
+    try:
+        while conn.recv(4096):
+            pass
+    except OSError:
+        pass
+
+
 def s_close_then_wait(server: Server, conn: socket.socket) -> None:
     """对端主动 close(4009)，然后等客户端有没有真的把 TCP 关掉。"""
     raw_frame(conn, 0x80 | OP_CLOSE, struct.pack("!H", 4009) + b"expired")
@@ -263,11 +284,17 @@ def main() -> int:
     s = Server(s_handshake_tamper, handshake="no_upgrade_header")
     s.start(); s.ready.wait(3)
     ws = WebSocket(f"ws://127.0.0.1:{s.port}/", timeout=2)
+    # 【期望为何变了】原来这条断言是"仍接受（只查 accept）"= 记录 bug；
+    # 协议加固后客户端会校验 Upgrade/Connection（RFC6455 §4.1 客户端必须校验），
+    # 所以期望翻转为"必须拒绝"。
     try:
         ws.connect()
-        check("缺 Upgrade/Connection 响应头时仍接受（只查 accept）", True, "已接受=按实现")
+        check("缺 Upgrade/Connection 响应头时必须拒绝（不能只看 accept）", False, "居然接受了")
+    except WSError as exc:
+        check("缺 Upgrade/Connection 响应头时必须拒绝（不能只看 accept）",
+              "Upgrade" in str(exc) or "升级" in str(exc), str(exc))
     except Exception as exc:
-        check("缺 Upgrade/Connection 响应头时仍接受（只查 accept）", False,
+        check("缺 Upgrade/Connection 响应头时必须拒绝（不能只看 accept）", False,
               f"{type(exc).__name__}: {exc}")
     finally:
         try: ws.close()
@@ -284,6 +311,9 @@ def main() -> int:
 
     # ── 2. 控制帧规则 ──────────────────────────────────────────
     print("\n2. 控制帧规则（RFC6455 §5.5：控制帧不得分片、payload ≤ 125）")
+    print("   【期望为何变了】原来 2 条是「记录 bug」：违规控制帧被接受、还回显了 pong，")
+    print("   之后连接照常工作。加固后客户端在 §5.5 检查处直接抛 WSError，且**不回显**、")
+    print("   那条 AFTER 也读不到——所以期望翻转为「必须拒绝、且不得再被当成正常连接使用」。")
     s = Server(s_ping_fragmented)
     s.start(); s.ready.wait(3)
     ws = WebSocket(f"ws://127.0.0.1:{s.port}/", timeout=2)
@@ -296,11 +326,14 @@ def main() -> int:
     s.join(5)
     echo = [(op, len(p)) for op, p, _ in s.wire]
     print(f"  [INFO] 客户端把 200 字节的 FIN=0 ping 回显成：{echo}")
-    check("违规控制帧（FIN=0 / 200 字节）被接受并回显 pong", echo == [(OP_PONG, 200)], str(echo))
-    check("违规控制帧之后连接照常工作", got == "AFTER", repr(got))
+    print(f"  [INFO] 违规帧之后的 recv_text → {got}")
+    check("违规控制帧（FIN=0 / 200 字节）被拒绝且**不回显 pong**",
+          echo == [] and got.startswith("<WSError"), f"echo={echo} got={got!r}")
+    check("违规控制帧之后连接不可信/不得被当成正常连接（读不到那条 AFTER）",
+          got != "AFTER" and "AFTER" not in got, repr(got))
     ws.close()
 
-    # ── 3. 分片总量无上限 ──────────────────────────────────────
+    # ── 3. 分片重组：单帧上限 vs 消息总量 ──────────────────────
     print("\n3. 分片重组：单帧上限 vs 消息总量")
     s = Server(s_flood_fragments)
     s.start(); s.ready.wait(3)
@@ -317,36 +350,59 @@ def main() -> int:
 
     # ── 4. 帧内超时 ────────────────────────────────────────────
     print("\n4. 半包超时：连接到底还可不可用")
-    s = Server(s_stall_midframe)
+    print("   【期望为何变了】原来这条把两种超时混在一个场景里，靠 sleep 抢时序，")
+    print("   既不稳、又把「一条字节都没到 → WSTimeout（连接可用）」和")
+    print("   「帧头已到、后续卡住 → WSClosed（连接不可信）」混为一谈。")
+    print("   修复后的契约是这两条，所以拆成两个互相独立的用例，服务端行为确定、不抢时序。")
+
+    # 4a. 一个字节都没到 → WSTimeout（连接仍可用）
+    s = Server(s_hold_open)
     s.start(); s.ready.wait(3)
     ws = WebSocket(f"ws://127.0.0.1:{s.port}/", timeout=2.0)
     ws.connect()
     t0 = time.time()
-    first = ""
+    idle = ""
     try:
-        first = ws.recv_text(timeout=0.3)
-        first = f"<返回 {first!r}>"
+        idle = f"<返回 {ws.recv_text(timeout=0.3)!r}>"
     except WSTimeout as exc:
-        first = f"WSTimeout({exc})"
+        idle = f"WSTimeout({exc})"
     except Exception as exc:
-        first = f"{type(exc).__name__}({exc})"
+        idle = f"{type(exc).__name__}({exc})"
     dt = time.time() - t0
-    print(f"  [INFO] recv_text(timeout=0.3) 实际耗时 {dt:.2f}s，抛出 {first}")
-    check("帧内超时按调用方给的 timeout 生效（不是 self.timeout）", dt < 1.0, f"{dt:.2f}s")
-    check("帧读到一半超时时不抛 WSTimeout（连接已不可信）",
-          "WSTimeout" not in first, first)
-
-    second = ""
+    print(f"  [INFO] 一个字节都没到：recv_text(timeout=0.3) 耗时 {dt:.2f}s → {idle}")
+    check("4a 空闲超时（帧还没开始读）抛 WSTimeout、且按调用方给的 timeout 生效",
+          idle.startswith("WSTimeout") and dt < 1.0, f"{idle}，{dt:.2f}s")
+    again = ""
     try:
-        second = ws.recv_text(timeout=2.0)
-        second = f"返回 {second!r}"
+        again = f"<返回 {ws.recv_text(timeout=0.3)!r}>"
     except WSTimeout as exc:
-        second = f"WSTimeout({exc})"
+        again = f"WSTimeout({exc})"
     except Exception as exc:
-        second = f"{type(exc).__name__}({exc})"
-    print(f"  [INFO] 恢复后第一次 recv_text → {second}")
-    check("超时后收到的两条独立消息不会被拼接错位",
-          second == "返回 'REALDATA!'" or second == "返回 'AFTER'", second)
+        again = f"{type(exc).__name__}({exc})"
+    print(f"  [INFO] 同一个连接再读一次 → {again}")
+    check("4a 空闲超时后连接**仍然可用**（下一次读还是干净的 WSTimeout，不是 WSClosed）",
+          again.startswith("WSTimeout"), again)
+    ws.close(); s.join(5)
+
+    # 4b. 帧头已到、后续卡住 → WSClosed（连接不可信）
+    s = Server(s_partial_frame_hold)
+    s.start(); s.ready.wait(3)
+    ws = WebSocket(f"ws://127.0.0.1:{s.port}/", timeout=2.0)
+    ws.connect()
+    t0 = time.time()
+    mid = ""
+    try:
+        mid = f"<返回 {ws.recv_text(timeout=0.3)!r}>"
+    except WSTimeout as exc:
+        mid = f"WSTimeout({exc})"
+    except Exception as exc:
+        mid = f"{type(exc).__name__}({exc})"
+    dt = time.time() - t0
+    print(f"  [INFO] 帧头已到（2 字节）后卡住：recv_text(timeout=0.3) 耗时 {dt:.2f}s → {mid}")
+    check("4b 帧内超时抛 WSClosed（不能是 WSTimeout：那半个帧头不能当下一帧的帧头）",
+          mid.startswith("WSClosed"), mid)
+    print("  [INFO] 注：抛出后连接已判为不可信（适配器 qq_official.py:1182 捕获 WSClosed 后")
+    print("         直接 raise，不会带着错位的字节流继续收消息）。")
     ws.close(); s.join(5)
 
     # ── 5. 对端 close 之后 close() 是不是空操作 ────────────────

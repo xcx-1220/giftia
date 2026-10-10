@@ -40,6 +40,7 @@ from giftia.memory import (  # noqa: E402
     mark_cited,
     recall,
 )
+from giftia.store import Store  # noqa: E402
 
 NOW = datetime.now()
 
@@ -140,7 +141,7 @@ def main() -> int:
         happened_ts=NOW.isoformat(timespec="seconds"),
         summary="搭档说他下周三要去考驾照，很紧张。", importance=0.9,
     )
-    mems = s2.active_memories(i2)
+    mems = s2.active_memories(i2, view=Store.ALL_SCOPES)
     hits = recall("考驾照", mems, stage(settings, "clear"), cfg, NOW)
     s2.mark_injected([r.memory["id"] for r in hits], NOW.isoformat(timespec="seconds"))
     row = s2._rows("SELECT recall_count, injected_at FROM memories WHERE id = ?", (mid,))[0]

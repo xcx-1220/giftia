@@ -42,6 +42,10 @@ YELLOW = "\033[33m"
 MAGENTA = "\033[35m"
 RESET = "\033[0m"
 
+# 虚拟时钟一次最多推进/回拨多少小时（≈100 年）。`/time nan|inf|1e24` 会把
+# 时钟写坏成"每次启动都崩"，所以这里先拦住。
+MAX_TIME_ADVANCE_HOURS = 100 * 365 * 24.0
+
 
 def _supports_color() -> bool:
     return sys.stdout.isatty()
@@ -77,8 +81,13 @@ def run_cli(brain: Giftia, *, banner: bool = True) -> int:
             continue
 
         if text.startswith("/"):
-            if _handle_command(brain, text):
-                break
+            # 指令路径也要兜异常（审查 P2）：以前 `/forget 99999999999999999999`
+            # 抛 OverflowError 会把整个 CLI 进程带走——指令和聊天应该一样健壮。
+            try:
+                if _handle_command(brain, text):
+                    break
+            except Exception as exc:  # noqa: BLE001
+                print(_c(f"[内部错误] {type(exc).__name__}: {exc}", YELLOW))
             continue
 
         try:
@@ -160,12 +169,15 @@ def _handle_command(brain: Giftia, text: str) -> bool:
             print(f"记下了（记忆 #{mid}）：{bits[0]} —— {bits[1]}" if mid else "没记上：名字和内容都要有")
 
     elif cmd == "/forget":
-        if not arg.strip().isdigit():
+        # 编号要落在 SQLite 的 INTEGER 范围内：`int()` 能解析任意大的数字，
+        # 直接绑进 SQL 会抛 OverflowError（以前会把整个 CLI 带走）。
+        raw_id = arg.strip()
+        if not raw_id.isdigit() or int(raw_id) > 2**31 - 1:
             print("用法：/forget <记忆编号>（编号见 /profile 或 /memories）")
-        elif brain.forget_memory(int(arg.strip())):
-            print(f"让她忘掉 #{arg.strip()} 了（数据还在，只是不再想起来）")
+        elif brain.forget_memory(int(raw_id)):
+            print(f"让她忘掉 #{raw_id} 了（数据还在，只是不再想起来）")
         else:
-            print(f"没有 #{arg.strip()} 这条记忆")
+            print(f"没有 #{raw_id} 这条记忆")
 
     elif cmd == "/reconcile":
         print("整理记忆…")
@@ -250,6 +262,18 @@ def _handle_time(brain: Giftia, arg: str) -> None:
         hours = float(arg.replace("+", "").replace("h", "").replace("小时", ""))
     except ValueError:
         print("用法：/time +24　/time -24　/time reset")
+        return
+
+    # 非有限值 / 超大幅度会把虚拟时钟写坏（审查 P2）：`/time nan` 曾经落库成
+    # meta.virtual_offset_hours='nan'，之后**每次启动**都在 banner 上抛异常，
+    # 连 `/time reset` 都敲不进去，只能手工改库。
+    import math
+
+    if not math.isfinite(hours) or abs(hours) > MAX_TIME_ADVANCE_HOURS:
+        print(
+            f"这个值不行（要有限值，且不超过 {MAX_TIME_ADVANCE_HOURS:.0f} 小时"
+            "≈100 年）。虚拟时钟没有被改动。"
+        )
         return
 
     brain.clock.advance(hours)

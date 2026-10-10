@@ -101,8 +101,14 @@ def main() -> int:
     day2 = [o.title for o in find_occasions(s, b3.store, now=b3.clock.now(), instance_no=1,
                                             days_known=6.0, mark=True) if o.memory_id == mid]
     print(f"    前一天 mark=True → {day1}；第二天（正日子）→ {day2 or '（不提醒）'}")
-    check("B2 前一天提过之后，正日子当天不再提（去重键 = id+日期，把「明天」和「今天」当成同一条）",
-          len(day1) == 1 and len(day2) == 0, f"{day1} / {day2}")
+    print("    【期望为何变了】B2 原来断言『前一天提过之后，正日子当天不再提』")
+    print("    （PASS = 去重键只有 id+event_date）。qa-verifier / behavior-checker 都报了这条：")
+    print("    『明天要考驾照』提醒一次之后，正日子当天反而一句话都没有。")
+    print("    修复后去重键 = id+event_date+今天，所以前一天与当天各提一次（措辞不同）。")
+    check("B2 前一天提过之后，正日子当天**仍会**提一次（去重键 = id+日期+今天，见 F 段）",
+          len(day1) == 1 and len(day2) == 1
+          and any(t.startswith("明天：") for t in day1) and any(t.startswith("今天：") for t in day2),
+          f"{day1} / {day2}")
 
     print()
     print("=" * 78)
@@ -158,8 +164,11 @@ def main() -> int:
     print("    —— 提示词片段 ——")
     idx = prompt.find("今天不只是普通的一天")
     print("    " + (prompt[idx:idx + 260].replace("\n", "\n    ") if idx >= 0 else "（没有这一天块）"))
-    check("D3 【隐私】群发提示词里出现了别人的私聊大日子（小雨/小刚）",
-          bool(leaked), f"命中 {leaked}")
+    print("    【期望为何变了】D3 原来是「记录 bug」：群发提示词里出现别人的私聊/搭档私事就算 PASS。")
+    print("    team-brain 修完 P0-4 后这条路径不再泄漏（实测命中 []），所以期望翻转为")
+    print("    「群发提示词里**不得**出现任何非本群归属的大日子」；D1 的群视角正向对照仍然保留。")
+    check("D3 【隐私】群发提示词里不得出现别人的私聊/搭档私事的大日子（小雨/小刚/搭档）",
+          not leaked, f"命中 {leaked}")
 
     # 对照：正常群聊（handle → _prepare）走的是 memory_view，没漏
     d.llm.seen.clear()
@@ -167,20 +176,70 @@ def main() -> int:
     chat_prompt = systems(d.llm)
     leaked_chat = [w for w in ("小雨", "搭档明天要去面试", "小刚") if w in chat_prompt]
     print(f"    正常群聊 _prepare 的 system 提示词里出现：{leaked_chat}")
-    check("D4 对照：正常群聊路径没有漏（说明漏点在 compose_outreach 的第二次 find_occasions）",
+    check("D4 对照：正常群聊路径也没有漏（两条群路径现在都守住归属）",
           not leaked_chat, str(leaked_chat))
 
     print()
     print("=" * 78)
     print("E. 日期解析边界")
     print("=" * 78)
+    print("    【期望为何变了】E1 原来写着『10月20号』『下周三』『2026/10/11』")
+    print("    应当静默作废（PASS = 解析不出来）。修复批次把这几条列为 P2：")
+    print("    模型/整理链路写进 event_date 的不一定是严格 ISO，认不出来就等于")
+    print("    “那天她不会想起来”。所以 E1 改成：常见写法要**能解析出正确的日期**，")
+    print("    而真正非法的（2026-13-01 / 空白 / None）仍然返回 None 且不报错。")
+    today = date(2026, 10, 10)      # 周六，用来验证相对星期
     for raw in ("2026-10-11", "2026-10-11T09:00:00", "2026-2-30", "10月20号", "20261011",
-                "", " 2026-10-11 ", None, "2026-13-01", "下周三", "2026/10/11"):
-        print(f"    _parse_event_date({raw!r}) = {_parse_event_date(raw)}")
-    check("E1 非 ISO 的日期串（『10月20号』『下周三』『2026/10/11』）静默作废 → 那天她不会想起来",
-          _parse_event_date("10月20号") is None and _parse_event_date("下周三") is None
-          and _parse_event_date("2026/10/11") is None,
-          f"{_parse_event_date('10月20号')}/{_parse_event_date('下周三')}/{_parse_event_date('2026/10/11')}")
+                "", " 2026-10-11 ", None, "2026-13-01", "下周三", "2026/10/11",
+                "2026年10月11日", "10/20", "周六", "明天"):
+        print(f"    _parse_event_date({raw!r}, today=2026-10-10) = {_parse_event_date(raw, today)}")
+    check("E1 常见写法能解析成正确的日期（『2026/10/11』『10月20号』『下周三』）",
+          _parse_event_date("2026/10/11", today) == date(2026, 10, 11)
+          and _parse_event_date("10月20号", today) == date(2026, 10, 20)
+          and _parse_event_date("下周三", today) == date(2026, 10, 21),
+          f"{_parse_event_date('2026/10/11', today)}/"
+          f"{_parse_event_date('10月20号', today)}/{_parse_event_date('下周三', today)}")
+    check("E1b 非法/缺失的日期仍然静默作废（返回 None，不抛错）",
+          _parse_event_date("2026-13-01", today) is None
+          and _parse_event_date("2026-2-30", today) is None
+          and _parse_event_date("", today) is None
+          and _parse_event_date(None, today) is None
+          and _parse_event_date("明天", today) is None,
+          f"{_parse_event_date('2026-13-01', today)}/{_parse_event_date('2026-2-30', today)}")
+    check("E1c ISO 与紧凑写法没被新解析器弄坏",
+          _parse_event_date("2026-10-11", today) == date(2026, 10, 11)
+          and _parse_event_date("20261011", today) == date(2026, 10, 11)
+          and _parse_event_date("2026-10-11T09:00:00", today) == date(2026, 10, 11))
+
+    print()
+    print("=" * 78)
+    print("F. 去重键带上“提醒发生在哪一天”（前一天提过 → 正日子当天还要提）")
+    print("=" * 78)
+    f = Giftia(dataclasses.replace(s, root=base_settings("occ-f", 81920.0).root),
+               llm=MockLLM(s.model))
+    tomorrow = (f.clock.now().date() + timedelta(days=1)).isoformat()
+    mid = add_mem(f, "明天要考驾照", tomorrow)
+    d1 = [o.title for o in find_occasions(s, f.store, now=f.clock.now(), instance_no=1,
+                                          days_known=5.0, mark=True) if o.memory_id == mid]
+    f.clock.advance(24)
+    d2 = [o.title for o in find_occasions(s, f.store, now=f.clock.now(), instance_no=1,
+                                          days_known=6.0, mark=True) if o.memory_id == mid]
+    print(f"    前一天（“明天考试”）→ {d1}；正日子当天（“今天考试”）→ {d2 or '（不提醒）'}")
+    check("F1 前一天提过之后，正日子当天还会再提一次（去重键 = id+日子+今天）",
+          len(d1) == 1 and len(d2) == 1, f"{d1} / {d2}")
+
+    g = Giftia(dataclasses.replace(s, root=base_settings("occ-g", 81920.0).root),
+               llm=MockLLM(s.model))
+    past = (g.clock.now().date() - timedelta(days=1)).isoformat()
+    mid2 = add_mem(g, "昨天考驾照", past)
+    g1 = [o.title for o in find_occasions(s, g.store, now=g.clock.now(), instance_no=1,
+                                          days_known=5.0, mark=True) if o.memory_id == mid2]
+    g.clock.advance(24)
+    g2 = [o.title for o in find_occasions(s, g.store, now=g.clock.now(), instance_no=1,
+                                          days_known=6.0, mark=True) if o.memory_id == mid2]
+    print(f"    事后第 1 天（“昨天那件事”）→ {g1}；第 2 天（“2 天前那件事”）→ {g2 or '（不追问）'}")
+    check("F2 事后第 1 天问过之后，第 2 天还能再回访一次（follow_up 去重键同样带上今天）",
+          len(g1) == 1 and len(g2) == 1, f"{g1} / {g2}")
 
     return report("beh_occasions")
 

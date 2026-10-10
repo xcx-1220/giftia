@@ -23,6 +23,8 @@ for _s in (sys.stdout, sys.stderr):
 from giftia.brain import FAILURE_LINES, Giftia  # noqa: E402
 from giftia.config import load_settings  # noqa: E402
 from giftia.llm import ChatReply, LLMError, MockLLM, ToolCall  # noqa: E402
+# 探针自检用（契约 §一：active_memories 的 view 必填，全量要显式 ALL_SCOPES）
+from giftia.store import Store  # noqa: E402
 
 PASS = FAIL = 0
 SECRET = "SECRET-ALPHA-7731"
@@ -148,7 +150,7 @@ print(f"      抛出后 DB 状态：{[(r['role'], r['content'][:12]) for r in ro
 print("\n== 4. 先写了记忆、最后一轮模型挂了 ==")
 h4 = fresh("writethenfail", WriteThenFail(env("writethenfail").model))
 reply4 = h4.handle("我答应你一件事", user_id="OWNER")
-mems = [m["summary"] for m in h4.store.active_memories(h4.instance_no)]
+mems = [m["summary"] for m in h4.store.active_memories(h4.instance_no, view=Store.ALL_SCOPES)]
 check("4a 记忆写进去了（工具那一轮成功）", any(SECRET in s for s in mems), str(mems))
 check("4b 回复走了失败兜底", reply4 in FAILURE_LINES, reply4[:30])
 print(f"      → 结果：她记住了「{mems}」，但用户只看到「{reply4[:20]}」")
@@ -212,7 +214,7 @@ try:
 except Exception as exc:
     raised = f"{type(exc).__name__}: {exc}"
 h7.store.add_memory = real  # type: ignore[method-assign]
-mems_after = [m["summary"] for m in h7.store.active_memories(h7.instance_no)]
+mems_after = [m["summary"] for m in h7.store.active_memories(h7.instance_no, view=Store.ALL_SCOPES)]
 open_after = len(h7.store.open_messages(h7.instance_no))
 print(f"      add_memory 调用次数={calls['n']}，consolidate 抛出：{raised or '（无）'}")
 print(f"      已写进记忆：{mems_after}；仍处于未整理的消息：{open_before} -> {open_after}")
@@ -220,7 +222,7 @@ check("7a 半写：第一条记忆已经落库，但消息没标已整理（没�
       bool(mems_after) and open_after > 0 and bool(raised),
       f"raised={raised!r} mems={mems_after} open={open_after}")
 added2 = h7.consolidate(force=True)
-mems2 = [m["summary"] for m in h7.store.active_memories(h7.instance_no)]
+mems2 = [m["summary"] for m in h7.store.active_memories(h7.instance_no, view=Store.ALL_SCOPES)]
 check("7b 重试后靠去重没有产生重复条目", len(mems2) == len(set(mems2)),
       f"added={added2} 条数={len(mems2)} 去重后={len(set(mems2))}")
 

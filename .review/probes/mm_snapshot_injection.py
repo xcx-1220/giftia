@@ -30,6 +30,7 @@ from mm_common import (  # noqa: E402
     title,
 )
 from giftia.memory import recall  # noqa: E402
+from giftia.store import Store  # noqa: E402
 
 NOW = datetime.now()
 TS = NOW.isoformat(timespec="seconds")
@@ -116,7 +117,7 @@ def main() -> int:
     table_alive = s._one(
         "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = ?", ("memories",)
     )["n"] == 1
-    hits = recall("DROP TABLE memories", s.active_memories(inst), stage(settings, "clear"),
+    hits = recall("DROP TABLE memories", s.active_memories(inst, view=Store.ALL_SCOPES), stage(settings, "clear"),
                   settings.memory, NOW)
     print(f"    SQL 注入尝试：写入前 {n_before} 行，写入后 {n_after} 行；"
           f"memories 表仍存在={table_alive}")
@@ -156,7 +157,7 @@ def main() -> int:
     s.seal_instance(inst)
     b.lifespan.reactivate()
     print(f"    换代后 instance_no={b.lifespan.instance_no}，"
-          f"active_memories={len(s.active_memories(b.lifespan.instance_no))}")
+          f"active_memories={len(s.active_memories(b.lifespan.instance_no, view=Store.ALL_SCOPES))}")
     print("    快照文件里含 instance_no 列，恢复是全表替换（DELETE FROM memories）——")
     print("    也就是说 restore 会把**所有实例**的记忆一起替换成快照那一刻的状态。")
     check("观察：restore_memories 是全表替换，没有 instance 过滤", True)

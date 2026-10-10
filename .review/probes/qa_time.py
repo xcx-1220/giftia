@@ -164,8 +164,8 @@ for m in ("我跟你说个事，我下周三要去考驾照", "教练说我倒�
           "考完就好了吧"):
     brain_c.handle(m, "u_owner", scene="c2c")
 brain_c.consolidate(force=True)
-mem = [m for m in brain_c.store.active_memories(1) if m.get("event_date")]
-C.check("带 event_date 的记忆已落库", len(mem) == 1, str([(m['id'], m.get('event_date')) for m in brain_c.store.active_memories(1)]))
+mem = [m for m in brain_c.store.active_memories(1, view=Store.ALL_SCOPES) if m.get("event_date")]
+C.check("带 event_date 的记忆已落库", len(mem) == 1, str([(m['id'], m.get('event_date')) for m in brain_c.store.active_memories(1, view=Store.ALL_SCOPES)]))
 C.check("event_date 是具体日期", mem and mem[0]["event_date"] == target.isoformat(),
         str(mem[0]["event_date"]) if mem else "无")
 
@@ -206,6 +206,7 @@ C.check("第 3 天不再回访（窗口关闭）",
 
 # 群里看不到搭档的私人大日子（view 过滤）
 from giftia.occasions import find_occasions  # noqa: E402
+from giftia.store import Store  # noqa: E402
 g = find_occasions(settings_c, brain_c.store, now=brain_c.clock.now(), instance_no=1,
                    days_known=10, mark=False, view=[("group", "groupX")])
 C.check("★ 搭档私聊的大日子不会在群里被惦记（view 过滤）",

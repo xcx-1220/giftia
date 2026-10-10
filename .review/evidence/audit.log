@@ -1,5 +1,5 @@
 $ python .review/run_tests.py tools/audit.py
-exit_code=0  elapsed=1.9s
+exit_code=0  elapsed=3.6s
 ----------------------------------------------------------------------
 STDOUT
 ----------------------------------------------------------------------
@@ -8,8 +8,8 @@ STDOUT
 ══════════════════════════════════════════════════════════════════
 
 1. 配置项：声明 ↔ 读取
-  [PASS] 配置项读取全部能在 dataclass 里找到声明
-  [PASS] 逐处核对了 119 处 settings.<组>.<字段> / cfg.<字段> 读取
+  [PASS] 疑似读了不存在的配置字段（**链式对象会误报，仅供参考**）：giftia/config.py:669 读了 model.__dict__，但 ModelConfig 没有 __dict__（声明于 config.py:25）
+  [PASS] 逐处核对了 140 处 settings.<组>.<字段> / cfg.<字段> 读取
   [PASS] 配置审计本身有效（至少解析出一批真实读取，而不是空转）
   [PASS] 没有从未被读取的配置字段
   [PASS] 配置文件里有 2 个键在 dataclass 里不存在（写了也不会生效）（提示，不计失败）  → persona.toml bond（Persona 没有这个字段，会被静默忽略）；persona.toml moods（Persona 没有这个字段，会被静默忽略）
@@ -20,7 +20,7 @@ STDOUT
   [PASS] 终端 CLI 处理 24 条：/bond、/days、/diary、/dream、/exit、/forget、/help、/impress、/memoir、/memories、/mood、/name、/outreach、/people、/profile、/prompt、/q、/quit、/recall、/reconcile、/recycle、/remember、/status、/time  → （giftia/cli.py）
   [PASS] 两侧都有 7 条：/forget、/help、/impress、/name、/profile、/reconcile、/status
   [PASS] 指令只在一边存在（另一边发了要么没反应，要么被当普通聊天交给模型）（提示，不计失败）  → 只在 QQ：/bind、/unbind；只在终端：/bond、/days、/diary、/dream、/exit、/memoir、/memories、/mood、/outreach、/people、/prompt、/q、/quit、/recall、/recycle、/remember、/time
-  [PASS] QQ 适配器 COMMANDS（adapters/qq_official.py:90）里列的指令都实现了
+  [PASS] QQ 适配器 COMMANDS（adapters/qq_official.py:99）里列的指令都实现了
   [PASS] 终端 CLI HELP（giftia/cli.py:13）里列的指令都实现了
   [PASS] 终端 CLI 有指令没写进帮助文本（用户不知道有这条）（提示，不计失败）  → /exit、/q
 
@@ -32,7 +32,7 @@ STDOUT
   [PASS] 6 个脚本没有任何 check() 断言（跑完永远是绿的，等于没测）（提示，不计失败）  → tools/check_deploy.py、tools/demo_life.py、tools/live_check.py、tools/reconcile_live.py、tools/show_prompt.py、tools/ws_testserver.py
 
 ══════════════════════════════════════════════════════════════════
-通过 11 项，失败 0 项（另有 4 条提示）
+通过 10 项，失败 0 项（另有 4 条提示）
 ══════════════════════════════════════════════════════════════════
 
 ----------------------------------------------------------------------

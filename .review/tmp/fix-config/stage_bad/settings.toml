@@ -1,0 +1,8 @@
+[[degradation.stages]]
+name = "x"
+label = "y"
+min_ratio = 0.0
+top_k = 6
+min_score = 0.15
+blur = 1.5
+max_chars = 400

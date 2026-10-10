@@ -27,6 +27,7 @@ from .dream import Dream, dream_text, latest_untold, make_dream, should_dream
 from .lifespan import Lifespan, LifeStatus
 from .llm import BaseLLM, DeepSeekLLM, LLMError, MockLLM
 from .memory import (
+    CONFIDENCE_CITE,
     day_label,
     Recalled,
     consolidate,
@@ -567,17 +568,25 @@ class Giftia:
         line_chars: int = 44,
         present_only: bool = False,
     ) -> str:
-        """【你对他们的印象】——每人一份档案的紧凑版，随提示词注入。
+        """【你对他们的印象】——每人一份档案的紧凑版。
+
+        **两种语义，看 `present_only`：**
+
+        | 调用方式 | 语义 |
+        |---|---|
+        | `present_only=True`（`_prepare` 在 group/guest 注入时） | **只带在场的人**：说话的这位、搭档、这条消息里点到的人 |
+        | 默认 `present_only=False`（直接调用 = 内部 API / 查看整份档案） | **整份档案，按人封顶**（每人 `per_person` 条、最多 `max_people` 人） |
+
+        安全的边界是**注入路径**：进了 system 的那一份必须是 `present_only=True`。
+        默认的 False 是"看整份档案"的语义，`tools/selftest.py` 用它验"每人最多 3 条"的封顶，
+        不要为了"顺手统一"把两条合成一条（两条规则并不矛盾：一条管注入，一条管查看）。
 
         和"检索式的记忆"不同：这一块**不靠 query 命中**，而是按人各带几条。
-        这样她不会因为这次没问到就把人忘干净，也天然封顶（每人 3 条、最多 15 人），
-        不会把上下文吃光。
+        这样她不会因为这次没问到就把人忘干净，也天然封顶，不会把上下文吃光。
 
-        `present_only=True`（**注入路径**，见 `_prepare`）时只带本轮真的出现过的人：
-        说话的这位、搭档、这条消息里点到的人。P1-13 之前这里有个"兜底循环"，
-        会把 `by_person` 里剩下的人全部补进来——群 G 里只有一个人在说话，
-        提示词里却带了另外 14 个人的印象，正好绕过了 `_filter_by_presence` 要防的事。
-        默认的 False 是"看整份档案"的语义（`/impressions`、调试），仍然按人封顶。
+        P1-13 之前这里有个"兜底循环"，会把 `by_person` 里剩下的人全部补进来——
+        群 G 里只有一个人在说话，提示词里却带了另外 14 个人的印象，
+        正好绕过了 `_filter_by_presence` 要防的事。注入路径现在没有这个循环了。
         """
         view = self.memory_view
         by_person = self._visible_by_person(view)
@@ -800,9 +809,15 @@ class Giftia:
             return False
         # 本地/单机调用方（uid 就是默认哨兵值）= 本机的搭档本人：
         # 不设遮蔽下界，他看的是自己留下的记忆（见 set_handler_id）。
-        self.set_handler_id(uid, local=(uid == LOCAL_USER_ID))
+        try:
+            self.set_handler_id(uid, local=(uid == LOCAL_USER_ID))
+        except Exception as exc:
+            # 认主写不进去（库锁住/磁盘满）：这一轮退回"未确认"路径。
+            # 宁可让她这一轮不认识人，也不能在没有遮蔽下界的情况下按搭档处理（那才是 P0）。
+            self._note_error("认主", exc)
+            return False
         self.notices.append(
-            f"[认主] 从现在起你就是她的搭档（想换人：/unbind）。"
+            "[认主] 从现在起你就是她的搭档（想换人：/unbind）。"
         )
         return True
 
@@ -1031,7 +1046,10 @@ class Giftia:
         # ★ 只在她"此刻能看到"的记忆里检索 —— 群聊时检索不到别人私聊的内容，
         #   换人之后也检索不到前任的私事（visible_memories 里含绑定时刻遮蔽）
         memories = self.visible_memories()
-        recalled = recall(query, memories, life.stage, self.settings.memory, now)
+        # 两路检索合并：历史+当前 / 只有当前这句（见 _recall_merged 的注释）
+        recalled = self._recall_merged(
+            memories, query, text, life.stage, now,
+        )
 
         # 检索太弱时才多花一次调用去改写查询（常见情况下不增加延迟）
         self.rewritten_queries = []
@@ -1040,12 +1058,8 @@ class Giftia:
         ):
             variants = self._rewrite_queries(text)
             if variants:
-                merged = recall(
-                    query,
-                    memories,
-                    life.stage,
-                    self.settings.memory,
-                    now,
+                merged = self._recall_merged(
+                    memories, query, text, life.stage, now,
                     extra_queries=variants,
                 )
                 if len(merged) > len(recalled):
@@ -1078,6 +1092,17 @@ class Giftia:
         #   否则她在群里讲梦 = 当众说出你的私事（真机测试抓到过这条泄漏）。
         if not (self.is_handler and self.last_scene == "c2c"):
             self.last_dream = None
+
+        # ★ 内核记忆保底：不靠关键词命中也要进提示词（README 的"她记得你是小林"）。
+        #   它只影响注入文本；"被说出口"的记账口径不变（mark_injected 照旧按最终列表记）。
+        core_guard = self._core_memories()
+        if core_guard:
+            before = len(recalled)
+            recalled = self._dedupe_recalled(recalled, core_guard)
+            if len(recalled) > before:
+                self.notices.append(
+                    f"[内核记忆] 保底注入 {len(recalled) - before} 条（这部分她永远不会含糊）"
+                )
 
         system = build_system_prompt(
             self.settings,
@@ -1526,6 +1551,16 @@ class Giftia:
                 f"mood_shared:{now.date().isoformat()}",
                 str(getattr(plan_, "mood_key", "") or ""),
             )
+        # 讲过的梦要标"已讲"（P1-19）：适配器走的是
+        # compose_outreach(record=False) + 这里记账，以前这条路径不标记，
+        # 同一个梦每过 min_gap_hours 就被再讲一遍（max_per_day=3 → 一天讲三次），
+        # 而稀缺的额度也一起被吃掉。`compose_outreach(record=True)` 那条路
+        # 在 plan 里就带了 dream_id，这里统一按 plan 记。
+        if plan_ is not None and getattr(plan_, "reason", "") == "dream":
+            dream_id = int(getattr(plan_, "dream_id", 0) or 0)
+            if dream_id:
+                self.store.mark_dream_told(dream_id)
+                self.notices.append("[做梦] 她把那个梦讲给你听了")
         record_sent(self.store, now)
 
     def _rewrite_queries(self, text: str) -> list[str]:
@@ -1537,9 +1572,103 @@ class Giftia:
         return [v.strip() for v in variants if v.strip() and v.strip() != text.strip()][:3]
 
     def _recall_query(self, recent: list[dict], text: str) -> str:
-        """用最近几句搭档的话 + 当前这句做检索，避免单句太短召不回东西。"""
+        """用最近几句搭档的话 + 当前这句做检索，避免单句太短召不回东西。
+
+        注意：拼历史是为了"召回更多"，但它也会**污染排名**——当前这句真正想问的那条
+        可能只剩 1/3 的名次，被相对裁剪（`relative_cutoff`）丢掉，于是"当天追问同一件事"
+        反而想不起来，第二天会话轮换后才想得起来（审查 P2 / qa-verifier 的实测）。
+        所以真正的检索走 `_recall_merged()`：**单独用当前这句再搜一遍**，两路结果合并。
+        """
         user_lines = [m["content"] for m in recent if m["role"] == "user"][-2:]
         return " ".join([*user_lines, text])
+
+    def _recall_merged(
+        self,
+        memories: list[dict],
+        query: str,
+        current_text: str,
+        stage,
+        now,
+        *,
+        extra_queries: list[str] | None = None,
+    ) -> list[Recalled]:
+        """两路检索合并：`历史+当前` 与 `只有当前这句`。
+
+        每条记忆按**较高的那个分数**保留，这样"只被当前这句命中"的记忆不会被
+        历史词面挤掉；排序仍按最终分数降序，`top_k` 与模糊化照旧由 `recall()` 决定。
+        """
+        cfg = self.settings.memory
+        merged: dict[int, Recalled] = {}
+        for q in (query, current_text):
+            if not q or not q.strip():
+                continue
+            for hit in recall(
+                q, memories, stage, cfg, now, extra_queries=extra_queries if q == query else None
+            ):
+                mid = int(hit.memory["id"])
+                old = merged.get(mid)
+                if old is None or hit.score > old.score:
+                    merged[mid] = hit
+        return sorted(merged.values(), key=lambda r: -r.score)
+
+    def _core_memories(self, limit: int | None = None) -> list[Recalled]:
+        """内核记忆的**保底通道**：不靠关键词命中，也能进提示词。
+
+        README 承诺"到了终端服务迫近的时候，她记得你是小林、记得你对她很重要"。
+        但 `recall()` 是词面检索：用户那句话里没有"名字/称呼/关系"这些字时，
+        core 层根本进不了候选（审查报告 §五 5.3 实测：问"今天天气怎么样"时，
+        "搭档叫小林"不会被召回）。这一块把 core 层直接取出来常驻注入——
+        它本来就"永不含糊"（`layer_core_blur = 0`），给她当底子用是安全的。
+        """
+        if not getattr(self.settings.memory, "core_always_inject", True):
+            return []
+        if limit is None:
+            limit = int(getattr(self.settings.memory, "core_always_inject_max", 3) or 3)
+        try:
+            rows = self.visible_memories()
+        except Exception:
+            return []
+        now = self.clock.now()
+        out: list[Recalled] = []
+        for mem in rows:
+            if str(mem.get("layer") or "") != "core":
+                continue
+            # 只带"关于他本人"的：别人的内核记忆不该进他和她的对话
+            about = str(mem.get("about") or "").strip()
+            if about and about not in ("搭档", self.handler_name, self.speaker_name):
+                continue
+            text = str(mem.get("summary") or "").strip()
+            if not text:
+                continue
+            max_chars = max(60, int(getattr(self.settings.memory, "core_max_chars", 200)))
+            if len(text) > max_chars:
+                text = text[:max_chars].rstrip() + "……"
+            out.append(
+                Recalled(
+                    memory=mem,
+                    score=1.0,
+                    text=text,
+                    blurred=False,
+                    blur=0.0,
+                    retention=retention_of(mem, self.settings.memory, now),
+                    confidence=CONFIDENCE_CITE,
+                )
+            )
+        # 新的、重要的排前面，避免内核记忆多了以后全是"最早那条"
+        out.sort(key=lambda r: (str(r.memory.get("created_ts") or ""), float(r.memory.get("importance") or 0)), reverse=True)
+        return out[: max(0, int(limit))]
+
+    def _dedupe_recalled(self, primary: list[Recalled], extra: list[Recalled]) -> list[Recalled]:
+        """合并两组回忆，按 id 去重（primary 的顺序优先）。"""
+        seen: set[int] = set()
+        out: list[Recalled] = []
+        for item in [*primary, *extra]:
+            mid = int(item.memory["id"])
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append(item)
+        return out
 
     def _render_group_chat(self, limit: int = 18, per_line: int = 90) -> str:
         """群里最近的聊天记录（含没点到她的话）。
@@ -1652,7 +1781,11 @@ class Giftia:
 
     def _on_draft(self, draft) -> None:
         """每条新记忆写入后的回调：关系加分 + 发现"他要求改口"。"""
-        self.bond.on_memory(self.instance_no, getattr(draft, "layer", "") or "normal")
+        # 关系加分每天最多结算一次（P1-15）：同一天聊得再多也不会把曲线刷快
+        self.bond.on_memory(
+            self.instance_no, getattr(draft, "layer", "") or "normal",
+            now=self.clock.now(),
+        )
         name = str(getattr(draft, "preferred_name", "") or "").strip()
         if name and name != self.handler_name:
             self.store.state_set("handler_name", name[:16])

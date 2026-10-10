@@ -23,6 +23,8 @@ for _s in (sys.stdout, sys.stderr):
 from giftia.brain import Giftia  # noqa: E402
 from giftia.config import load_settings  # noqa: E402
 from giftia.llm import ChatReply, MockLLM  # noqa: E402
+# 探针自检用（契约 §一：active_memories 的 view 必填，全量要显式 ALL_SCOPES）
+from giftia.store import Store  # noqa: E402
 
 PASS = FAIL = 0
 SECRET = "SECRET-ALPHA-7731"
@@ -129,7 +131,18 @@ h.llm.reset()
 reply = h.handle("你好呀，你认识我吗", user_id="STRANGER", scene="group", group_id="G-1",
                  speaker_name="小雨", is_handler=False)
 check("C1 客人拿不到搭档私事", SECRET not in h.llm.system)
-check("C2 客人拿得到本群公开记忆（说明'完全不检索'不成立）", "豆豆" in h.llm.system)
+# ★ 期望翻转（lead 授权，2026-10-10）：原来这条断言"豆豆"在提示词里，用来证明
+#   "客人完全不检索"不成立。但修前它成立的原因**不是检索**，而是 P1-13 的兜底循环——
+#   印象块把 by_person 里不在场的人（阿伟）全都补进了提示词。P1-13 修掉之后，
+#   这一轮 query 与那条记忆无关，检索本就该是空的，所以改为断言"不在场的人不该出现在注入提示词里"。
+check("C2 ★ 客人那一轮不在场的人（阿伟）不该出现在注入提示词里",
+      "豆豆" not in h.llm.system)
+# 客人仍然有"本群公开记忆"的**视角**：问对了事照样检索得到（对照见 D 段/契约 §三）
+h.llm.reset()
+h.handle("阿伟家的猫叫什么来着", user_id="STRANGER2", scene="group", group_id="G-1",
+         speaker_name="小雨", is_handler=False)
+check("C2b 客人问对了事，本群公开记忆照旧检索得到（视角没变窄）",
+      "豆豆" in h.llm.system)
 b1 = h.current_bond()
 check("C3 客人不推进关系", (b0.affinity, b0.interactions) == (b1.affinity, b1.interactions),
       f"{b0.affinity}/{b0.interactions} -> {b1.affinity}/{b1.interactions}")
@@ -228,7 +241,7 @@ j.set_handler_id("OWNER")
 for i in range(2):
     j.handle(f"我是客人，第{i}次说话，聊的是周末天气怎么样", user_id="GUEST", scene="group",
              group_id="GW", speaker_name="丙", is_handler=False)
-jm = j.store.active_memories(j.instance_no)
+jm = j.store.active_memories(j.instance_no, view=Store.ALL_SCOPES)
 print(f"      客人两轮之后她的记忆：{[(m['scope'], m['subject_id'], m['summary'][:18]) for m in jm]}")
 check("J1 ★ 客人说的话会被整理成记忆（README 的『不写记忆』字面不成立）", bool(jm), str(len(jm)))
 check("J2 但归属正确：全部是 group 归属，没有 private",

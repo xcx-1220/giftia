@@ -88,6 +88,7 @@ s3 = make_settings(tmp3, hours=9000.0)
 b3 = make_brain(s3, RecordingLLM(s3.model))
 b3.set_handler_id("u_owner")
 import json  # noqa: E402
+from giftia.store import Store  # noqa: E402
 text = json.loads(r'{"content":"hello \ud83d world"}')["content"]
 C.info(f"json.loads 得到的文本：{text!r}（这是平台 JSON 里合法的一个转义）")
 rows_before = b3.store._one("SELECT COUNT(*) AS n FROM messages")["n"]
@@ -130,7 +131,7 @@ C.check("★ 换代后新实例仍然用「小林」称呼你（称呼没有随�
         b4.handler_name == "小林" and "小林" in p,
         f"handler_name={b4.handler_name!r} 出现在新实例提示词：{'小林' in p}")
 C.check("对照：新实例确实没有前任的记忆条目（记忆这一半做到了）",
-        "◆" not in p and len(b4.store.active_memories(2)) == 0, "")
+        "◆" not in p and len(b4.store.active_memories(2, view=Store.ALL_SCOPES)) == 0, "")
 b4.close()
 rm_dir(tmp4)
 

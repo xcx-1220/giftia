@@ -73,19 +73,28 @@ print(f"   handler_id = {brain.handler_id!r}；档案里仍有密钥：{SECRET i
 print("   适配器对 'owner and user_id != owner' 的处理：走 DEFLECT 分支（不调用 profile_text）")
 print("   —— 同一函数本身不做身份判定，身份判定只在适配器那一个 if 上")
 
-# ── B2. 更直接的一条：群成员那一轮，她的系统提示词里有没有搭档的私事 ──
-print("\nB2. 群里一个陌生人 @ 她时，提示词里会不会出现搭档的私事（不管走不走 /profile）")
-guess = Giftia(settings, llm=MockLLM(settings.model))
-guess.store.state_set("handler_id", "")          # 未绑定态
-visible = guess.store.active_memories(
-    1, view=[("group", "GROUP-A")]               # 群视角：只应有本群公开记忆
-)
-print(f"   群视角能看到 {len(visible)} 条（应为 0，因为私事归属 private）")
-guess.set_handler_id("")
-guess.handle("我叫小林，我的保险箱密码是 " + SECRET, "OWNER-OLD", scene="c2c")
-prompt_blob = guess.preview_prompt("你还记得我的密码吗")
-print(f"   解绑后陌生人私聊同一句话 → 提示词里含密钥：{SECRET in prompt_blob}")
-print("   （这正是 Stream C 的 P0：is_handler 在 owner 为空时把私聊当搭档）")
+# ── B2. 更直接的一条：换人之后，新搭档那一轮的提示词里有没有前任的私事 ──
+# 注意：这一节必须用**独立的库**，否则会拿到前面几节留下的记忆，误判成"泄漏"。
+print("\nB2. 解绑/换人后，新搭档的提示词里会不会出现前任的私事")
+b2_root = TMP / "b2"
+b2_root.mkdir(parents=True, exist_ok=True)
+b2_settings = dataclasses.replace(load_settings(force_mock=True), root=b2_root)
+first = Giftia(b2_settings, llm=MockLLM(b2_settings.model))
+first.set_handler_id("OWNER-OLD")                      # 前一任搭档
+first.handle(f"我叫小林，我的保险箱密码是 {SECRET}", "OWNER-OLD", scene="c2c")
+first.consolidate(force=True)
+print(f"   前任留下的 private 记忆：{len(first.store.active_memories(1, view=[('private', '')]))} 条")
+
+newcomer = Giftia(b2_settings, llm=MockLLM(b2_settings.model))
+newcomer.set_handler_id("INTRUDER")                    # 换人：新搭档绑定（走遮蔽下界）
+print(f"   新搭档 = {newcomer.handler_id!r}，遮蔽下界 = {newcomer.handler_bound_at!r}")
+newcomer.handle("你还记得我的密码吗", "INTRUDER", scene="c2c")   # 新搭档的第一句
+visible = newcomer.visible_memories(view=[("private", "")])
+print(f"   新搭档能看到的 private 记忆：{len(visible)} 条（期望 0）")
+prompt_blob = newcomer.preview_prompt("你还记得我的密码吗")
+leaked = SECRET in prompt_blob
+print(f"   [{'FAIL' if leaked else 'PASS'}] 新搭档的提示词里没有前任的私事")
+print(f"   （群视角对照：{len(newcomer.store.active_memories(1, view=[('group', 'GROUP-A')]))} 条 —— 应恒为 0）")
 
 # ── D. 记忆归属结构：private 是不带 openid 的全局命名空间 ────────────
 print("\nD. 根因：private 归属不带 openid")

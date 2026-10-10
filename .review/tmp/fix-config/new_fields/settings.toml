@@ -1,0 +1,15 @@
+[outreach]
+wakeup_max_per_30_days = 4
+mood_share_min_idle_hours = 6
+[memory]
+recall_prefilter = 500
+min_raw_score = 0.1
+
+[[degradation.stages]]
+name = "clear"
+label = "记忆清晰"
+min_ratio = 0.0
+top_k = 6
+min_score = 0.15
+blur = 0.0
+max_chars = 400

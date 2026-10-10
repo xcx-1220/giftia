@@ -27,6 +27,8 @@ from adapters.qq_official import DEFLECT, QQBot, extract_content  # noqa: E402
 from giftia import brain as brain_mod  # noqa: E402
 from giftia.config import load_settings  # noqa: E402
 from giftia.llm import MockLLM  # noqa: E402
+# 探针自检用（契约 §一：active_memories 的 view 必填，全量要显式 ALL_SCOPES）
+from giftia.store import Store  # noqa: E402
 
 PASS = FAIL = 0
 SECRET = "SECRET-ALPHA-7731"
@@ -97,7 +99,8 @@ print("== 0. 前置：本地 CLI（run.py → cli.py:85 brain.handle(text)）不
 st0, hub0, bot0 = new_bot("cli_pre")
 hub0.handle("我今天加班到很晚，回来路上下了点雨")   # 不带 user_id，等价 cli.py:85
 hub0.consolidate(force=True)
-scopes0 = [m["scope"] for m in hub0.store.active_memories(hub0.instance_no)]
+scopes0 = [m["scope"] for m in hub0.store.active_memories(hub0.instance_no,
+                                                          view=Store.ALL_SCOPES)]
 check("0a CLI 聊过之后 handler_id 仍是空", hub0.handler_id == "", repr(hub0.handler_id))
 check("0b 记忆落在 private（谁都能在群里 /profile 出来的那批）", set(scopes0) == {"private"},
       str(scopes0))
@@ -110,7 +113,7 @@ hub.store.add_memory(instance_no=hub.instance_no, created_ts=hub.clock.iso(),
                      summary=f"搭档的秘密 {SECRET}：他下周三要考驾照",
                      importance=0.9, layer="important", scope="private", subject_id="",
                      about="椎名")
-mem_id = hub.store.active_memories(hub.instance_no)[0]["id"]
+mem_id = hub.store.active_memories(hub.instance_no, view=Store.ALL_SCOPES)[0]["id"]
 check("1a 前置：已有一条搭档私事，且当前未绑定", hub.handler_id == "", repr(hub.handler_id))
 
 buf = io.StringIO()
@@ -126,13 +129,15 @@ print(f"      输出片段：{[l for l in out.splitlines() if SECRET in l][:1]}"
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     bot.handle_command("group", "G-CMD", f"/forget {mem_id}", "STRANGER", "m2")
-alive = any(int(m["id"]) == mem_id for m in hub.store.active_memories(hub.instance_no))
+alive = any(int(m["id"]) == mem_id
+            for m in hub.store.active_memories(hub.instance_no, view=Store.ALL_SCOPES))
 check("1d ★ 未绑定时陌生人能 /forget 掉搭档的记忆", alive is False, f"memory #{mem_id} 还在={alive}")
 
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     bot.handle_command("group", "G-CMD", "/impress 张三 他欠我钱", "STRANGER", "m3")
-imp = [m for m in hub.store.active_memories(hub.instance_no) if "欠我钱" in str(m["summary"])]
+imp = [m for m in hub.store.active_memories(hub.instance_no, view=Store.ALL_SCOPES)
+       if "欠我钱" in str(m["summary"])]
 check("1e ★ 未绑定时陌生人能 /impress 往记忆里写东西", bool(imp), str(len(imp)))
 
 # ══ 2. 已绑定：同样的指令被挡 ══════════════════════════════════

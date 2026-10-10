@@ -516,9 +516,17 @@ class Store:
         session_id 形如 i1-gXXXX-20261007，前缀 i1-gXXXX- 就是"这个群的所有记录"——
         她"往上翻聊天记录"查的就是它，和她在 QQ 里看到的视角一致。
         """
-        safe = prefix.replace("%", "").replace("_", "")
+        # LIKE 的通配符要**转义**而不是删掉（P3-4）：session_id 里的 `_` 是合法字符
+        # （scope_key 是 `p<uid[:12]>` / `g<gid[:12]>`，不能保证永远没有 `_`）。
+        # 以前直接删掉，含 `_` 的会话前缀会静默失配。
+        safe = (
+            str(prefix)
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         rows = self._rows(
-            "SELECT * FROM messages WHERE session_id LIKE ? AND recalled = 0 "
+            "SELECT * FROM messages WHERE session_id LIKE ? ESCAPE '\\' AND recalled = 0 "
             "ORDER BY id DESC LIMIT ?",
             (safe + "%", limit),
         )
@@ -553,18 +561,29 @@ class Store:
         )
         return int(row["n"]) if row and row["n"] is not None else None
 
-    def mark_recalled(self, msg_id: str) -> int:
+    def mark_recalled(self, msg_id: str, session_id: str | None = None) -> int:
         """标记一条消息被撤回了。返回标记了几条。
 
         撤回的消息**再也不发给模型**（工作记忆、群聊记录、记忆整理三条路都不带它）——
         否则她会记住一句从没发生过的话。
+
+        传 `session_id` 就只在那个会话里找：平台 msg_id 理论上全局唯一，但真出现重复时，
+        按 mid 全表更新会把**别人群里**同 id 的那条也标成撤回（P3-1）。不传 = 旧行为
+        （所有会话里同 mid 的都标记），保持对既有调用方兼容。
         """
         if not msg_id:
             return 0
-        cur = self.conn.execute(
-            "UPDATE messages SET recalled = 1, consolidated = 1 WHERE mid = ?",
-            (str(msg_id),),
-        )
+        if session_id:
+            cur = self.conn.execute(
+                "UPDATE messages SET recalled = 1, consolidated = 1 "
+                "WHERE mid = ? AND session_id = ?",
+                (str(msg_id), str(session_id)),
+            )
+        else:
+            cur = self.conn.execute(
+                "UPDATE messages SET recalled = 1, consolidated = 1 WHERE mid = ?",
+                (str(msg_id),),
+            )
         self.conn.commit()
         return int(cur.rowcount or 0)
 

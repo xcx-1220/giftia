@@ -1,0 +1,4 @@
+[model]
+provider = "mock"
+[lifespan]
+total_hours = 100

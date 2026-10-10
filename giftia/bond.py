@@ -159,8 +159,18 @@ class BondTracker:
         after.progressed = after.stage.key != before.stage.key
         return after
 
-    def on_memory(self, instance_no: int, layer: str) -> None:
-        """整理出一条记忆时给一点关系加成：记住关于他本人的事，最重。"""
+    def on_memory(self, instance_no: int, layer: str, *, now=None) -> None:
+        """整理出一条记忆时给一点关系加成：记住关于他本人的事，最重。
+
+        **每天最多结算一次**（审查 P1-15）。以前这里按条给：同一天聊得越多 →
+        整理出的记忆越多 → 亲密度涨得越快。实测同一天能把 3.47 推到 32.90，
+        而 README 和本文件开头都写着"不可刷：同一天说一百句也只算一次"，
+        那条"第 11/34/80/180 天"的曲线也就跟着失真了。
+        现在第一次 core/important 记忆照旧给全额，同一天后面的不再重复计。
+
+        `now` 不传时退化成"不做每日去重"（兼容老调用方/内部测试）；
+        brain 的真实路径会传 `clock.now()`。
+        """
         if not self.settings.relationship.enabled:
             return
         gain = {
@@ -169,6 +179,11 @@ class BondTracker:
         }.get(layer, 0.0)
         if gain <= 0:
             return
+        if now is not None:
+            today = now.date().isoformat()
+            if self.store.state_get(self._key("memory_gain_day", instance_no)) == today:
+                return  # 今天已经为记忆加过一次了
+            self.store.state_set(self._key("memory_gain_day", instance_no), today)
         current = self._get_float("affinity", instance_no)
         self.store.state_set(
             self._key("affinity", instance_no),

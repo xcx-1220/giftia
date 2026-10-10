@@ -78,21 +78,41 @@ report = perform_recycle(settings, store, clock, MockLLM(settings.model), life, 
 
 memoir_text = report.memoir_path.read_text(encoding="utf-8")
 sealed_text = report.sealed_path.read_text(encoding="utf-8")
+sealed = json.loads(sealed_text)
 diary_rows = store.list_diary(kind="terminal", limit=10)
 diary_text = "\n".join(str(r["content"]) for r in diary_rows)
 
+print("  【分层期望：为什么第 1/3 条与第 2 条的标准不同】")
+print("  回忆录 .md 与 /memoir（diary）：是**交给搭档**的东西，必须是搭档视角，")
+print("    所以判定标准 = 绝不能出现「小雨的私聊」这类第三方归属（第 1、3 条）。")
+print("  封存 封存/instance-NN.json：是**运维资产**（前任记忆的唯一存档），按修复设计")
+print("    **保留全量原始数据**，过滤掉就等于把前任的记忆真删了。所以它的判定标准不是")
+print("    “不含 person”，而是“必须显式标注自己是全量 + 原始 memories 一条不少”（第 2 条）。")
+print("    —— 这条期望是**改了**（原来是“不含 person”），因为修复目标之一就是让封存保持全量。")
 checks = [
-    ("回忆录 .md 不含小雨的私聊", SECRET not in memoir_text),
-    ("封存 JSON 不含小雨的私聊", SECRET not in sealed_text),
-    ("/memoir（diary 表）不含小雨的私聊", SECRET not in diary_text),
+    ("回忆录 .md 不含小雨的私聊（搭档视角）", SECRET not in memoir_text),
+    ("封存 JSON 是全量运维档案：scope=all_scopes + note + 小雨的记录仍在（**分层期望，非放宽**）",
+     sealed.get("scope") == "all_scopes"
+     and bool(str(sealed.get("note") or ""))
+     and any(SECRET in str(m.get("summary", "")) for m in sealed.get("memories", []))),
+    ("/memoir（diary 表）不含小雨的私聊（搭档视角）", SECRET not in diary_text),
 ]
 for label, ok in checks:
     print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
 print(f"\n  回忆录路径：{report.memoir_path}")
+print(f"  回忆录条数（搭档视角）={report.memory_count} 条；"
+      f"封存条数（全量）={report.sealed_count} 条；封存 scope={sealed.get('scope')!r}")
+print(f"  封存 note：{str(sealed.get('note') or '')[:60]}…")
+print(f"  终端服务公文里有没有把“全量”说清楚："
+      f"{'原始数据' in report.notification(settings)}")
 leaked = [ln for ln in memoir_text.splitlines() if SECRET in ln]
-for ln in leaked:
-    print(f"  泄漏行 → {ln}")
-print(f"\n  active_memories() 不传 view 时返回 {len(store.active_memories(instance))} 条"
+if leaked:
+    print("  回忆录泄漏行：")
+    for ln in leaked:
+        print(f"    → {ln}")
+else:
+    print("  回忆录泄漏行：无")
+print(f"\n  active_memories(view=ALL_SCOPES) 返回 {len(store.active_memories(instance, view=Store.ALL_SCOPES))} 条"
       f"（= 全量，含 person/group）")
 print(f"  对照组：群 A 视角 active_memories(view=[('group','GROUP-A')]) = "
       f"{len(store.active_memories(instance, view=[('group', 'GROUP-A')]))} 条")

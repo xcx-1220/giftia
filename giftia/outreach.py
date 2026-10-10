@@ -36,6 +36,10 @@ class OutreachPlan:
     # 心情分享用：**计划时**的心情 key。不能等到真发出去时再取一次——
     # 中间这段时间心情可能已经变了，去重就对不上了。
     mood_key: str = ""
+    # 讲梦用：这一次要讲的是哪一场梦。适配器路径（compose_outreach(record=False)
+    # + 发送成功后 note_outreach_sent）就是靠它把梦标成"已讲"的——
+    # 否则同一个梦每过 min_gap_hours 就被再讲一遍，额度也一起被吃掉（P1-19）。
+    dream_id: int = 0
 
     @property
     def reason_label(self) -> str:
@@ -57,8 +61,25 @@ def _log(store: Store) -> list[str]:
     return [str(x) for x in data] if isinstance(data, list) else []
 
 
+def effective_max_per_30_days(settings: Settings) -> int:
+    """当前生效的 30 天额度。
+
+    `use_wakeup = true` 时走的是官方「互动召回消息」，平台硬限是 **30 天 4 条**
+    （4 个周期各 1 条）。本地账本必须跟着收紧，否则会以为自己还有额度、
+    实际早就超发（审查 P1-17）。
+    """
+    base = max(0, int(settings.outreach.max_per_30_days))
+    if bool(settings.outreach.use_wakeup):
+        cap = max(0, int(getattr(settings.outreach, "wakeup_max_per_30_days", 4) or 4))
+        return min(base, cap)
+    return base
+
+
 def quota_state(settings: Settings, store: Store, now: datetime) -> tuple[int, int, str]:
-    """返回 (30 天内已发, 还剩几条, 下次最早可发的时间串)。"""
+    """返回 (30 天内已发, 还剩几条, 下次最早可发的时间串)。
+
+    额度取**实际生效值**：`use_wakeup=true` 时按官方的 4 条/30 天算。
+    """
     window = now - timedelta(days=30)
     recent: list[datetime] = []
     for raw in _log(store):
@@ -69,7 +90,7 @@ def quota_state(settings: Settings, store: Store, now: datetime) -> tuple[int, i
         if when >= window:
             recent.append(when)
     used = len(recent)
-    left = max(0, settings.outreach.max_per_30_days - used)
+    left = max(0, effective_max_per_30_days(settings) - used)
     if recent:
         earliest = max(recent) + timedelta(hours=settings.outreach.min_gap_hours)
         next_ok = earliest.isoformat(timespec="seconds")
@@ -252,6 +273,9 @@ def plan(
                 "你想把这个梦讲给他听。讲得随意一点，像刚睡醒那样。"
             ),
             urgency=0.5,
+            # 带上梦的 id：发送成功后调用方要把它标成"已讲"（P1-19），
+            # 否则适配器那条路每过 min_gap_hours 就把同一个梦再讲一遍。
+            dream_id=int(getattr(dream, "id", 0) or 0),
         )
 
     # 5) 太久没说话（只对搭档说；群里"没人说话"不该由她来打破）
@@ -306,10 +330,14 @@ def history_text(settings: Settings, store: Store, clock: Clock) -> str:
     now = clock.now()
     used, left, next_ok = quota_state(settings, store, now)
     log = _log(store)
-    lines = [
-        f"主动联系的额度　{settings.outreach.max_per_30_days} 条 / 30 天"
-        f"　已用 {used}　还剩 {left}",
-    ]
+    effective = effective_max_per_30_days(settings)
+    quota_line = f"主动联系的额度　{effective} 条 / 30 天　已用 {used}　还剩 {left}"
+    if effective != settings.outreach.max_per_30_days:
+        quota_line += (
+            f"（配置写的是 {settings.outreach.max_per_30_days}，"
+            "但 use_wakeup 走官方互动召回，硬限 4 条/30 天，已按 4 算）"
+        )
+    lines = [quota_line]
     if next_ok:
         lines.append(f"下次最早可发　{next_ok[:16].replace('T', ' ')}"
                      f"（间隔至少 {settings.outreach.min_gap_hours} 小时）")

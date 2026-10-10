@@ -133,7 +133,9 @@ def blur_text(text: str, ratio: float, seed: int = 0) -> tuple[str, bool]:
         head = segments[0].strip().rstrip("，,、；;")
         return f"{head}……（后面的，想不起来了）", True
 
-    drop_n = int(round(len(segments) * ratio))
+    # 用 floor 而不是 round：round 在 .5 处向偶数取整（round(2.5)=2、round(1.5)=2），
+    # "模糊度提高"在某些区间里不会增加擦除量，台阶不可预测（P3-2）。floor 单调不回退。
+    drop_n = math.floor(len(segments) * ratio)
     if drop_n > 0 and len(segments) > 1:
         drop_n = min(drop_n, len(segments) - 1)
         for i in rng.sample(range(len(segments)), drop_n):
@@ -184,9 +186,16 @@ def initial_strength(importance: float, emotion: str = "") -> float:
 
 def _age_hours(ts: str, now: datetime) -> float:
     try:
-        then = datetime.fromisoformat(ts)
+        then = datetime.fromisoformat(str(ts).replace(" ", "T")[:19])
     except (TypeError, ValueError):
         return 0.0
+    # 库里混进带时区的时间戳（手工修库 / 外部导入 / 快照恢复）不该让 recall() 崩：
+    # human_age 早就防了这一手，这里照抄同样的归一化 —— aware 的一侧丢掉 tz，
+    # 两边按同一个本地时间轴算。宁可差几小时，也不能让整条对话路径抛 TypeError。
+    if then.tzinfo is not None and now.tzinfo is None:
+        then = then.replace(tzinfo=None)
+    elif then.tzinfo is None and now.tzinfo is not None:
+        now = now.replace(tzinfo=None)
     return max(0.0, (now - then).total_seconds() / 3600.0)
 
 
@@ -398,8 +407,15 @@ def recall(
         seed = int(mem["id"]) * 7919 + zlib.crc32(stage.name.encode("utf-8"))
         text, blurred = blur_text(str(mem.get("summary", "")), blur, seed)
         if len(text) > stage.max_chars:
-            text = text[: stage.max_chars].rstrip() + "……"
-            blurred = True
+            # 截断只是"显示空间不够"，**不是**"被模糊了"：blurred 只由 blur_text 决定。
+            # 以前截断后强行置 blurred=True，于是 core 记忆在 terminal 阶段明明 blur=0
+            # 却被标成"已模糊"，和 README「内核记忆永不含糊」相反（P2-1）。
+            # 长度也要真的不超过配置值：预算是 max_chars-1 加一个省略号。
+            budget = int(stage.max_chars)
+            if budget >= 2:
+                text = text[: budget - 1].rstrip() + "……"
+            else:
+                text = text[: max(0, budget)]
         retention = retention_of(mem, cfg, now)
         results.append(
             Recalled(

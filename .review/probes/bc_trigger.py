@@ -128,15 +128,20 @@ check("4a 普通旁听一句：零模型调用", ck.total == 0, f"total={ck.tota
 print(f"      计数：chat={ck.chat_calls} tools={ck.tool_calls} extract={ck.extract_calls} "
       f"name={ck.name_calls} rewrite={ck.rewrite_calls}")
 
-# 4b. 短句里带自我介绍标志词 → learn_name 会调模型（在 log_only 判断之前！）
+# 4b. 期望翻转（lead 授权，2026-10-10）：修前这条断言"短句里的自我介绍标志词会让旁听也调一次模型"，
+#     那是 P1-14 的一半根因（learn_name 跑在 log_only 判定之前）。修后旁听只走正则，不再调模型。
 before = ck.name_calls
 h.handle("我是来看热闹的", user_id="STRANGER", scene="group", group_id="GZ",
          speaker_name="阿伟", log_only=True, mid="z2")
-check("4b ★ 旁听一句「我是来看热闹的」也调了模型（名字判定）", ck.name_calls > before,
-      f"name_calls {before} -> {ck.name_calls}")
+check("4b ★ 旁听一句「我是来看热闹的」不再调模型（名字判定只走正则）",
+      ck.name_calls == before and ck.total == before,
+      f"name_calls {before} -> {ck.name_calls}，total={ck.total}")
 print(f"      详情：chat={ck.chat_calls} extract={ck.extract_calls} name={ck.name_calls}")
 
-# 4c. 攒够 consolidate_every(=8) 条旁听 → consolidate 调模型
+# 4c. 期望翻转（lead 授权，2026-10-10）：修前"旁听到第 8 条当场触发一次记忆整理"，
+#     等于大群里每 consolidate_every 条消息一次 API 调用，与"零 token"直接相反（P1-14）。
+#     修后旁听只留待整理标记，由搭档那一轮 / 退出路径统一整理——所以这里要同时验两件事：
+#     ① 旁听期间一次整理都没有；② 搭档那一轮到来时，群聊记忆**照旧生成**（不能变成永不整理）。
 h2 = Giftia(env("zero2"), llm=Count(env("zero2").model))
 h2.set_handler_id("OWNER")
 ck2: Count = h2.llm  # type: ignore[assignment]
@@ -145,8 +150,16 @@ for i in range(10):
     h2.handle(f"群里闲聊第{i}句，聊的是周末怎么过", user_id="STRANGER", scene="group",
               group_id="G2", speaker_name="阿伟", log_only=True, mid=f"y{i}")
     curve.append(ck2.extract_calls)
-check("4c ★ 旁听到第 8 条触发一次记忆整理（extract_memories）", curve[7] > curve[0],
+check("4c ★ 旁听期间一次记忆整理都不做（攒着）", all(c == 0 for c in curve),
       f"extract_calls 曲线={curve}")
+check("4c' 旁听攒下来的会话被记进了待整理标记", bool(h2._listen_pending()),
+      str(h2._listen_pending()))
+pending_before = ck2.extract_calls
+h2.handle("在吗", user_id="OWNER")      # 搭档那一轮：统一补整理
+group_mems = h2.store.active_memories(1, view=[("group", "G2")])
+check("4c'' ★ 搭档那一轮把旁听补整理成记忆（群聊记忆不会永远不生成）",
+      ck2.extract_calls > pending_before and len(group_mems) > 0,
+      f"extract {pending_before} -> {ck2.extract_calls}，group 记忆 {len(group_mems)} 条")
 print(f"      每收一条旁听后的 extract_calls：{curve}")
 print(f"      （配置 consolidate_every={h2.settings.memory.consolidate_every}）")
 
