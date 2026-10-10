@@ -656,11 +656,43 @@ ssh root@你的服务器IP
 cd /tmp/giftia && sudo bash deploy/setup.sh
 ```
 
+#### 如果服务器连不上 GitHub（国内机器常见）
+
+`git clone` 在腾讯云/阿里云的国内节点上经常直接超时（实测：`Failed to connect to
+github.com port 443 after 136041 ms`）。**这不影响部署**——代码不需要从 GitHub 拿，
+从你本机 scp 过去就行。推荐流程：
+
+```powershell
+# 本机（D:\ai chatbot）：打一个不含 data/ 与 .env 的包
+tar czf giftia-src.tar.gz --exclude=./data --exclude=./.git --exclude=./.env `
+    --exclude=./.review --exclude=./__pycache__ --exclude=*/__pycache__ .
+# 确认包里没有凭据（应该什么都不输出）
+tar tzf giftia-src.tar.gz | Select-String '\.env$|^\./data/'   # 期望：无输出
+scp giftia-src.tar.gz ubuntu@你的服务器IP:/tmp/
+
+# 服务器：解包 → 用服务同一个解释器自检 → 安装
+ssh ubuntu@你的服务器IP
+mkdir -p /tmp/giftia-src && tar xzf /tmp/giftia-src.tar.gz -C /tmp/giftia-src
+cd /tmp/giftia-src && /usr/bin/python3 tools/selftest.py    # 期望 304 项全绿
+sudo bash deploy/setup.sh
+```
+
+> **`.env` 永远不要打包传输**：它是你的真凭据，而且服务器上那份已经配好了（权限 600）。
+> `setup.sh` 也不会覆盖它、不会覆盖 `data/`，更不会覆盖你已经改过的 `config/`。
+
+**同步核对**（本机跑，只读）：
+
+| 方式 | 命令 |
+|---|---|
+| Windows 本机 | `.\tools\check_sync.ps1` |
+| 任意平台 / 想逐文件看 | `python .review\deploy\verify_parity.py ubuntu@你的服务器IP` |
+| 只比配置的**值**而不是文本 | `python .review\deploy\diff_config.py ubuntu@你的服务器IP` |
+
 `deploy/setup.sh` 一共六步，可以重复运行：
 
 1. 检查 Python 版本（要 3.11+，不够会直接拦住并说明怎么换镜像）
 2. 建系统用户 `giftia`
-3. 装到 `/opt/giftia`（**不覆盖已有的 `data/`**），`.env` 权限收成 600
+3. 装到 `/opt/giftia`（**不覆盖已有的 `data/`**，**也不覆盖已存在的 `config/`**），`.env` 权限收成 600
 4. **环境自检**：以 `giftia` 用户、用**与 systemd 服务相同的解释器**跑一遍项目自带的端到端测试（不需要联网、不需要 API key）。
    这一步过了，就说明这台机器上她能正常跑；没过会把最后 15 行日志打出来
 5. 装 systemd 服务并注册开机自启

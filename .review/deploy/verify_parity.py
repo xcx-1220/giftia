@@ -34,7 +34,8 @@ def sha(path: Path) -> str:
 def main() -> int:
     names = files()
     print(f"本地待比对文件：{len(names)} 个")
-    remote_cmd = f"cd {APP} && sha256sum " + " ".join(names)
+    # config/*.toml 在服务器上是 600（giftia 属主），要借 sudo 读
+    remote_cmd = f"cd {APP} && sudo sha256sum " + " ".join(names)
     proc = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", TARGET, remote_cmd],
         capture_output=True,
