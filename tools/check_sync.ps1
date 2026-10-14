@@ -23,7 +23,10 @@ try {
     $subject = (git log -1 --format=%s).Trim()
     Write-Host "本地 HEAD   $head  ($subject)"
 
-    $files = @(git ls-files)
+    # 只比对**会被部署的文件**。`.review/` 是代码审查的证据链（报告、探针、快照），
+    # 本来就不上服务器——以前拿 git ls-files 的全部去服务器算哈希，
+    # 审查一加文件（99 个）这个脚本就整个报错，等于同步检查失效了。
+    $files = @(git ls-files | Where-Object { $_ -notmatch '^\.review/' })
     if ($files.Count -eq 0) { throw "git 里没有任何文件" }
 
     Write-Host "本地文件    $($files.Count) 个，逐个算 SHA256…"
@@ -34,7 +37,9 @@ try {
     }
 
     # 远端一次性算出同一批文件的哈希（路径没有空格，所以能直接拼）
-    $raw = ssh -o BatchMode=yes -o ConnectTimeout=15 "$User@$Server" "cd $AppDir && sha256sum $($files -join ' ')" 2>&1
+    # config/*.toml 是 600 权限（里面有她的称呼、群号这类东西），普通用户读不到，
+    # 要 sudo。ubuntu 用户在 setup.sh 里已经配了免密 sudo。
+    $raw = ssh -o BatchMode=yes -o ConnectTimeout=15 "$User@$Server" "cd $AppDir && sudo sha256sum $($files -join ' ')" 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "连不上服务器或路径不对：" -ForegroundColor Red
         $raw | Select-Object -First 3 | ForEach-Object { Write-Host "  $_" }

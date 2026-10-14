@@ -865,11 +865,20 @@ class QQBot:
         if hub is not None:
             hub.note_reply_delivery(result.delivered)
 
-        # 她的"系统通知"（例如终端服务预告）另发一条，不混进她的台词。
+        # 她的"系统通知"另发一条，不混进她的台词。
         # 同一个 msg_id 的再次回复会自动用 msg_seq=2，避免被平台按重复消息拒掉。
+        #
+        # ★ 群里只发 [终端服务]（那是"她"的一部分），**内部提示一律不进群**：
+        #   `[记忆整理] 新增 1 条长期记忆`、`[记忆强化] 说出口了 1 条记忆` 这类是
+        #   运维信息，不是她说的话。真机上它们还抢了每分钟的发送额度，
+        #   把她真正要说的那句挤掉过（日志里 "每分钟最多 6 条，这句等不起先不发了"）。
+        #   群里还有别人，他们更不该看到"记忆整理"这种东西。
         if hub is not None:
+            prefixes = ("[终端服务]",) if kind == "group" else (
+                "[终端服务]", "[记忆整理]", "[记忆强化]",
+            )
             for note in hub.notices:
-                if note.startswith(("[终端服务]", "[记忆整理]", "[记忆强化]")):
+                if note.startswith(prefixes):
                     self.send(kind, target, note, msg_id)
 
     def respond_safely(
