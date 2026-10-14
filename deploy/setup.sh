@@ -75,6 +75,11 @@ if [ "$SRC_DIR" != "$APP_DIR" ]; then
       cp "$SRC_DIR/config/$f.example" "$APP_DIR/config/$f"
       echo "  种了一份 config/$f（模板；往里写覆盖就生效）"
     fi
+    # 模板本身也留一份在服务器上：README 让你"照 *.example 复制"，
+    # 不带上它就等于那句话没法照做（同步检查也会报"服务器少了这个文件"）。
+    if [ -f "$SRC_DIR/config/$f.example" ]; then
+      cp "$SRC_DIR/config/$f.example" "$APP_DIR/config/$f.example"
+    fi
   done
   echo "已从 $SRC_DIR 复制（data/ 不动；config 的仓库部分已更新，你的 *.local.toml 原样保留）"
 else
