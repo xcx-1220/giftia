@@ -12,3 +12,9 @@ venv/
 # 报告与探针脚本仍然入库：.review/findings、.review/probes、.review/evidence、
 # .review/fix-reports、.review/checks。
 .review/tmp/
+
+# IDE 的本地配置（路径、窗口布局、workspace.xml）——纯粹是机器的本地状态，
+# 而且里面常带绝对路径。不进版本库。
+.idea/
+.vscode/
+*.iml

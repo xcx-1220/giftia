@@ -163,6 +163,20 @@ def collect_dataclasses(tree: ast.Module) -> dict[str, DataclassInfo]:
     return out
 
 
+# `tools/` 下的脚本分两类。要审的是**测试脚本**：它们必须至少有一条断言，
+# 否则跑完永远是绿的，等于没测。
+# 另一类是"工具/演示"，本来就没有可断言的东西 —— 手工列在这里，
+# 而不是让审计脚本去猜"这看起来像不像测试"（猜错就会悄悄放过真正的测试脚本）。
+TOOL_SCRIPTS = {
+    "check_deploy.py",      # 部署体检：打印环境/依赖状态
+    "demo_life.py",         # 演示：跑一遍她的一生给人看
+    "live_check.py",        # 连真模型的联调打印工具
+    "reconcile_live.py",    # 对真实数据库手工跑一次整理
+    "show_prompt.py",       # 打印实际注入的提示词，给人看
+    "ws_testserver.py",     # WebSocket 测试用的假服务端（工具，被别的测试调用）
+}
+
+
 def group_names(classes: dict[str, DataclassInfo]) -> dict[str, str]:
     """Settings 里的组名 → 数据类名。
 
@@ -208,25 +222,6 @@ def _path_of(node: ast.AST) -> tuple[tuple[str, ...], bool]:
     return tuple(parts), bool(parts)
 
 
-def _is_method_call(tree: ast.Module, line: int, name: str) -> bool:
-    """这一行里 `name(...)` 是不是被当成方法调用了。
-
-    `r.memory.get("summary")` 的 `.get` 是 dict 的方法，不是配置字段；
-    `settings.runtime.handler_name.strip()` 的 `.strip` 同理。
-    这类链尾访问不能拿去比字段名。
-    """
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == name
-            and node.func.lineno == line
-        ):
-            return True
-    return False
-
-
-
 class FileScan:
     """一个文件的源码级视图：别名表 + 属性读取。
 
@@ -265,6 +260,13 @@ class FileScan:
             if prev is None or len(parts) > len(prev[0]):
                 best[key] = (parts, node.lineno)
         self.reads = sorted(best.values(), key=lambda item: item[1])
+        # 这一行里 `xxx(...)` 被当成方法调用的那些名字：`r.memory.get("summary")` 的
+        # `.get` 是 dict 的方法，`settings.runtime.handler_name.strip()` 的 `.strip`
+        # 是 str 的方法，都不是配置字段，不能拿去比字段名。
+        self.called: set[tuple[int, str]] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.called.add((node.func.lineno, node.func.attr))
 
     def _collect_aliases(self) -> None:
         """只认"名字/属性 ← 另一条属性链"的直接赋值，以及形参上的类型注解。
@@ -353,12 +355,6 @@ class FileScan:
         if parts[0] not in self._config_roots:        # 链首得真是个配置对象
             return None
         return head_cls, (attr,)                      # cfg.w_bm25
-
-
-def stub_scan(path: Path, tree: ast.Module) -> FileScan:
-    """构造一个不建别名表的轻量扫描（给"这个属性名到底在别处读过没有"用）。"""
-    scan = FileScan(path, tree)
-    return scan
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -512,11 +508,6 @@ def main() -> int:
     FileScan._config_roots = roots
 
     # 所有属性读取：用于"声明了但没读过"的判定（跨文件，含 tools/）
-    read_parts: set[tuple[str, ...]] = set()
-    for scan in [*scans, *other_scans]:
-        for parts, _ln in scan.reads:
-            read_parts.add(parts)
-    raw_dotted: set[str] = {f".{'.'.join(p)}" for p in read_parts}
     all_source = "\n".join(
         p.read_text(encoding="utf-8", errors="replace")
         for p in [*py_files(SCAN_DIRS), *py_files([ROOT / "tools", ROOT])]
@@ -540,7 +531,7 @@ def main() -> int:
         ):
             return True
         # `r.memory.get(...)`：链尾是 dict/str 的方法，读的是数据不是配置字段
-        return _is_method_call(scan.tree, lineno, parts[-1])
+        return (lineno, parts[-1]) in scan.called
 
     for scan in scans:                     # 只看 giftia/ 与 adapters/
         for parts, lineno in scan.reads:
@@ -549,8 +540,8 @@ def main() -> int:
                 continue
             cls_name, fields = resolved
             attr = fields[0]
-            if attr in SAFE_NAMES or is_intermediate(scan, parts, lineno):
-                continue
+            if attr in SAFE_NAMES or attr.startswith("__") or is_intermediate(scan, parts, lineno):
+                continue                       # `model.__dict__` 这类通用属性，不是字段读取
             info = classes[cls_name]
             if info.has(attr):
                 count_1 += 1
@@ -560,19 +551,13 @@ def main() -> int:
                     f"{scan.rel}:{lineno} 读了 {'.'.join(parts)}"
                     f"，但 {cls_name} 没有 {attr}（声明于 config.py:{info.lineno}）"
                 )
-    # ⚠ 这一类目前**降级成提示**，不计失败：
-    # 匹配器对 `obj.attr.attr` 这种形式会猜错——实测它把 `before.stage.key`
-    # 里的 `before`（一个 Bond）当成了 Stage，把 `settings.relationship`
-    # 当成了 RelationshipConfig，于是报了一串并不存在的"读了不存在的字段"。
-    # 真正会崩的是 `settings.<组>.<字段>` 这条路，那条已经在上面的 count_1 里
-    # 逐处核对过了；等我修好链式解析再把它提回 FAIL。
-    if bad_reads:
-        note(
-            "疑似读了不存在的配置字段（**链式对象会误报，仅供参考**）："
-            + "；".join(bad_reads[:8])
-        )
-    else:
-        check("配置项读取全部能在 dataclass 里找到声明", True)
+    # 这一类是**严重问题，计入 FAIL**：读了不存在的字段 = AttributeError，
+    # 而且只在走到那一行的用户路径上才炸（本地随手点两下不一定碰得到）。
+    check(
+        "配置项读取全部能在 dataclass 里找到声明（读了不存在的字段 = AttributeError，上线才炸）",
+        not bad_reads,
+        "；".join(bad_reads[:8]),
+    )
     note(f"逐处核对了 {count_1} 处 settings.<组>.<字段> / cfg.<字段> 读取")
     # 这条是审计脚本自己的护栏：如果哪天一条读取都解析不出来了（AST 结构变了、
     # 组名改了、路径算错了），上面那条"没有坏读取"就会变成一句廉价的 PASS。
@@ -633,7 +618,10 @@ def main() -> int:
             if pinfo is not None:
                 for key in praw:
                     if not pinfo.has(str(key)):
-                        extra_keys.append(f"persona.toml {key}（Persona 没有这个字段，会被静默忽略）")
+                        extra_keys.append(
+                            f"persona.toml {key}（Persona 没有这个字段，不会被 Persona 读到；"
+                            "若它由 load_settings 另行解析则可忽略）"
+                        )
         if extra_keys:
             hint(f"配置文件里有 {len(extra_keys)} 个键在 dataclass 里不存在（写了也不会生效）",
                  "；".join(extra_keys))
@@ -726,9 +714,10 @@ def main() -> int:
              "send() 不支持，所以故意直连")
 
     # ── 4. 测试脚本断言 ──────────────────────────────────────────
-    print("\n4. tools/ 下每个脚本至少一条断言")
+    print("\n4. tools/ 下每个测试脚本至少一条断言")
     tools_dir = ROOT / "tools"
     no_assert: list[str] = []
+    assert_in_tools: list[str] = []
     scanned = 0
     for path in sorted(tools_dir.glob("*.py")) if tools_dir.exists() else []:
         if path.name == "audit.py":                # 本文件：审计工具，不给自己打勾
@@ -736,14 +725,23 @@ def main() -> int:
         tree = _parse(path)
         if tree is None:
             continue
+        n_assert = assert_calls(path, tree)
+        if path.name in TOOL_SCRIPTS:
+            if n_assert:
+                assert_in_tools.append(path.name)  # 工具脚本悄悄长出了断言 → 该改名/该挪走
+            continue
         scanned += 1
-        if assert_calls(path, tree) == 0:
+        if n_assert == 0:
             no_assert.append(_rel(path))
-    if no_assert:
-        hint(f"{len(no_assert)} 个脚本没有任何 check() 断言（跑完永远是绿的，等于没测）",
-             "、".join(no_assert))
-    else:
-        check(f"tools/ 下 {scanned} 个脚本都有断言", True)
+    check(
+        f"tools/ 下 {scanned} 个测试脚本都至少有一条 check() 断言",
+        not no_assert,
+        "没有断言、跑完永远是绿的（要么补断言，要么按工具脚本登记进 TOOL_SCRIPTS）："
+        + "、".join(no_assert),
+    )
+    if assert_in_tools:
+        hint("这几个脚本登记成了工具脚本，却又带了断言（说明它其实是测试）",
+             "、".join(assert_in_tools))
 
     # ── 汇总 ────────────────────────────────────────────────────
     print("\n" + "═" * 66)
