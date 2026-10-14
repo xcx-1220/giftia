@@ -13,3 +13,4 @@
 *.json        text
 *.toml        text
 *.py          text
+*.sh text eol=lf

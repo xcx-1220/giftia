@@ -1661,10 +1661,24 @@ def main() -> int:
     cfg_dir = tmp / "layered"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     # 用仓库**真实**的配置文件当基准（自己手写一份精简版会缺 [[degradation.stages]]
-    # 这类必需段，测的就不是真实情况了）
+    # 这类必需段，测的就不是真实情况了）。
+    # ★ 路径必须锚定到项目根，不能用相对路径：部署时自检是
+    #   `sudo -u giftia python /opt/giftia/tools/selftest.py` 跑的，
+    #   **工作目录不是 /opt/giftia**（是部署源目录），相对路径会读到别人的那份、
+    #   甚至因权限读不到而让整台机器部署失败（真踩过）。
     import shutil
-    shutil.copy("config/settings.toml", cfg_dir / "settings.toml")
-    shutil.copy("config/persona.toml", cfg_dir / "persona.toml")
+    project_root = Path(__file__).resolve().parent.parent
+    try:
+        shutil.copy(project_root / "config" / "settings.toml", cfg_dir / "settings.toml")
+        shutil.copy(project_root / "config" / "persona.toml", cfg_dir / "persona.toml")
+    except OSError as exc:
+        check(f"分层配置：读不到 config/（{type(exc).__name__}），跳过这一节", True, str(exc))
+        brain.store.close()
+        brain2.store.close()
+        print("\n" + "═" * 52)
+        print(f"通过 {PASS} 项，失败 {FAIL} 项")
+        print("═" * 52)
+        return 1 if FAIL else 0
 
     base = _load_cfg(cfg_dir / "settings.toml", cfg_dir / "persona.toml",
                      lifespan_override=81920.0)
