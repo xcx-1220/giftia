@@ -75,6 +75,39 @@ def effective_max_per_30_days(settings: Settings) -> int:
     return base
 
 
+def _minutes(hhmm: str) -> int | None:
+    """把 "23:30" 变成分钟数。解析不了返回 None（宁可不生效，也别乱禁）。"""
+    raw = str(hhmm or "").strip()
+    if ":" not in raw:
+        return None
+    try:
+        hour, minute = raw.split(":", 1)
+        h, m = int(hour), int(minute)
+    except ValueError:
+        return None
+    if not (0 <= h < 24 and 0 <= m < 60):
+        return None
+    return h * 60 + m
+
+
+def in_quiet_hours(settings: Settings, now: datetime) -> bool:
+    """现在是不是她的「安静时段」（这段时间里她不主动开口）。
+
+    真机数据：她会凌晨 5 点来找人 —— `outreach:log` 里有 01:57 / 05:00 / 00:07
+    这样的时间戳。主动是好事，半夜吵醒人就变成坏事了。
+
+    时段是**跨午夜**的（默认 23:30 ~ 08:00 横跨两天），所以要分两段比。
+    """
+    start = _minutes(getattr(settings.outreach, "quiet_from", ""))
+    end = _minutes(getattr(settings.outreach, "quiet_to", ""))
+    if start is None or end is None or start == end:
+        return False
+    now_min = now.hour * 60 + now.minute
+    if start < end:
+        return start <= now_min < end
+    return now_min >= start or now_min < end
+
+
 def quota_state(settings: Settings, store: Store, now: datetime) -> tuple[int, int, str]:
     """返回 (30 天内已发, 还剩几条, 下次最早可发的时间串)。
 
@@ -195,6 +228,15 @@ def plan(
             urgency=1.0,
         )
 
+    # ★ 安静时段：这段时间里她不主动开口。
+    # **放在这里**——紧跟在 near_end 之后、所有其他理由之前。
+    # 「快到终端服务了」是唯一的例外（上面已经返回了）；其余理由
+    # ——"明天要办的事""昨天的事""她的心情""纪念日""梦""想你了"——
+    # 都不值得在凌晨 5 点把人吵醒。
+    # 真机日志里她有 01:57 / 05:00 / 00:07 这样的主动时间戳。
+    if in_quiet_hours(settings, now):
+        return None
+
     # 2) 他的大日子
     for occ in occasions or []:
         if occ.kind == "big_day":
@@ -205,7 +247,7 @@ def plan(
                 urgency=0.8,
             )
 
-    # 2) 昨天/前天那件事办得怎么样（"她记得的事到点主动问"）
+    # 3) 昨天/前天那件事办得怎么样（"她记得的事到点主动问"）
     for occ in occasions or []:
         if occ.kind == "follow_up":
             return OutreachPlan(
@@ -215,7 +257,7 @@ def plan(
                 urgency=0.75,
             )
 
-    # 3) 她自己的心情（"主动分享自己"）
+    # 4) 她自己的心情（"主动分享自己"）
     #    不安那种心情不往外说——那是终端服务迫近，只在私聊、且走 near_end 那条路。
     #    **两道闸**（审查 P1-16）：
     #      ① 心情必须还在有效期内（过期的软心情不算"她今天的样子"）；
@@ -249,7 +291,7 @@ def plan(
                     urgency=0.55,
                 )
 
-    # 4) 纪念日 —— 只认"今天正好是"的那一个。
+    # 5) 纪念日 —— 只认"今天正好是"的那一个。
     #    错过了几天再补一句"我们认识第 3 天了"很怪；补记留给当面说。
     for occ in occasions or []:
         if occ.kind != "milestone":
@@ -263,7 +305,7 @@ def plan(
             urgency=0.6,
         )
 
-    # 4) 做了梦还没讲（只对搭档说）
+    # 6) 做了梦还没讲（只对搭档说）
     if not for_group and dream is not None:
         return OutreachPlan(
             reason="dream",
@@ -278,7 +320,7 @@ def plan(
             dream_id=int(getattr(dream, "id", 0) or 0),
         )
 
-    # 5) 太久没说话（只对搭档说；群里"没人说话"不该由她来打破）
+    # 7) 太久没说话（只对搭档说；群里"没人说话"不该由她来打破）
     if not for_group:
         last_ts = store.last_message_ts(instance_no)
         if last_ts:

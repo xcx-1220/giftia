@@ -1585,6 +1585,67 @@ def main() -> int:
           tscript.count("——") == 6 and "10月7日（周三）" in tscript,
           tscript.replace("\n", " / ")[:110])
 
+    # ══ 34. 安静时段：半夜不主动吵人 ═══════════════════════════
+    print("\n34. 安静时段（半夜不主动吵人）")
+    from giftia.outreach import in_quiet_hours as _quiet
+
+    qs = make_settings(tmp / "quiet", 81920.0)
+    qm = Giftia(qs, llm=MockLLM(qs.model))
+    qm.set_handler_id("OWNER")
+    qm.handle("我叫椎名", user_id="OWNER")
+
+    def at(hour, minute=0):
+        return datetime(2026, 10, 14, hour, minute)
+
+    check("★ 23:30~08:00 是安静的（跨午夜）",
+          _quiet(qs, at(0)) and _quiet(qs, at(5))
+          and _quiet(qs, at(23, 30)) and _quiet(qs, at(23, 59)),
+          "0点/5点/23:30/23:59")
+    check("边界正确：08:00 可以、23:29 可以",
+          not _quiet(qs, at(8)) and not _quiet(qs, at(23, 29)))
+    check("白天当然可以", not _quiet(qs, at(12)) and not _quiet(qs, at(20)))
+
+    off = dataclasses.replace(
+        qs, outreach=dataclasses.replace(
+            qs.outreach, quiet_from="", quiet_to="")
+    )
+    check("留空 = 不设安静时段（想让她随时能来就留空）", not _quiet(off, at(3)))
+    bad = dataclasses.replace(
+        qs, outreach=dataclasses.replace(
+            qs.outreach, quiet_from="晚上", quiet_to="08:00")
+    )
+    check("格式写错也不乱禁（宁可不生效，也别把她锁死）", not _quiet(bad, at(3)))
+
+    class _NightClock:
+        """把"现在"钉在凌晨 5 点：安静时段里不该主动，"快到终端服务"例外。"""
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def now(self):
+            return at(5)
+
+        def iso(self, when=None):
+            return self.inner.iso(when or at(5))
+
+    night_plan = outreach_mod.plan(
+        qs, qm.store, _NightClock(qm.clock), life=qm.status(), occasions=[],
+        mood=None, instance_no=qm.instance_no, force=True,
+    )
+    check("★ 凌晨 5 点她不会主动开口",
+          night_plan is None, night_plan.reason if night_plan else "None（正好）")
+
+    near = dataclasses.replace(
+        qs, mood=dataclasses.replace(qs.mood, uneasy_hours=99999.0)
+    )
+    urgent = outreach_mod.plan(
+        near, qm.store, _NightClock(qm.clock), life=qm.status(), occasions=[],
+        mood=None, instance_no=qm.instance_no, force=True,
+    )
+    check("★ 但「快到终端服务了」是例外——那时候半夜她也会开口",
+          urgent is not None and urgent.reason == "near_end",
+          urgent.reason if urgent else "None")
+
     brain.store.close()
     brain2.store.close()
 
