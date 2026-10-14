@@ -1646,6 +1646,56 @@ def main() -> int:
           urgent is not None and urgent.reason == "near_end",
           urgent.reason if urgent else "None")
 
+    # ══ 35. 分层配置：仓库默认值 + 你自己的 local 覆盖 ═════════
+    print("\n35. 分层配置（settings.local.toml / persona.local.toml）")
+    from giftia.config import _deep_merge, load_settings as _load_cfg
+
+    check("表递归合并（不是整段替换）",
+          _deep_merge({"a": 1, "s": {"x": 1, "y": 2}}, {"s": {"y": 9}, "b": 2})
+          == {"a": 1, "s": {"x": 1, "y": 9}, "b": 2})
+    check("列表是替换不是拼接（keywords 你写一份就该是你那份）",
+          _deep_merge({"k": ["a", "b"]}, {"k": ["c"]}) == {"k": ["c"]})
+    check("类型变了就整个替换（表 → 标量）",
+          _deep_merge({"s": {"x": 1}}, {"s": "nope"}) == {"s": "nope"})
+
+    cfg_dir = tmp / "layered"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    # 用仓库**真实**的配置文件当基准（自己手写一份精简版会缺 [[degradation.stages]]
+    # 这类必需段，测的就不是真实情况了）
+    import shutil
+    shutil.copy("config/settings.toml", cfg_dir / "settings.toml")
+    shutil.copy("config/persona.toml", cfg_dir / "persona.toml")
+
+    base = _load_cfg(cfg_dir / "settings.toml", cfg_dir / "persona.toml",
+                     lifespan_override=81920.0)
+    base_tier = base.runtime.response_tier
+    base_speak = base.runtime.speak_max_per_day
+    check("没有 local 文件时全用仓库值", base_tier > 0, f"tier={base_tier}")
+
+    (cfg_dir / "settings.local.toml").write_text(
+        "[runtime]\nresponse_tier = 7\n", encoding="utf-8"
+    )
+    (cfg_dir / "persona.local.toml").write_text(
+        'core = "你自己的内核"\n', encoding="utf-8"
+    )
+    over = _load_cfg(cfg_dir / "settings.toml", cfg_dir / "persona.toml",
+                     lifespan_override=81920.0)
+    check("★ 你写的值优先（response_tier = 7 压过仓库值）",
+          over.runtime.response_tier == 7, str(over.runtime.response_tier))
+    check("★ 你没写的项仍然用仓库默认值（这叫合并，不是替换）",
+          over.runtime.speak_max_per_day == base_speak
+          and over.outreach.quiet_from == base.outreach.quiet_from,
+          f"speak={over.runtime.speak_max_per_day} quiet={over.outreach.quiet_from}")
+    check("人格也能覆盖", over.persona.core == "你自己的内核", over.persona.core[:12])
+    check("人格里没写的项还在（name 仍是仓库的）",
+          over.persona.name == base.persona.name, over.persona.name)
+
+    (cfg_dir / "settings.local.toml").write_text("这不是 toml {{{", encoding="utf-8")
+    broken = _load_cfg(cfg_dir / "settings.toml", cfg_dir / "persona.toml",
+                       lifespan_override=81920.0)
+    check("★ local 文件写坏了只退回仓库默认值，不让进程起不来",
+          broken.runtime.response_tier == base_tier, str(broken.runtime.response_tier))
+
     brain.store.close()
     brain2.store.close()
 

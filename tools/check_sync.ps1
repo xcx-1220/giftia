@@ -26,18 +26,18 @@ try {
     # 只比对**会被部署的文件**。`.review/` 是代码审查的证据链（报告、探针、快照），
     # 本来就不上服务器——以前拿 git ls-files 的全部去服务器算哈希，
     # 审查一加文件（99 个）这个脚本就整个报错，等于同步检查失效了。
-    # 只比对**会被部署的文件**。`.review/` 是代码审查的证据链（报告、探针、快照），
-    # 本来就不上服务器——以前拿 git ls-files 的全部去服务器算哈希，
-    # 审查一加文件（99 个）这个脚本就整个报错，等于同步检查失效了。
-    $files = @(git ls-files | Where-Object { $_ -notmatch '^\.review/' })
+    # 只比对**会被部署的文件**：
+    #  · `.review/` 是代码审查的证据链（报告、探针、快照），本来就不上服务器
+    #    ——以前拿 git ls-files 的全部去服务器算哈希，审查一加文件（99 个）
+    #    这个脚本就整个报错，等于同步检查失效了。
+    #  · `config/*.local.toml` 是**你自己**的覆盖，服务器上的那份不该跟仓库一样。
+    # config/settings.toml 与 config/persona.toml **要**比：分层之后它们是仓库的
+    # 默认值文件，部署会覆盖，理应一致（以前它们永远差一条，让这个检查常年报红，
+    # 一个永远报红的检查等于没有检查）。
+    $files = @(git ls-files | Where-Object {
+        $_ -notmatch '^\.review/' -and $_ -notmatch '\.local\.toml$'
+    })
     if ($files.Count -eq 0) { throw "git 里没有任何文件" }
-
-    # 配置文件**单独看**：部署脚本故意不覆盖服务器上已有的 config/*.toml
-    # （那是你自己调过的东西——比如 response_tier）。它们内容不同是**预期行为**，
-    # 不该算"不一致"，否则这个脚本永远报红，久了就没人信它了。
-    # 但仍然列出来：你要是想知道"默认配置改过没有"，看得到。
-    $configFiles = @('config/settings.toml', 'config/persona.toml')
-    $files = @($files | Where-Object { $configFiles -notcontains $_ })
 
     Write-Host "本地文件    $($files.Count) 个，逐个算 SHA256…"
     $local = @{}

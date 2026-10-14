@@ -43,8 +43,14 @@ fi
 say "3/6 安装到 $APP_DIR"
 mkdir -p "$APP_DIR"
 if [ "$SRC_DIR" != "$APP_DIR" ]; then
-  # 代码全量覆盖；**config/ 单独处理**：persona.toml / settings.toml 是"她是谁"，
-  # 服务器上多半被改过（改人格、调退化曲线），重复运行 setup.sh 不该把改动冲掉。
+  # 代码全量覆盖；config/ 单独处理，而且**分两层**：
+  #   persona.toml / settings.toml        ← 仓库的东西（默认值 + 文档），跟部署走
+  #   *.local.toml                        ← 你自己的调整，永不覆盖
+  #
+  # 以前是"整份 toml 都不覆盖"，看着安全，其实有个很难发现的坑：
+  # toml 里写了某个键，它就**压过代码默认值** —— 于是代码里改好的默认值
+  # 部署上去根本没生效，还没有任何提示（键存在就优先）。
+  # 分层之后：默认值改动自动生效，你的调整也永远安全。
   tar -C "$SRC_DIR" \
       --exclude=./data \
       --exclude=./.git \
@@ -55,14 +61,22 @@ if [ "$SRC_DIR" != "$APP_DIR" ]; then
       -cf - . | tar -C "$APP_DIR" -xf -
   mkdir -p "$APP_DIR/config"
   for f in persona.toml settings.toml; do
+    if [ -f "$APP_DIR/config/$f" ] && ! cmp -s "$SRC_DIR/config/$f" "$APP_DIR/config/$f"; then
+      # 内容真的变了才备份；顺便把"你手写的值"留个后路（迁移期很有用）
+      cp "$APP_DIR/config/$f" "$APP_DIR/config/$f.bak-$(date +%Y%m%d-%H%M%S)"
+      echo "  旧的 config/$f 有改动，已备份为 .bak-…"
+    fi
+    cp "$SRC_DIR/config/$f" "$APP_DIR/config/$f"
+  done
+  for f in persona.local.toml settings.local.toml; do
     if [ -f "$APP_DIR/config/$f" ]; then
-      echo "  保留已有的 config/$f（不覆盖）"
-    else
-      cp "$SRC_DIR/config/$f" "$APP_DIR/config/$f"
-      echo "  补上 config/$f（仓库默认值）"
+      echo "  保留你自己的 config/$f"
+    elif [ -f "$SRC_DIR/config/$f.example" ]; then
+      cp "$SRC_DIR/config/$f.example" "$APP_DIR/config/$f"
+      echo "  种了一份 config/$f（模板；往里写覆盖就生效）"
     fi
   done
-  echo "已从 $SRC_DIR 复制（data/ 与已有 config/ 都不动）"
+  echo "已从 $SRC_DIR 复制（data/ 不动；config 的仓库部分已更新，你的 *.local.toml 原样保留）"
 else
   echo "源目录就是 $APP_DIR，跳过复制"
 fi

@@ -484,6 +484,24 @@ python run.py --reset --yes           # 清空重来
 
 ## 4. 调她
 
+> **改之前先知道这两份各是谁的：**
+>
+> | 文件 | 谁的 | 部署时 |
+> |---|---|---|
+> | `config/settings.toml`、`config/persona.toml` | **仓库的**（默认值 + 文档） | **会跟着更新** |
+> | `config/settings.local.toml`、`config/persona.local.toml` | **你自己的** | **永不覆盖** |
+>
+> 你自己的调整写进 `.local.toml`（照 `*.local.toml.example` 复制一份，**只写你要改的那几项**）：
+>
+> ```toml
+> # config/settings.local.toml
+> [runtime]
+> response_tier = 70
+> ```
+>
+> 没写的项自动用仓库默认值 —— 所以我以后改默认值你能**自动拿到**，
+> 你写下的值也永远是你的。（改完 `systemctl restart giftia-qq` 生效。）
+
 **换人格** → `config/persona.toml`：名字、型号、称呼、开场白、人格内核。改这个文件不需要动任何代码。
 **换行为** → `config/settings.toml`：
 

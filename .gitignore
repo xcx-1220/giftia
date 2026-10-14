@@ -18,3 +18,7 @@ venv/
 .idea/
 .vscode/
 *.iml
+
+# 你自己的配置覆盖（部署永不碰，也不该进版本库）——
+# 模板 config/*.local.toml.example 是入库的，照它复制一份就能用。
+config/*.local.toml

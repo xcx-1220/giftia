@@ -522,6 +522,50 @@ def _read_toml(path: Path) -> dict:
         return tomllib.load(fh)
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """把 override 叠在 base 上：**表递归合并，其它一律替换**。
+
+    为什么要分层：`settings.toml` / `persona.toml` 是仓库的东西（文档 + 默认值），
+    部署时会覆盖；你自己的调整写在 `*.local.toml` 里，部署**永不碰**。
+
+    以前是"整份 toml 都不覆盖"，看着安全，其实有个很难发现的坑：
+    toml 里写了某个键，它就**压过代码默认值**——于是我在 config.py 里
+    修好一个默认阈值、测试全绿、部署上去，**服务器上那个修复根本没生效**，
+    而且没有任何提示（键存在就优先）。分层之后：默认值改动自动生效，
+    你的调整也永远安全。
+
+    列表是替换不是拼接：`keywords = [...]` 你写一份就该是你那份，
+    合并出个"两边的并集"只会让人意外。
+    """
+    merged = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _read_toml_layered(path: Path) -> dict:
+    """读 <name>.toml，再把同目录的 <name>.local.toml 叠上去（后者可不存在）。
+
+    缺失的 local 文件不是错误——大多数人不会去建它，那就全用仓库默认值。
+    """
+    base = _read_toml(path)
+    local = path.with_name(path.stem + ".local" + path.suffix)
+    if not local.exists():
+        return base
+    try:
+        overrides = _read_toml(local)
+    except Exception as exc:  # 你的文件写坏了要吼一声，但不能让整个进程起不来
+        print(f"[config] {local.name} 读不了（{exc}），这次只用仓库默认值", file=sys.stderr)
+        return base
+    if not overrides:
+        return base
+    print(f"[config] 已叠加你自己的 {local.name}（{len(overrides)} 段）")
+    return _deep_merge(base, overrides)
+
+
 def _sub(cls, data: dict, where: str = "", *, ignore: set[str] | None = None):
     """只取数据类里声明过的字段，多余的键**打印警告**（以前是静默忽略）。
 
@@ -667,8 +711,10 @@ def load_settings(
     force_mock: bool = False,
 ) -> Settings:
     load_env_file()  # 让 python run.py 直接可用，不必每次手动设环境变量
-    raw = _read_toml(settings_path or (CONFIG_DIR / "settings.toml"))
-    praw = _read_toml(persona_path or (CONFIG_DIR / "persona.toml"))
+    # 分层：仓库的 settings.toml / persona.toml 是默认值与文档（部署会覆盖），
+    # 你自己的调整写在 settings.local.toml / persona.local.toml（部署永不碰）。
+    raw = _read_toml_layered(settings_path or (CONFIG_DIR / "settings.toml"))
+    praw = _read_toml_layered(persona_path or (CONFIG_DIR / "persona.toml"))
 
     model = _sub(ModelConfig, raw.get("model", {}), where="settings.toml [model]")
     if force_mock:
