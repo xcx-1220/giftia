@@ -705,6 +705,20 @@ def main() -> int:
 
     brain_mod.reset_default()
 
+    print("\n12. 内部提示不进群（真机踩过的坑）")
+    check("★ 群里只发「终端服务」，运维提示不发出去",
+          adapter.notice_prefixes("group") == ("[终端服务]",),
+          str(adapter.notice_prefixes("group")))
+    for note in ("[记忆整理] 新增 1 条长期记忆", "[记忆强化] 说出口了 1 条记忆"):
+        check(f"「{note[:6]}…」不会进群",
+              not note.startswith(adapter.notice_prefixes("group")))
+    check("「终端服务」进群（那是设定内的东西，属于她）",
+          "[终端服务] 还有 72 小时".startswith(adapter.notice_prefixes("group")))
+    check("私聊保持原样（给你看的，你自己决定）",
+          all(n.startswith(adapter.notice_prefixes("c2c"))
+              for n in ("[终端服务] x", "[记忆整理] y", "[记忆强化] z")),
+          str(adapter.notice_prefixes("c2c")))
+
     print("\n" + "═" * 52)
     print(f"通过 {PASS} 项，失败 {FAIL} 项")
     print("═" * 52)

@@ -115,6 +115,22 @@ class QQError(RuntimeError):
     pass
 
 
+def notice_prefixes(kind: str) -> tuple[str, ...]:
+    """哪几类"系统通知"可以当成她的消息发出去。
+
+    **群里只发 `[终端服务]`**——那是"她"的一部分（寿命、回收日这些设定内的东西）。
+    `[记忆整理] 新增 1 条长期记忆`、`[记忆强化] 说出口了 1 条记忆` 是**运维信息**：
+      · 不是她说的话，而且群里还有别人，他们更不该看到"记忆整理"这种东西；
+      · 更实际的是，它们会抢每分钟的发送额度 —— 真机日志里 9 次
+        "这条回复只送出去 0/1 段"，就是她真正要说的那句被这些提示挤掉了
+        （`[发送] 每分钟最多 6 条，这句等不起先不发了（[记忆强化] …）`）。
+    私聊保持原样：那是给你看的，你自己决定要不要。
+    """
+    if kind == "group":
+        return ("[终端服务]",)
+    return ("[终端服务]", "[记忆整理]", "[记忆强化]")
+
+
 class QQReconnect(QQError):
     """需要重建连接（可带 resume）。"""
 
@@ -874,9 +890,7 @@ class QQBot:
         #   把她真正要说的那句挤掉过（日志里 "每分钟最多 6 条，这句等不起先不发了"）。
         #   群里还有别人，他们更不该看到"记忆整理"这种东西。
         if hub is not None:
-            prefixes = ("[终端服务]",) if kind == "group" else (
-                "[终端服务]", "[记忆整理]", "[记忆强化]",
-            )
+            prefixes = notice_prefixes(kind)
             for note in hub.notices:
                 if note.startswith(prefixes):
                     self.send(kind, target, note, msg_id)
