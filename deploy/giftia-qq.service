@@ -18,7 +18,12 @@ WorkingDirectory=/opt/giftia
 
 # 零第三方依赖，直接用系统 python3（需要 3.11+，setup.sh 会检查）
 # 如果你把 python 装在别处，改这一行即可
-ExecStart=/usr/bin/python3 /opt/giftia/adapters/qq_official.py
+#
+# --web-port：同时开网站入口（**一个进程、两个入口**）。
+#   · HTTP 线程只入队，真正的执行在这个进程的主循环里 —— 她不是线程安全的
+#   · 只监听 127.0.0.1:8111，**不对外开任何端口**；公网走 cloudflared 隧道
+#   · 门禁口令在 /opt/giftia/.env 的 AILA_WEB_SECRET（没配就不开这个入口）
+ExecStart=/usr/bin/python3 /opt/giftia/adapters/qq_official.py --web-port 8111
 
 # 退出与重启
 Restart=always
