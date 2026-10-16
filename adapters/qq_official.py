@@ -1296,6 +1296,22 @@ class QQBot:
     def run(self) -> None:
         self.install_signal_handlers()
         self.start_web_gate()
+        if getattr(self, "web_only", False):
+            # 只跑网站入口：**不连 QQ**，省得本机调试还要凭据。
+            # 排空队列必须在这个（主）线程里做——她不是线程安全的。
+            if self.web_gate is None:
+                print("[web] --web-only 需要同时给 --web-port 和 AILA_WEB_SECRET",
+                      file=sys.stderr)
+                return
+            print("[web] 只跑网站入口（不连 QQ）。Ctrl+C 退出。")
+            while not self._stopping:
+                try:
+                    self.web_gate.drain(self.settings)
+                except Exception as exc:
+                    print(f"[web] 处理请求出错：{type(exc).__name__}: {exc}",
+                          file=sys.stderr)
+                time.sleep(0.05)
+            return
         backoff = 5.0
         try:
             while not self._stopping:
@@ -1361,6 +1377,10 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help="不发网络请求，只验证接线")
     parser.add_argument(
+        "--web-only", action="store_true",
+        help="只跑网站入口，不连 QQ（本机调试用；配合 --web-port）",
+    )
+    parser.add_argument(
         "--web-port", type=int, default=0,
         help="同时开一个网站入口（0 = 不开）。口令从 .env 的 AILA_WEB_SECRET 读",
     )
@@ -1422,6 +1442,7 @@ def main() -> int:
         else:
             print("[提示] 还没认人：在 QQ 里私聊她发一句 /bind。", file=sys.stderr)
     bot.web_port = args.web_port   # 网站入口（0 = 不开）
+    bot.web_only = args.web_only
     bot.run()
     return 0
 
