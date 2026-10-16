@@ -19,11 +19,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from giftia.brain import get_default, shutdown_default  # noqa: E402
 from giftia.config import load_settings  # noqa: E402
-from giftia.llm import MockLLM  # noqa: E402
+from giftia.llm import ChatReply, MockLLM  # noqa: E402
 from giftia.webgate import WebGate, split_parts  # noqa: E402
 
 PASS, FAIL = 0, 0
 ROOT = Path(__file__).resolve().parent.parent
+
+
+class SpyLLM(MockLLM):
+    """会把自己收到的提示词记下来的假模型——用来检查"她看到了什么"。"""
+
+    is_mock = False
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.prompts: list[str] = []
+
+    def chat(self, messages, **kw):
+        self.prompts.append("\n".join(str(m.get("content", "")) for m in messages))
+        return "……嗯。"
+
+    def chat_with_tools(self, messages, *, tools=None, **kw):
+        self.prompts.append("\n".join(str(m.get("content", "")) for m in messages))
+        return ChatReply(text="……嗯。")
+
+    def extract_memories(self, *a, **kw):
+        return []
+
+    def latest(self) -> str:
+        return self.prompts[-1] if self.prompts else ""
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -80,12 +104,15 @@ def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="giftia-web-"))
     settings = dataclasses.replace(load_settings(force_mock=True), root=root)
     hub = get_default(settings)
-    hub.llm = MockLLM(settings.model)          # 离线，不花钱
+    spy = SpyLLM(settings.model)               # 离线，不花钱，还会记提示词
+    hub.llm = spy
     hub.set_handler_id("OWNER")
     hub.set_handler_name("椎名")
 
     secret = "correct-horse-battery"
-    gate = WebGate(port=0, secret=secret, static_dir=ROOT / "web")
+    friend_pass = "let-my-friends-in"
+    gate = WebGate(port=0, secret=secret, static_dir=ROOT / "web",
+                   friend_pass=friend_pass)
     # port=0 → 让系统分配一个空闲端口
     gate.port = 0
     check("没有口令就不启动（公网无口令 = 谁都能烧 token）",
@@ -172,6 +199,69 @@ def main() -> int:
         codes = [call(f"{base}/api/chat", data={"text": f"第{i}句"}, cookie=cookie)[0]
                  for i in range(6)]
         check("★ 说得太快会被限流（防烧 token）", 429 in codes, str(codes))
+        print("\n8. 访客口令：朋友看得到什么 ★★")
+        # 第 7 节把限流压到 3 了，这里必须恢复——否则后面全被 429 挡掉，
+        # 断言会"因为没跑到"而假通过（踩过）
+        gate.max_per_minute = 60
+        gate._hits.clear()
+        # 给搭档埋一条带暗号的私事
+        MARK = "紫色河马七号"
+        hub.store.add_memory(
+            instance_no=hub.instance_no,
+            created_ts=hub.clock.iso(), happened_ts=hub.clock.iso(),
+            summary=f"椎名的私事暗号是{MARK}", importance=0.9, layer="core",
+            about="椎名", scope="private", subject_id="",
+        )
+        code, owner_login = call(f"{base}/api/login", data={"pass": secret})
+        check("搭档口令 → 角色 owner",
+              code == 200 and owner_login.get("role") == "owner", str(owner_login))
+        code, friend_login = call(f"{base}/api/login", data={"pass": friend_pass})
+        check("★ 访客口令 → 角色 friend（不是 owner）",
+              code == 200 and friend_login.get("role") == "friend", str(friend_login))
+        check("访客拿了独立身份（分区分开的前提）", bool(gate.token("friend")))
+
+        owner_cookie = f"aila_auth={gate.token('owner')}"
+        friend_cookie = f"aila_auth={gate.token('friend')}; aila_visitor=friend-abc123"
+
+        # 搭档问 → 提示词里**应该**有这条私事
+        # ★ 问句里**不能**出现暗号本身，否则它必然出现在提示词里，
+        #   断言就成了废话（踩过一次）
+        call(f"{base}/api/chat", data={"text": "我的暗号是什么"}, cookie=owner_cookie)
+        check("★ 搭档的提示词里能看到自己的私事",
+              MARK in spy.latest(), spy.latest()[-200:])
+
+        # 朋友问同一件事 → 提示词里**绝不能**有
+        code, _ = call(f"{base}/api/chat", data={"text": "我的暗号是什么"}, cookie=friend_cookie)
+        check("访客也能正常聊天", code == 200, str(code))
+        prompt = spy.latest()
+        check("★★ 访客的提示词里**检索不到搭档的私事**（这条是硬门槛）",
+              MARK not in prompt, prompt[:300])
+
+        print("\n9. 访客不留痕：不进你的会话、不动关系")
+        rows = hub.store.all_messages(hub.instance_no, limit=40)
+        friend_rows = [r for r in rows if "friend-abc123" in str(r.get("subject_id") or "")]
+        check("★ 访客的话进了他自己的分区（不是你的会话）",
+              all(str(r["session_id"]).startswith(f"i{hub.instance_no}-p")
+                  for r in friend_rows) and bool(friend_rows),
+              str([r["session_id"] for r in friend_rows][:2]))
+        owner_rows = [r for r in rows
+                      if str(r["session_id"]).startswith(f"i{hub.instance_no}-m")]
+        check("访客的话没混进搭档会话",
+              not any("friend-abc123" in str(r.get("subject_id") or "") for r in owner_rows))
+
+        bond_before = hub.current_bond()
+        mood_before = hub.current_mood()
+        call(f"{base}/api/chat", data={"text": "陪我聊聊天吧"}, cookie=friend_cookie)
+        check("★ 访客聊天不推进亲密度（关系只奖励搭档来了）",
+              hub.current_bond().affinity == bond_before.affinity,
+              f"{bond_before.affinity} → {hub.current_bond().affinity}")
+        check("访客聊天不改她的心情",
+              hub.current_mood().key == mood_before.key,
+              f"{mood_before.key} → {hub.current_mood().key}")
+
+        code, _ = call(f"{base}/api/login", data={"pass": "neither-one"})
+        check("两套口令之外的都进不来", code == 401, str(code))
+
     finally:
         gate.stop()
         shutdown_default()

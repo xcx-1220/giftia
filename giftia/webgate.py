@@ -38,6 +38,7 @@ import hashlib
 import hmac
 import json
 import queue
+import secrets
 import sys
 import threading
 import time
@@ -80,6 +81,8 @@ class Job:
     #   （踩过：ProgrammingError: SQLite objects created in a thread can only be used
     #     in that same thread）。这就是"HTTP 线程绝不碰她"那条铁律的具体代价。
     user_id: str = ""
+    # "owner" = 搭档本人（共享 QQ 那边的记忆）；"friend" = 访客（独立分区）
+    role: str = "owner"
     done: threading.Event = field(default_factory=threading.Event)
     reply: str = ""
     error: str = ""
@@ -104,10 +107,15 @@ class WebGate:
         static_dir: Path,
         host: str = "127.0.0.1",
         max_per_minute: int = DEFAULT_MAX_PER_MINUTE,
+        friend_pass: str = "",
     ) -> None:
         self.port = int(port)
         self.host = host
         self.secret = (secret or "").strip()
+        # 朋友用的另一套口令。**必须和搭档那套分开**：
+        # 用同一个口令的话，朋友进来就是"以搭档的身份"——她会当着他的面
+        # 提起你的私事，他的话还会写进你的会话，心情/关系/寿命也被陌生人推进。
+        self.friend_pass = (friend_pass or "").strip()
         self.static_dir = Path(static_dir)
         self.max_per_minute = max(1, int(max_per_minute))
         self.jobs: queue.Queue[Job] = queue.Queue()
@@ -125,25 +133,45 @@ class WebGate:
         """没设口令就不开——**不允许无口令的公网入口**（会烧 token）。"""
         return bool(self.secret)
 
-    def token(self) -> str:
-        """登录成功后发的 cookie 值。改口令 = 所有人重新登录。"""
-        return hmac.new(self.secret.encode("utf-8"), b"aila-web", hashlib.sha256).hexdigest()
+    def token(self, role: str = "owner") -> str:
+        """某种角色的 cookie 值（带角色前缀，一眼能看出是哪套）。
+        改口令 = 该角色的人需要重新登录。"""
+        key = self.secret if role == "owner" else self.friend_pass
+        digest = hmac.new(key.encode("utf-8"), b"aila-web", hashlib.sha256).hexdigest()
+        return f"{role}.{digest}"
 
-    def check_pass(self, given: str) -> bool:
-        """constant-time 比较，别让口令能被逐字符猜。"""
-        return bool(self.secret) and hmac.compare_digest(
-            (given or "").strip(), self.secret
-        )
+    def role_of(self, passphrase: str) -> str:
+        """这个口令是谁的。constant-time 比较，别让它能被逐字符猜。"""
+        given = (passphrase or "").strip()
+        if not given:
+            return ""
+        if self.secret and hmac.compare_digest(given, self.secret):
+            return "owner"
+        if self.friend_pass and hmac.compare_digest(given, self.friend_pass):
+            return "friend"
+        return ""
 
-    def check_cookie(self, value: str) -> bool:
-        return bool(value) and hmac.compare_digest(value, self.token())
+    def role_of_cookie(self, value: str) -> str:
+        """cookie 对应哪个角色。空串 = 没登录。"""
+        raw = value or ""
+        if not raw:
+            return ""
+        for role in ("owner", "friend"):
+            if hmac.compare_digest(raw, self.token(role)):
+                return role
+        return ""
+
+    @property
+    def has_friends(self) -> bool:
+        return bool(self.friend_pass)
 
     # ── 限流 ──────────────────────────────────────────────
-    def allow(self, ip: str) -> bool:
+    def allow(self, ip: str, *, limit: int | None = None) -> bool:
+        cap = self.max_per_minute if limit is None else max(1, int(limit))
         now = time.time()
         with self._lock:
             stamps = [t for t in self._hits.get(ip, []) if now - t < 60.0]
-            if len(stamps) >= self.max_per_minute:
+            if len(stamps) >= cap:
                 self._hits[ip] = stamps
                 self.rejected += 1
                 return False
@@ -230,27 +258,41 @@ class WebGate:
 
             def _login(self) -> None:
                 data = self._body()
-                if not gate.check_pass(str(data.get("pass") or "")):
+                role = gate.role_of(str(data.get("pass") or ""))
+                if not role:
                     # 失败也慢一点，别让它成为一个高速爆破口
                     time.sleep(0.4)
                     return self._json(HTTPStatus.UNAUTHORIZED, {"error": "口令不对"})
-                tok = gate.token()
+                cookies = [
+                    f"aila_auth={gate.token(role)}; Path=/; HttpOnly; "
+                    "SameSite=Strict; Max-Age=31536000"
+                ]
+                # 访客给一个随机身份 → 他在她记忆里是独立的一份，看得见自己的、
+                # 看不见搭档的（视角闸门在 brain 里，这里只负责给个稳定 id）
+                if role == "friend" and not self._cookie("aila_visitor"):
+                    cookies.append(
+                        f"aila_visitor={secrets.token_hex(8)}; Path=/; HttpOnly; "
+                        "SameSite=Strict; Max-Age=31536000"
+                    )
+                body = json.dumps({"ok": True, "role": role}, ensure_ascii=False).encode()
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header(
-                    "Set-Cookie",
-                    f"aila_auth={tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000",
-                )
-                body = b'{"ok": true}'
+                for c in cookies:
+                    self.send_header("Set-Cookie", c)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
 
             def _chat(self) -> None:
-                if not gate.check_cookie(self._cookie("aila_auth")):
+                role = gate.role_of_cookie(self._cookie("aila_auth"))
+                if not role:
                     return self._json(HTTPStatus.UNAUTHORIZED, {"error": "还没登录"})
                 ip = self.client_address[0] if self.client_address else "?"
-                if not gate.allow(ip):
+                # 访客的额度只有搭档的一半：他们花的是你的 token
+                cap = gate.max_per_minute if role == "owner" else max(
+                    2, gate.max_per_minute // 2
+                )
+                if not gate.allow(ip, limit=cap):
                     return self._json(
                         HTTPStatus.TOO_MANY_REQUESTS,
                         {"error": "你说得太快了，等一下下。"},
@@ -258,7 +300,13 @@ class WebGate:
                 text = str((self._body().get("text") or "")).strip()
                 if not text:
                     return self._json(HTTPStatus.BAD_REQUEST, {"error": "空消息"})
-                job = Job(text=text[:2000])   # user_id 留空，主线程来填
+                # 访客的身份只能用 cookie 里的字符串（**不能在这里读库**）
+                visitor = self._cookie("aila_visitor") or "web-guest"
+                job = Job(
+                    text=text[:2000],
+                    role=role,
+                    user_id=visitor if role == "friend" else "",
+                )
                 gate.jobs.put(job)
                 if not job.wait(JOB_TIMEOUT):
                     return self._json(
@@ -335,15 +383,27 @@ class WebGate:
                 break
             handled += 1
             try:
-                # ★ 唯一的执行点：主线程 + scene="c2c" + 搭档身份
-                #   → 和 QQ 那边共享同一份记忆、同一个会话上下文。
-                #   user_id 在这里才解析（读 handler_id 要碰 SQLite，HTTP 线程不能碰）
-                reply = handle_message(
-                    job.text,
-                    job.user_id or hub.handler_id or "handler",
-                    settings=settings,
-                    scene="c2c",
-                )
+                # ★ 唯一的执行点，都在主线程（她不是线程安全的）
+                if job.role == "friend":
+                    # 访客：scene="guest" + 他自己的 id →
+                    #   · 视角只有 [("person", 他自己)]，**检索不到搭档的私事**
+                    #   · 写进他自己的记忆分区，不进你的会话
+                    #   · is_handler=False → 心情/关系/寿命一点都不动
+                    reply = handle_message(
+                        job.text,
+                        job.user_id or "web-guest",
+                        settings=settings,
+                        scene="guest",
+                    )
+                else:
+                    # 搭档：scene="c2c" → 和 QQ 那边共享同一份记忆、同一个会话上下文。
+                    # user_id 在这里才解析（读 handler_id 要碰 SQLite，HTTP 线程不能碰）
+                    reply = handle_message(
+                        job.text,
+                        job.user_id or hub.handler_id or "handler",
+                        settings=settings,
+                        scene="c2c",
+                    )
                 job.finish(reply=reply)
             except Exception as exc:  # 网页出问题绝不能拖垮 QQ 那条线
                 job.finish(error=f"{type(exc).__name__}: {exc}")

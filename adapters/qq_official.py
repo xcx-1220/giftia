@@ -302,7 +302,12 @@ class QQBot:
         if not static_dir.is_dir():
             print(f"[web] 找不到静态目录 {static_dir}，网站入口不开", file=sys.stderr)
             return
-        self.web_gate = WebGate(port=port, secret=secret, static_dir=static_dir)
+        # 访客口令（可选）：朋友用这一套 → 走 guest 场景，看得见自己的、
+        # 看不见搭档的，也不推进心情/关系/寿命
+        friend_pass = str(os.environ.get("AILA_WEB_FRIEND_PASS") or "").strip()
+        self.web_gate = WebGate(
+            port=port, secret=secret, static_dir=static_dir, friend_pass=friend_pass
+        )
         self.web_gate.start()
 
     def install_signal_handlers(self) -> None:
