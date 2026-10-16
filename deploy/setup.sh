@@ -53,6 +53,8 @@ if [ "$SRC_DIR" != "$APP_DIR" ]; then
   # 分层之后：默认值改动自动生效，你的调整也永远安全。
   tar -C "$SRC_DIR" \
       --exclude=./data \
+      --exclude=./.env \
+      --exclude=./.env.* \
       --exclude=./.git \
       --exclude=./.review \
       --exclude=./config \
