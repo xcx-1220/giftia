@@ -1,0 +1,504 @@
+/* 艾拉 · 手机端 PWA 样式
+ *
+ * 基调：《可塑性记忆》那种暖白/米色纸感 —— 不用纯白、不用纯黑、不用渐变紫。
+ * 只有一个克制的灰青做点缀（就是她型号环的颜色）。
+ * 深色模式走 prefers-color-scheme，所有颜色都出自下面这组变量，改一处就够。
+ */
+
+/* ---------- 颜色 ---------- */
+:root {
+  --paper:       #f4ede1;  /* 页面底色：暖米 */
+  --paper-top:   #f9f4ea;  /* 顶部一点点提亮，像纸被灯照着 */
+  --paper-deep:  #ece2d1;  /* 宽屏时"手机"外面的桌面色 */
+
+  --card:        #fffcf6;  /* 她的气泡：暖白，但不是 #fff */
+  --card-line:   #ece0cd;
+  --mine:        #e8dcc6;  /* 我的气泡：偏沙色，一眼能分左右 */
+  --mine-line:   #dbcdb2;
+
+  --ink:         #3f3a34;  /* 暖深灰，不用纯黑 */
+  --ink-soft:    #6f665b;
+  --ink-faint:   #9c9083;
+  --note:        #8d8378;  /* 括号旁白：比台词淡一档 */
+  --line:        #e2d7c4;
+
+  --accent:      #7f9c96;  /* 灰青，克制的那一点点颜色 */
+  --accent-ink:  #5b7a74;
+  --accent-tint: #e7ede9;
+  --on-accent:   #fbf7f0;
+
+  --shadow: 0 1px 2px rgba(96, 80, 58, .06), 0 8px 20px rgba(96, 80, 58, .06);
+  --shadow-lift: 0 2px 6px rgba(96, 80, 58, .10), 0 18px 40px rgba(96, 80, 58, .12);
+
+  --radius: 16px;
+
+  /* 刘海屏/圆角屏的安全区，配合 viewport-fit=cover 用 */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper:       #1b1a18;
+    --paper-top:   #211f1c;
+    --paper-deep:  #141312;
+
+    --card:        #262421;
+    --card-line:   #35312b;
+    --mine:        #332f29;
+    --mine-line:   #423c34;
+
+    --ink:         #e9e2d6;
+    --ink-soft:    #b8ada0;
+    --ink-faint:   #8b8175;
+    --note:        #94897c;
+    --line:        #312d28;
+
+    --accent:      #86a8a1;
+    --accent-ink:  #a9c8c1;
+    --accent-tint: #232a28;
+    --on-accent:   #16201e;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 8px 20px rgba(0, 0, 0, .28);
+    --shadow-lift: 0 2px 8px rgba(0, 0, 0, .45), 0 18px 40px rgba(0, 0, 0, .40);
+  }
+}
+
+/* ---------- 基础 ---------- */
+* { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+               "Microsoft YaHei", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-size: 16px;
+  line-height: 1.62;
+  /* 手机上点按钮不要闪一层蓝灰方块 */
+  -webkit-tap-highlight-color: transparent;
+  overflow: hidden; /* 只让消息流自己滚，避免整页橡皮筋 */
+}
+
+[hidden] { display: none !important; }
+
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+::selection { background: var(--accent-tint); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 每"屏"都是一整屏高。
+ *
+ * 三行 height 是故意的：老浏览器认 100vh；新浏览器认 100dvh（会跟着地址栏伸缩）；
+ * 当 JS 通过 visualViewport 拿到真实可视高度时，用 --vvh 覆盖它（键盘弹起时最关键）。
+ * 若浏览器既不懂 dvh 也不懂 var()，第一行的 100vh 仍然兜住。 */
+.screen {
+  height: 100vh;
+  height: 100dvh;
+  height: var(--vvh, 100dvh);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ---------- 口令页 ---------- */
+.gate {
+  align-items: center;
+  justify-content: center;
+  padding: 24px 20px calc(24px + var(--safe-bottom));
+  background: radial-gradient(130% 90% at 50% 6%, var(--paper-top) 0%, var(--paper) 62%);
+}
+
+.gate__card {
+  width: 100%;
+  max-width: 340px;
+  text-align: center;
+}
+
+.gate__mark {
+  width: 64px; height: 64px;
+  margin: 0 auto 18px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  color: var(--accent-ink);
+  font-size: 22px;
+  line-height: 60px;
+  letter-spacing: .06em;
+  /* 环下留个小缺口，跟图标是一套 */
+  border-bottom-color: transparent;
+}
+
+.gate__title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: .16em;
+  text-indent: .16em; /* 补掉字间距在末字留下的空隙，视觉才居中 */
+}
+
+.gate__sub {
+  margin: 4px 0 0;
+  color: var(--ink-faint);
+  font-size: 12px;
+  letter-spacing: .12em;
+}
+
+.gate__line {
+  margin: 22px 0 18px;
+  color: var(--ink-soft);
+  font-size: 14px;
+}
+
+.gate__form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.gate__input {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--card-line);
+  border-radius: 14px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px; /* 小于 16px 时 iOS 会自动放大页面，很晃眼 */
+  text-align: center;
+  letter-spacing: .08em;
+  box-shadow: var(--shadow);
+}
+
+.gate__input::placeholder { color: var(--ink-faint); letter-spacing: normal; }
+
+.gate__btn {
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 14px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  font-size: 15px;
+  letter-spacing: .1em;
+  cursor: pointer;
+  transition: opacity .18s ease, transform .18s ease;
+}
+
+.gate__btn:active { transform: translateY(1px); }
+.gate__btn:disabled { opacity: .5; cursor: default; }
+
+.gate__msg {
+  min-height: 1.5em; /* 占住位置，出错时文字不会把版面顶得一跳 */
+  margin: 14px 0 0;
+  color: var(--note);
+  font-size: 13px;
+}
+
+.gate__msg--bad { color: #a4707a; }
+
+@media (prefers-color-scheme: dark) {
+  .gate__msg--bad { color: #c08d96; }
+}
+
+/* ---------- 聊天页 ---------- */
+.chat {
+  position: relative;
+  background: radial-gradient(120% 70% at 50% 0%, var(--paper-top) 0%, var(--paper) 58%);
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: calc(10px + var(--safe-top)) 14px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.topbar__who { display: flex; align-items: center; gap: 10px; min-width: 0; }
+
+.topbar__mark {
+  flex: none;
+  width: 30px; height: 30px;
+  border: 1.5px solid var(--accent);
+  border-radius: 50%;
+  color: var(--accent-ink);
+  font-size: 11px;
+  line-height: 27px;
+  text-align: center;
+  letter-spacing: .04em;
+}
+
+.topbar__text { display: flex; flex-direction: column; min-width: 0; }
+.topbar__name { font-size: 15px; font-weight: 500; letter-spacing: .1em; }
+.topbar__sub {
+  color: var(--ink-faint);
+  font-size: 11px;
+  letter-spacing: .08em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar__more {
+  flex: none;
+  width: 34px; height: 34px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--ink-soft);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.topbar__more:hover { background: var(--accent-tint); }
+
+.banner {
+  margin: 8px 14px 0;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--accent-tint);
+  color: var(--accent-ink);
+  font-size: 13px;
+}
+
+/* ---------- 消息流 ---------- */
+.stream {
+  flex: 1 1 auto;
+  min-height: 0;           /* 关键：不加这条，flex 子项不肯收缩，输入框会被挤出屏幕 */
+  margin: 0;
+  padding: 16px 14px 8px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;   /* 滚到头不要带着整页一起弹 */
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.stream::-webkit-scrollbar { width: 6px; }
+.stream::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+.msg { display: flex; }
+.msg--her { justify-content: flex-start; }
+.msg--me  { justify-content: flex-end; }
+
+/* 刷新后从历史里恢复的气泡：直接就位，不播动画 —— 一屏 100 条一起飘进来太吵 */
+.msg--static .bubble { animation: none; }
+
+/* 她连发几条时，间距收紧一点，看起来是"一口气说完的" */
+.msg--her + .msg--her { margin-top: -2px; }
+.msg--me + .msg--me { margin-top: -2px; }
+
+.bubble {
+  max-width: 78%;
+  padding: 9px 13px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;   /* 她换行是真的换行，别压成一行 */
+  animation: rise .26s ease-out both;
+}
+
+.msg--her .bubble {
+  background: var(--card);
+  border-color: var(--card-line);
+  border-top-left-radius: 5px;   /* 靠近说话人的那一角收窄，像个小尾巴 */
+  box-shadow: var(--shadow);
+}
+
+.msg--me .bubble {
+  background: var(--mine);
+  border-color: var(--mine-line);
+  border-top-right-radius: 5px;
+}
+
+/* 整条都是括号旁白时，干脆不要气泡 —— 像剧本里的动作提示，而不是一句台词 */
+.bubble--aside {
+  max-width: 86%;
+  padding: 2px 2px 2px 4px;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--note);
+  font-style: italic;
+  font-size: 14.5px;
+}
+
+/* 台词里夹着的旁白（"……（笑）"这种）：淡一档 + 斜体，跟说的话区分开 */
+.aside { color: var(--note); font-style: italic; }
+
+/* 气泡落下的小动画：位移很短，只是"出现"，不要抢戏。
+   每段之间 500~900ms 的停顿在 app.js 里控制 —— 节奏感靠停顿，不靠动画。 */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* 她那边的系统提示（忙、掉线、口令过期），居中、更淡 */
+.note {
+  align-self: center;
+  max-width: 90%;
+  margin: 2px 0;
+  color: var(--note);
+  font-size: 13px;
+  font-style: italic;
+  text-align: center;
+  animation: rise .26s ease-out both;
+}
+
+/* ---------- "正在输入" ---------- */
+.typing { display: flex; justify-content: flex-start; }
+
+.typing__bubble {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--card-line);
+  border-radius: var(--radius);
+  border-top-left-radius: 5px;
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.typing__dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--ink-faint);
+  animation: pulse 1.25s ease-in-out infinite;
+}
+
+.typing__dot:nth-child(2) { animation-delay: .16s; }
+.typing__dot:nth-child(3) { animation-delay: .32s; }
+
+@keyframes pulse {
+  0%, 70%, 100% { opacity: .28; transform: translateY(0); }
+  35%           { opacity: .85; transform: translateY(-2px); }
+}
+
+/* ---------- 输入区 ---------- */
+.composer {
+  flex: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 12px calc(8px + var(--safe-bottom));  /* 躲开 home indicator */
+  border-top: 1px solid var(--line);
+  background: var(--paper);
+}
+
+.composer__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-height: 7.5em;       /* 超过就自己滚，别把消息流挤没 */
+  padding: 10px 14px;
+  border: 1px solid var(--card-line);
+  border-radius: 20px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px;         /* 同上：16px 防止 iOS 聚焦时自动放大 */
+  line-height: 1.45;
+  resize: none;
+  overflow-y: auto;
+  box-shadow: var(--shadow);
+}
+
+.composer__input::placeholder { color: var(--ink-faint); }
+
+.composer__input:disabled {
+  opacity: .55;            /* 她还在说话时把输入锁上，防止连点重复发 */
+  cursor: default;
+}
+
+.composer__send {
+  flex: none;
+  width: 40px; height: 40px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--on-accent);
+  cursor: pointer;
+  transition: opacity .18s ease, transform .18s ease;
+}
+
+.composer__send:active { transform: translateY(1px); }
+.composer__send:disabled { opacity: .4; cursor: default; }
+
+/* ---------- 右上角小菜单 ---------- */
+.menu {
+  position: absolute;
+  top: calc(var(--safe-top) + 52px);
+  right: 12px;
+  z-index: 5;
+  min-width: 160px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+  box-shadow: var(--shadow-lift);
+  animation: rise .16s ease-out both;
+}
+
+.menu__item {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu__item:hover { background: var(--accent-tint); }
+.menu__item--quiet { color: var(--ink-soft); }
+
+/* ---------- 宽屏：把这一屏摆成一台手机，而不是拉成一张大饼 ---------- */
+@media (min-width: 640px) {
+  body { background: var(--paper-deep); }
+
+  #app {
+    max-width: 560px;
+    margin: 0 auto;
+    box-shadow: var(--shadow-lift);
+  }
+}
+
+/* ---------- 尊重"减少动态效果" ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}

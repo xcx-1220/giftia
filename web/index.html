@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>艾拉</title>
+
+<!-- viewport-fit=cover：页面铺到刘海/圆角屏的边缘，
+     再由 CSS 里的 env(safe-area-inset-*) 把内容躲开下巴，键盘弹起时也不会顶掉输入框 -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+<meta name="description" content="和艾拉说说话。Giftia Type-07。">
+<meta name="color-scheme" content="light dark">
+
+<!-- 主题色跟深浅色各写一份：Android 上独立窗口的标题栏、状态栏才会和页面同色 -->
+<meta name="theme-color" content="#f4ede1" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1b1a18" media="(prefers-color-scheme: dark)">
+
+<!-- iOS 只认 apple-* 这一套：加到主屏后以独立 App 的样子启动，而不是套一层 Safari -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="艾拉">
+<meta name="format-detection" content="telephone=no">
+
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+<!-- 手机上只留一屏；宽屏时这个壳会居中、收窄成一台"手机"的样子 -->
+<div id="app">
+
+  <!-- ============ 口令页 ============ -->
+  <section id="gate" class="screen gate" aria-labelledby="gate-title">
+    <div class="gate__card">
+      <div class="gate__mark" aria-hidden="true">07</div>
+      <h1 class="gate__title" id="gate-title">艾拉</h1>
+      <p class="gate__sub">Giftia · Type-07</p>
+      <p class="gate__line">开始之前，先对一下口令。</p>
+
+      <form id="gate-form" class="gate__form" autocomplete="on">
+        <label class="sr-only" for="gate-pass">口令</label>
+        <input id="gate-pass" class="gate__input" type="password" name="pass"
+               placeholder="口令" autocomplete="current-password"
+               autocapitalize="off" autocorrect="off" spellcheck="false" required>
+        <button id="gate-btn" class="gate__btn" type="submit">进去</button>
+      </form>
+
+      <!-- 登录失败/网络不通的提示，用 aria-live 让读屏也能听到 -->
+      <p id="gate-msg" class="gate__msg" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <!-- ============ 聊天页 ============ -->
+  <section id="chat" class="screen chat" hidden>
+    <header class="topbar">
+      <div class="topbar__who">
+        <span class="topbar__mark" aria-hidden="true">07</span>
+        <span class="topbar__text">
+          <strong class="topbar__name">艾拉</strong>
+          <!-- 这里的"第 N 天"由前端按首次打开时间算，不需要后端 -->
+          <small class="topbar__sub" id="topbar-sub">Giftia · Type-07</small>
+        </span>
+      </div>
+      <button id="menu-btn" class="topbar__more" type="button"
+              aria-label="更多" aria-haspopup="menu" aria-expanded="false">⋯</button>
+    </header>
+
+    <!-- 顶部的轻提示（离线、口令过期之类），默认不占位 -->
+    <p id="banner" class="banner" role="status" aria-live="polite" hidden></p>
+
+    <!-- 消息流。aria-live 用 off：她自己会一条条冒出来，读屏不该抢着念 -->
+    <ol id="stream" class="stream" aria-live="off"></ol>
+
+    <!-- 输入区：固定在底部，底部内边距吃掉 home indicator 的高度 -->
+    <form id="composer" class="composer" autocomplete="off">
+      <label class="sr-only" for="input">想对她说的话</label>
+      <textarea id="input" class="composer__input" rows="1" maxlength="500"
+                placeholder="跟她说点什么…" enterkeyhint="send"
+                autocapitalize="sentences" spellcheck="false"></textarea>
+      <button id="send" class="composer__send" type="submit" aria-label="发送">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
+          <path d="M4 12.2 19.4 5.1c.6-.3 1.2.3.9.9l-7 15.1c-.3.7-1.3.6-1.5-.1l-1.5-6.2-6.2-1.5c-.7-.2-.8-1.2-.1-1.5Z"
+                fill="currentColor"/>
+        </svg>
+      </button>
+    </form>
+
+    <!-- 右上角的小菜单：清空这段对话 / 忘掉口令 -->
+    <div id="menu" class="menu" role="menu" hidden>
+      <button class="menu__item" type="button" role="menuitem" data-act="clear">清空这段对话</button>
+      <button class="menu__item menu__item--quiet" type="button" role="menuitem" data-act="forget">忘掉口令</button>
+    </div>
+  </section>
+</div>
+
+<noscript>
+  <p style="padding:24px;text-align:center">这个页面需要 JavaScript 才能运行。</p>
+</noscript>
+
+<script src="app.js" defer></script>
+</body>
+</html>

@@ -49,6 +49,7 @@ from giftia.brain import handle_message  # noqa: E402
 from giftia.config import load_env_file, load_settings  # noqa: E402
 from giftia.outreach import can_send  # noqa: E402
 from giftia.trigger import decide as decide_speak  # noqa: E402
+from giftia.webgate import WebGate  # noqa: E402
 from giftia.ws import WebSocket, WSClosed, WSTimeout  # noqa: E402
 
 # ── 常量（鉴权、网关、identify、READY 已用真实凭据验证过）─────────
@@ -254,6 +255,8 @@ class QQBot:
         self._stopping = False
         # 主动联系多久查一次（她真要不要开口，由 outreach 那边决定）
         self.outreach_interval = 600.0
+        # 网站入口（一个进程、两个入口：HTTP 线程只入队，主线程执行）
+        self.web_gate = None
         # 聚批：群聊里被触发后，等 wake_delay 秒把这段时间里的话一起处理。
         # target → {"items": [...], "deadline": float}。**固定倒计时，不因新消息重置。**
         self._batch: dict[str, dict] = {}
@@ -273,6 +276,34 @@ class QQBot:
         if not self._stopping:
             print("\n[退出] 收到停止信号，正在收尾…")
         self._stopping = True
+
+    def start_web_gate(self) -> None:
+        """开网站入口（**一个进程、两个入口**）。
+
+        口令从 `.env` 的 `AILA_WEB_SECRET` 读——**和 API key 一样不进 toml、
+        不进 git**。没配口令就不开：公网无口令的入口 = 谁都能让她说话、
+        烧你的 token，还可能把陌生人的话写进她的记忆。
+
+        HTTP 线程只入队；真正的执行在主循环里（她不是线程安全的）。
+        """
+        port = int(getattr(self, "web_port", 0) or 0)
+        if port <= 0:
+            return
+        secret = str(os.environ.get("AILA_WEB_SECRET") or "").strip()
+        if not secret:
+            print(
+                "[web] --web-port 给了，但没配口令 —— 在 .env 里加一行：\n"
+                "      AILA_WEB_SECRET=你的口令\n"
+                "      （公网无口令的入口，谁都能让她说话、烧你的 token）",
+                file=sys.stderr,
+            )
+            return
+        static_dir = Path(__file__).resolve().parent.parent / "web"
+        if not static_dir.is_dir():
+            print(f"[web] 找不到静态目录 {static_dir}，网站入口不开", file=sys.stderr)
+            return
+        self.web_gate = WebGate(port=port, secret=secret, static_dir=static_dir)
+        self.web_gate.start()
 
     def install_signal_handlers(self) -> None:
         import signal
@@ -1193,6 +1224,12 @@ class QQBot:
                     next_outreach = now + self.outreach_interval
                 # 到点的聚批：一次处理这段时间里攒下的话
                 self._flush_batches()
+                # 网站那边排队的请求：**在主线程执行**（她不是线程安全的）
+                if self.web_gate is not None:
+                    try:
+                        self.web_gate.drain(self.settings)
+                    except Exception as exc:
+                        print(f"[web] 处理请求出错：{type(exc).__name__}: {exc}", file=sys.stderr)
                 if now >= next_beat:
                     ws.send_text(json.dumps({"op": OP_HEARTBEAT, "d": self.seq}))
                     next_beat = now + interval
@@ -1203,6 +1240,9 @@ class QQBot:
                     if due is not None:
                         # 有批次在等：别睡过头，到点就得起来处理
                         wait = max(0.2, min(wait, due - now))
+                    if self.web_gate is not None and self.web_gate.pending:
+                        # 网站在等回话：最多睡 0.2 秒就起来看一眼
+                        wait = 0.2
                     raw = ws.recv_text(timeout=wait)
                 except WSTimeout:
                     continue
@@ -1255,6 +1295,7 @@ class QQBot:
 
     def run(self) -> None:
         self.install_signal_handlers()
+        self.start_web_gate()
         backoff = 5.0
         try:
             while not self._stopping:
@@ -1319,6 +1360,10 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--dry-run", action="store_true", help="不发网络请求，只验证接线")
+    parser.add_argument(
+        "--web-port", type=int, default=0,
+        help="同时开一个网站入口（0 = 不开）。口令从 .env 的 AILA_WEB_SECRET 读",
+    )
     parser.add_argument("--mock-llm", action="store_true", help="她的对话用离线假模型")
     parser.add_argument("--owner", default=os.environ.get("QQ_OWNER_OPENID", ""),
                         metavar="OPENID", help="只服务这个 user_openid（其他人不进记忆）")
@@ -1376,6 +1421,7 @@ def main() -> int:
             )
         else:
             print("[提示] 还没认人：在 QQ 里私聊她发一句 /bind。", file=sys.stderr)
+    bot.web_port = args.web_port   # 网站入口（0 = 不开）
     bot.run()
     return 0
 

@@ -96,8 +96,21 @@ class FlakyLLM(MockLLM):
         raise LLMError("模拟故障：连接被重置")
 
 
-def make_settings(tmp: Path, hours: float) -> Settings:
+def make_settings(
+    tmp: Path, hours: float, *, quiet: bool = False
+) -> Settings:
+    """测试用的配置。
+
+    **默认关掉"安静时段"**：它（23:30~08:00 不主动）和主动联系那一堆断言
+    天然矛盾——留着就变成"白天过、晚上挂"的时效性 bug（真在凌晨跑才暴露，
+    而且部署门槛会因此挂掉）。安静时段由第 34 节显式打开来测。
+    """
     base = load_settings(lifespan_override=hours, force_mock=True)
+    if not quiet:
+        base = dataclasses.replace(
+            base,
+            outreach=dataclasses.replace(base.outreach, quiet_from="", quiet_to=""),
+        )
     return dataclasses.replace(base, root=tmp)
 
 
@@ -791,8 +804,8 @@ def main() -> int:
           "【你昨晚做的梦】" not in dr._prepare("在吗")[0][0]["content"])
     check("梦簿能列出来", "她做过的梦" in dr.dream_text())
 
-    # ══ 24. 主动联系 ═══════════════════════════════════════════
-    print("\n24. 主动联系：稀缺资源，用完就没有")
+    # ══ 24. 主动联系：她什么时候会先开口 ═══════════════════════
+    print("\n24. 主动联系（额度 / 间隔 / 理由）")
     from giftia.outreach import can_send, quota_state, record_sent
 
     base = make_settings(tmp / "out", 81920.0)
@@ -1589,7 +1602,7 @@ def main() -> int:
     print("\n34. 安静时段（半夜不主动吵人）")
     from giftia.outreach import in_quiet_hours as _quiet
 
-    qs = make_settings(tmp / "quiet", 81920.0)
+    qs = make_settings(tmp / "quiet", 81920.0, quiet=True)
     qm = Giftia(qs, llm=MockLLM(qs.model))
     qm.set_handler_id("OWNER")
     qm.handle("我叫椎名", user_id="OWNER")
