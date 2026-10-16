@@ -6,10 +6,13 @@
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "display_override": ["standalone", "minimal-ui"],
+  "display_override": [
+    "standalone",
+    "minimal-ui"
+  ],
   "orientation": "portrait",
-  "theme_color": "#f4ede1",
-  "background_color": "#f4ede1",
+  "theme_color": "#eef5f4",
+  "background_color": "#eef5f4",
   "icons": [
     {
       "src": "icons/icon-192.png",

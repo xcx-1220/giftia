@@ -1,66 +1,97 @@
 /* 艾拉 · 手机端 PWA 样式
  *
- * 基调：《可塑性记忆》那种暖白/米色纸感 —— 不用纯白、不用纯黑、不用渐变紫。
- * 只有一个克制的灰青做点缀（就是她型号环的颜色）。
- * 深色模式走 prefers-color-scheme，所有颜色都出自下面这组变量，改一处就够。
+ * 视觉基调：Giftia Type-07 ——「终端服务」的制服色。
+ * 冷白（不是米白）+ 她眼睛那种清透的青绿，干净、克制、留白多。
+ * 不做萌系、不做霓虹、不做玻璃拟态；温度只留一点点（正文用冷调深绿灰，不是纯灰）。
+ *
+ * 所有颜色都出自下面这组变量，浅色 / 深色各一套，改一处就够。
+ * 对比度（WCAG，脚本实算）：正文最低 4.75:1，次要文字最低 4.63:1，
+ * 装饰性线条不承载信息，故只按 1.x:1 的"看得见"标准控制。
  */
 
-/* ---------- 颜色 ---------- */
+/* ---------- 颜色 · 浅色（日光下的白墙：微青的冷白） ---------- */
 :root {
-  --paper:       #f4ede1;  /* 页面底色：暖米 */
-  --paper-top:   #f9f4ea;  /* 顶部一点点提亮，像纸被灯照着 */
-  --paper-deep:  #ece2d1;  /* 宽屏时"手机"外面的桌面色 */
+  /* 三层"纸"：页面 / 顶部受光 / 宽屏时的桌面 */
+  --bg:          #eef5f4;
+  --bg-top:      #f7fbfa;
+  --bg-deep:     #dde8e7;
 
-  --card:        #fffcf6;  /* 她的气泡：暖白，但不是 #fff */
-  --card-line:   #ece0cd;
-  --mine:        #e8dcc6;  /* 我的气泡：偏沙色，一眼能分左右 */
-  --mine-line:   #dbcdb2;
+  /* 她的气泡：干净的白，靠白本身从底色里浮起来 */
+  --card:        #ffffff;
+  --card-line:   #dcebe9;
+  /* 我的气泡：同一色系压一档青灰，一眼分得出左右 */
+  --mine:        #d8eae8;
+  --mine-line:   #c2dcda;
 
-  --ink:         #3f3a34;  /* 暖深灰，不用纯黑 */
-  --ink-soft:    #6f665b;
-  --ink-faint:   #9c9083;
-  --note:        #8d8378;  /* 括号旁白：比台词淡一档 */
-  --line:        #e2d7c4;
+  /* 文字：冷调深绿灰，不做纯黑 */
+  --ink:         #16302e;  /* 台词 */
+  --ink-soft:    #4a6a67;  /* 次要文字 */
+  --ink-faint:   #5f7d7a;  /* 型号小字、占位符 */
+  --note:        #5d7c79;  /* 括号旁白 / 系统提示 */
+  --line:        #dbe8e7;  /* 分隔线 */
 
-  --accent:      #7f9c96;  /* 灰青，克制的那一点点颜色 */
-  --accent-ink:  #5b7a74;
-  --accent-tint: #e7ede9;
-  --on-accent:   #fbf7f0;
+  /* 她眼睛那点青绿：只在关键处出现 */
+  --accent:      #1c7d78;  /* 实心按钮、状态点 */
+  --accent-ink:  #146660;  /* 青绿当文字用时压深一点 */
+  --accent-tint: #dcefed;  /* 极淡的一层青色底 */
+  --accent-edge: #8fc9c3;  /* 她气泡左沿那道细边，最轻的一档 */
+  --on-accent:   #f2f9f8;  /* 青绿实心底上的字 */
 
-  --shadow: 0 1px 2px rgba(96, 80, 58, .06), 0 8px 20px rgba(96, 80, 58, .06);
-  --shadow-lift: 0 2px 6px rgba(96, 80, 58, .10), 0 18px 40px rgba(96, 80, 58, .12);
+  --danger:      #a34b5c;
+
+  /* 阴影压得很轻、偏青：像纸被漫射的日光托起，不是聊天 App 那种投影 */
+  --shadow:      0 1px 1px rgba(20, 60, 58, .04), 0 6px 16px rgba(20, 60, 58, .05);
+  --shadow-lift: 0 2px 6px rgba(20, 60, 58, .07), 0 16px 36px rgba(20, 60, 58, .10);
+
+  /* 受光面：非常淡的一层，只为让整屏和气泡各自有"上亮下暗"的方向 */
+  --glow:      radial-gradient(120% 64% at 50% 0%, var(--bg-top) 0%, var(--bg) 62%);
+  --glow-gate: radial-gradient(130% 86% at 50% 8%, var(--bg-top) 0%, var(--bg) 66%);
 
   --radius: 16px;
+
+  --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  /* 型号铭牌用等宽：'Giftia · Type-07' 这种字串看起来更像刻上去的 */
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          "Liberation Mono", monospace;
 
   /* 刘海屏/圆角屏的安全区，配合 viewport-fit=cover 用 */
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 
+/* ---------- 颜色 · 深色（整套重做：夜里的冷青，不是把浅色反相） ---------- */
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper:       #1b1a18;
-    --paper-top:   #211f1c;
-    --paper-deep:  #141312;
+    --bg:          #0d1617;
+    --bg-top:      #122021;
+    --bg-deep:     #070f10;
 
-    --card:        #262421;
-    --card-line:   #35312b;
-    --mine:        #332f29;
-    --mine-line:   #423c34;
+    --card:        #172526;  /* 她的气泡比底色亮一档，依旧"浮"着 */
+    --card-line:   #294040;
+    --mine:        #20383a;  /* 我的气泡再亮一档，偏青 */
+    --mine-line:   #325253;
 
-    --ink:         #e9e2d6;
-    --ink-soft:    #b8ada0;
-    --ink-faint:   #8b8175;
-    --note:        #94897c;
-    --line:        #312d28;
+    --ink:         #e6f1ef;
+    --ink-soft:    #b3c6c3;
+    --ink-faint:   #8da4a1;
+    --note:        #9fb4b0;
+    --line:        #22383a;
 
-    --accent:      #86a8a1;
-    --accent-ink:  #a9c8c1;
-    --accent-tint: #232a28;
-    --on-accent:   #16201e;
+    /* 深色下"她的青绿"要真的亮起来，否则整屏发灰 */
+    --accent:      #5ccfc2;
+    --accent-ink:  #8ee0d4;
+    --accent-tint: #17302f;
+    --accent-edge: #3c6f6d;
+    --on-accent:   #062522;
 
-    --shadow: 0 1px 2px rgba(0, 0, 0, .35), 0 8px 20px rgba(0, 0, 0, .28);
-    --shadow-lift: 0 2px 8px rgba(0, 0, 0, .45), 0 18px 40px rgba(0, 0, 0, .40);
+    --danger:      #e0899a;
+
+    --shadow:      0 1px 2px rgba(0, 0, 0, .40), 0 8px 20px rgba(0, 0, 0, .30);
+    --shadow-lift: 0 2px 8px rgba(0, 0, 0, .50), 0 18px 40px rgba(0, 0, 0, .42);
+
+    --glow:      radial-gradient(120% 64% at 50% 0%, var(--bg-top) 0%, var(--bg) 66%);
+    --glow-gate: radial-gradient(130% 86% at 50% 8%, var(--bg-top) 0%, var(--bg) 70%);
   }
 }
 
@@ -73,12 +104,14 @@ html {
 
 body {
   margin: 0;
-  background: var(--paper);
+  background: var(--bg);
   color: var(--ink);
-  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
-               "Microsoft YaHei", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-family: var(--sans);
   font-size: 16px;
-  line-height: 1.62;
+  /* 行距比通用聊天界面松一点：她说话慢，版面也该喘得上气 */
+  line-height: 1.72;
+  /* 中文用 300：屏幕上笔画会略细一档，显得干净、克制（不支持的平台自动回退到常规字重） */
+  font-weight: 300;
   /* 手机上点按钮不要闪一层蓝灰方块 */
   -webkit-tap-highlight-color: transparent;
   overflow: hidden; /* 只让消息流自己滚，避免整页橡皮筋 */
@@ -122,7 +155,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 24px 20px calc(24px + var(--safe-bottom));
-  background: radial-gradient(130% 90% at 50% 6%, var(--paper-top) 0%, var(--paper) 62%);
+  background: var(--glow-gate);
 }
 
 .gate__card {
@@ -131,36 +164,42 @@ body {
   text-align: center;
 }
 
+/* 型号环：一圈缺口 + 拉开字距的 "07"，像制服上的铭牌，不像按钮 */
 .gate__mark {
   width: 64px; height: 64px;
-  margin: 0 auto 18px;
+  margin: 0 auto 20px;
   border: 2px solid var(--accent);
   border-radius: 50%;
   color: var(--accent-ink);
-  font-size: 22px;
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 400;
   line-height: 60px;
-  letter-spacing: .06em;
+  letter-spacing: .08em;
+  text-indent: .08em;
   /* 环下留个小缺口，跟图标是一套 */
   border-bottom-color: transparent;
 }
 
 .gate__title {
   margin: 0;
-  font-size: 26px;
-  font-weight: 500;
-  letter-spacing: .16em;
-  text-indent: .16em; /* 补掉字间距在末字留下的空隙，视觉才居中 */
+  font-size: 27px;
+  font-weight: 400;
+  letter-spacing: .22em;   /* 名字也当铭牌排：宽字距、轻字重 */
+  text-indent: .22em;      /* 补掉字间距在末字留下的空隙，视觉才居中 */
 }
 
 .gate__sub {
-  margin: 4px 0 0;
+  margin: 7px 0 0;
   color: var(--ink-faint);
-  font-size: 12px;
-  letter-spacing: .12em;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
 }
 
 .gate__line {
-  margin: 22px 0 18px;
+  margin: 28px 0 20px;   /* 多留一点空：她在等你开口 */
   color: var(--ink-soft);
   font-size: 14px;
 }
@@ -173,29 +212,32 @@ body {
 
 .gate__input {
   width: 100%;
-  padding: 12px 14px;
+  padding: 13px 14px;
   border: 1px solid var(--card-line);
   border-radius: 14px;
   background: var(--card);
   color: var(--ink);
   font: inherit;
   font-size: 16px; /* 小于 16px 时 iOS 会自动放大页面，很晃眼 */
+  font-weight: 400;
   text-align: center;
-  letter-spacing: .08em;
+  letter-spacing: .1em;
   box-shadow: var(--shadow);
 }
 
 .gate__input::placeholder { color: var(--ink-faint); letter-spacing: normal; }
 
 .gate__btn {
-  padding: 12px 14px;
+  padding: 13px 14px;
   border: 0;
   border-radius: 14px;
   background: var(--accent);
   color: var(--on-accent);
   font: inherit;
   font-size: 15px;
-  letter-spacing: .1em;
+  font-weight: 400;
+  letter-spacing: .18em;
+  text-indent: .18em;
   cursor: pointer;
   transition: opacity .18s ease, transform .18s ease;
 }
@@ -205,21 +247,17 @@ body {
 
 .gate__msg {
   min-height: 1.5em; /* 占住位置，出错时文字不会把版面顶得一跳 */
-  margin: 14px 0 0;
+  margin: 16px 0 0;
   color: var(--note);
   font-size: 13px;
 }
 
-.gate__msg--bad { color: #a4707a; }
-
-@media (prefers-color-scheme: dark) {
-  .gate__msg--bad { color: #c08d96; }
-}
+.gate__msg--bad { color: var(--danger); }
 
 /* ---------- 聊天页 ---------- */
 .chat {
   position: relative;
-  background: radial-gradient(120% 70% at 50% 0%, var(--paper-top) 0%, var(--paper) 58%);
+  background: var(--glow);
 }
 
 .topbar {
@@ -229,7 +267,8 @@ body {
   gap: 8px;
   padding: calc(10px + var(--safe-top)) 14px 10px;
   border-bottom: 1px solid var(--line);
-  background: var(--paper);
+  /* 比页面底色再白一点点：顶栏是"另一个面"，不是同一条带子 */
+  background: var(--bg-top);
 }
 
 .topbar__who { display: flex; align-items: center; gap: 10px; min-width: 0; }
@@ -240,18 +279,29 @@ body {
   border: 1.5px solid var(--accent);
   border-radius: 50%;
   color: var(--accent-ink);
-  font-size: 11px;
+  font-family: var(--mono);
+  font-size: 10.5px;
   line-height: 27px;
   text-align: center;
   letter-spacing: .04em;
+  text-indent: .04em;
+  border-bottom-color: transparent;   /* 和口令页的环是同一个记号 */
 }
 
 .topbar__text { display: flex; flex-direction: column; min-width: 0; }
-.topbar__name { font-size: 15px; font-weight: 500; letter-spacing: .1em; }
+
+.topbar__name {
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: .18em;
+}
+
 .topbar__sub {
+  margin-top: 1px;
   color: var(--ink-faint);
-  font-size: 11px;
-  letter-spacing: .08em;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .1em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -271,14 +321,16 @@ body {
 
 .topbar__more:hover { background: var(--accent-tint); }
 
+/* 离线 / 口令过期的轻提示：一层极淡的青，安静地说一句 */
 .banner {
-  margin: 8px 14px 0;
-  padding: 7px 12px;
-  border: 1px solid var(--line);
+  margin: 10px 14px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--card-line);
   border-radius: 12px;
   background: var(--accent-tint);
   color: var(--accent-ink);
   font-size: 13px;
+  line-height: 1.6;
 }
 
 /* ---------- 消息流 ---------- */
@@ -286,11 +338,11 @@ body {
   flex: 1 1 auto;
   min-height: 0;           /* 关键：不加这条，flex 子项不肯收缩，输入框会被挤出屏幕 */
   margin: 0;
-  padding: 16px 14px 8px;
+  padding: 18px 14px 10px;
   list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   overflow-y: auto;
   overscroll-behavior: contain;   /* 滚到头不要带着整页一起弹 */
   -webkit-overflow-scrolling: touch;
@@ -309,12 +361,12 @@ body {
 .msg--static .bubble { animation: none; }
 
 /* 她连发几条时，间距收紧一点，看起来是"一口气说完的" */
-.msg--her + .msg--her { margin-top: -2px; }
-.msg--me + .msg--me { margin-top: -2px; }
+.msg--her + .msg--her { margin-top: -3px; }
+.msg--me + .msg--me { margin-top: -3px; }
 
 .bubble {
-  max-width: 78%;
-  padding: 9px 13px;
+  max-width: 80%;
+  padding: 10px 14px;
   border: 1px solid transparent;
   border-radius: var(--radius);
   word-break: break-word;
@@ -323,32 +375,39 @@ body {
   animation: rise .26s ease-out both;
 }
 
+/* 她的话：白纸，左沿压一道极轻的青绿 —— 识别度靠这道边，不靠任何符号 */
 .msg--her .bubble {
   background: var(--card);
   border-color: var(--card-line);
+  border-left: 2px solid var(--accent-edge);
   border-top-left-radius: 5px;   /* 靠近说话人的那一角收窄，像个小尾巴 */
   box-shadow: var(--shadow);
 }
 
+/* 我的话：同色系压深一档的青灰，安静地退到右边 */
 .msg--me .bubble {
   background: var(--mine);
   border-color: var(--mine-line);
   border-top-right-radius: 5px;
+  color: var(--ink);
 }
 
-/* 整条都是括号旁白时，干脆不要气泡 —— 像剧本里的动作提示，而不是一句台词 */
+/* 整条都是括号旁白时，干脆不要气泡 —— 像剧本里的动作提示，而不是一句台词。
+ * 中文斜体在手机上只是轻微倾斜，所以这里主要靠"小一档 + 淡一档"来做区别。 */
 .bubble--aside {
-  max-width: 86%;
+  max-width: 88%;
   padding: 2px 2px 2px 4px;
   background: transparent;
   border-color: transparent;
+  border-left: 0;
   box-shadow: none;
   color: var(--note);
-  font-style: italic;
-  font-size: 14.5px;
+  font-size: 14px;
+  text-indent: .02em;
 }
 
-/* 台词里夹着的旁白（"……（笑）"这种）：淡一档 + 斜体，跟说的话区分开 */
+/* 台词里夹着的旁白（"……（笑）"这种）：淡一档（另加一点斜体，
+   中文斜体在手机上其实只是轻微倾斜，主要还是靠颜色拉开距离） */
 .aside { color: var(--note); font-style: italic; }
 
 /* 气泡落下的小动画：位移很短，只是"出现"，不要抢戏。
@@ -365,7 +424,7 @@ body {
   margin: 2px 0;
   color: var(--note);
   font-size: 13px;
-  font-style: italic;
+  line-height: 1.6;
   text-align: center;
   animation: rise .26s ease-out both;
 }
@@ -373,12 +432,14 @@ body {
 /* ---------- "正在输入" ---------- */
 .typing { display: flex; justify-content: flex-start; }
 
+/* 和她的气泡同一张脸：同一圈边、同一道青绿左沿，所以"正在输入"读起来还是她在说话 */
 .typing__bubble {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 12px 14px;
+  padding: 13px 14px;
   border: 1px solid var(--card-line);
+  border-left: 2px solid var(--accent-edge);
   border-radius: var(--radius);
   border-top-left-radius: 5px;
   background: var(--card);
@@ -388,7 +449,7 @@ body {
 .typing__dot {
   width: 5px; height: 5px;
   border-radius: 50%;
-  background: var(--ink-faint);
+  background: var(--accent);
   animation: pulse 1.25s ease-in-out infinite;
 }
 
@@ -396,8 +457,8 @@ body {
 .typing__dot:nth-child(3) { animation-delay: .32s; }
 
 @keyframes pulse {
-  0%, 70%, 100% { opacity: .28; transform: translateY(0); }
-  35%           { opacity: .85; transform: translateY(-2px); }
+  0%, 70%, 100% { opacity: .3; transform: translateY(0); }
+  35%           { opacity: .9; transform: translateY(-2px); }
 }
 
 /* ---------- 输入区 ---------- */
@@ -408,7 +469,7 @@ body {
   gap: 8px;
   padding: 8px 12px calc(8px + var(--safe-bottom));  /* 躲开 home indicator */
   border-top: 1px solid var(--line);
-  background: var(--paper);
+  background: var(--bg-top);
 }
 
 .composer__input {
@@ -422,7 +483,8 @@ body {
   color: var(--ink);
   font: inherit;
   font-size: 16px;         /* 同上：16px 防止 iOS 聚焦时自动放大 */
-  line-height: 1.45;
+  font-weight: 400;
+  line-height: 1.45;       /* 和 app.js 里的 autoGrow 按 22px 行高对齐 */
   resize: none;
   overflow-y: auto;
   box-shadow: var(--shadow);
@@ -476,6 +538,7 @@ body {
   color: var(--ink);
   font: inherit;
   font-size: 14px;
+  font-weight: 400;
   text-align: left;
   cursor: pointer;
 }
@@ -485,7 +548,7 @@ body {
 
 /* ---------- 宽屏：把这一屏摆成一台手机，而不是拉成一张大饼 ---------- */
 @media (min-width: 640px) {
-  body { background: var(--paper-deep); }
+  body { background: var(--bg-deep); }
 
   #app {
     max-width: 560px;
