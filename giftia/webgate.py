@@ -65,6 +65,11 @@ STATIC_TYPES = {
 
 # 一次 drain 最多处理几个请求（别让网站把 QQ 那边饿死）
 DRAIN_PER_TICK = 2
+# 队列里最多排这么多个；再多人就先谢客。
+# 为什么：她单线程、每条要 1~5 秒，排到 10 个人最后一个要等 40 秒以上，
+# 而 HTTP 那边 60 秒就超时 —— 让人干等 60 秒再看到"504"是最差的第一印象。
+# 直接说"她正忙着"反而体面，而且前端能立刻重试。
+MAX_PENDING = 5
 # HTTP 那边最多等多久（秒）。超过就回 504——她可能正在跟 QQ 那边说话
 JOB_TIMEOUT = 60.0
 # 聊天接口每个 IP 每分钟最多几次（防 token 被烧）
@@ -300,6 +305,12 @@ class WebGate:
                 text = str((self._body().get("text") or "")).strip()
                 if not text:
                     return self._json(HTTPStatus.BAD_REQUEST, {"error": "空消息"})
+                # 排队太深就先谢客 —— 比让ta干等 60 秒再看到 504 体面
+                if gate.pending >= MAX_PENDING:
+                    return self._json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"error": "她正忙着，过一会儿再来找她吧。", "busy": True},
+                    )
                 # 访客的身份只能用 cookie 里的字符串（**不能在这里读库**）
                 visitor = self._cookie("aila_visitor") or "web-guest"
                 job = Job(
