@@ -168,12 +168,42 @@ def send_push(
     ttl: int = 86400,
     urgency: str = "normal",
     timeout: float = 20.0,
+    relay_url: str = "",
+    relay_secret: str = "",
 ) -> tuple[bool, int, str]:
     """发一个**空载荷**推送。返回 (成功, HTTP 码, 说明)。
 
     201 = 推送服务收下了；404/410 = 这个订阅已经失效（该删掉）。
+
+    `relay_url`：**大陆服务器必须用**。实测服务器连不上 fcm.googleapis.com
+    （6 秒超时），但能连 Cloudflare —— 所以推送先发给一个 Cloudflare Worker，
+    由它代发（见 deploy/cf-push-relay/worker.js）。为空时直连。
     """
     headers = make_vapid_headers(endpoint, private_b64, public_b64, subject=subject)
+
+    if relay_url:
+        from urllib.parse import quote
+
+        sep = "&" if "?" in relay_url else "?"
+        target = f"{relay_url}{sep}to={quote(endpoint, safe='')}"
+        req = urllib.request.Request(target, data=b"", method="POST")
+        req.add_header("X-Relay-Secret", relay_secret)
+        req.add_header("X-Push-Authorization", headers["Authorization"])
+        req.add_header("X-Push-TTL", str(ttl))
+        req.add_header("X-Push-Urgency", urgency)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                try:
+                    code = int(__import__("json").loads(body).get("status") or 0)
+                except ValueError:
+                    code = 0
+                return code in (200, 201, 202), code, body[:200]
+        except urllib.error.HTTPError as exc:
+            return False, exc.code, exc.read().decode("utf-8", "replace")[:200]
+        except Exception as exc:
+            return False, 0, f"{type(exc).__name__}: {exc}"
+
     headers.update({"TTL": str(ttl), "Urgency": urgency, "Content-Length": "0"})
     req = urllib.request.Request(endpoint, data=b"", headers=headers, method="POST")
     try:
@@ -266,6 +296,8 @@ def notify_all(
     public_b64: str,
     subject: str,
     title: str = "艾拉",
+    relay_url: str = "",
+    relay_secret: str = "",
 ) -> tuple[int, int]:
     """把消息记下来，然后给**所有搭档的设备**推一个空响铃。
 
@@ -279,7 +311,10 @@ def notify_all(
         endpoint = str(sub.get("endpoint") or "")
         if not endpoint:
             continue
-        sent, code, _ = send_push(endpoint, private_b64, public_b64, subject=subject)
+        sent, code, _ = send_push(
+            endpoint, private_b64, public_b64, subject=subject,
+            relay_url=relay_url, relay_secret=relay_secret,
+        )
         if sent:
             good += 1
         elif code in (404, 410):

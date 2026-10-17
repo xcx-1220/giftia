@@ -449,6 +449,10 @@ class WebGate:
                 private_b64=priv,
                 public_b64=self.push_public_key(),
                 subject=str(os.environ.get("VAPID_SUBJECT") or "mailto:aila@giftia.icu"),
+                # 大陆服务器直连不到 fcm，走 Cloudflare Worker 中转。
+                # 没配就直连（在墙外的机器上依然能用）。
+                relay_url=str(os.environ.get("PUSH_RELAY_URL") or "").strip(),
+                relay_secret=str(os.environ.get("PUSH_RELAY_SECRET") or "").strip(),
             )
         except Exception as exc:
             print(f"[push] 推送失败（不影响她别的功能）：{type(exc).__name__}: {exc}",
