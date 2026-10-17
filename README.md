@@ -8,6 +8,7 @@
 - 到回收日，**回忆录交给你、记忆封存、实例换代**，新的她不认识你。
 
 零第三方依赖（纯 Python 标准库 + SQLite），**不需要 API key 就能跑通全流程**。
+除了 QQ，她还有一个网页入口：[giftia.icu](https://giftia.icu)——不是另一个她，是同一个她的另一扇门（见第 6.5 节）。
 
 ---
 
@@ -20,7 +21,7 @@ python run.py --mock
 # 一次看完她的一生（实测约 1 秒，推荐先看这个）
 python tools/demo_life.py
 
-# 端到端自测（当前 304 项全绿）：出厂状态、称呼、分层、召回强化、置信度、退化、人格注入、关系、心情、纪念日、做梦、主动联系、多人群聊分区、访客、回收、换代、迁移
+# 端到端自测（当前 320 项全绿）：出厂状态、称呼、分层、召回强化、置信度、退化、人格注入、关系、心情、纪念日、做梦、主动联系、多人群聊分区、访客、回收、换代、迁移
 python tools/selftest.py
 
 # 看她这一轮实际被注入了什么（人格 + 状态 + 记忆 + 规则，离线、不写库）
@@ -31,12 +32,16 @@ python tools/show_prompt.py
 # 全程在临时目录跑，不碰 data/ 里的正式数据
 python tools/live_check.py
 
-# 协议层自测：QQ 适配器对着本地假网关完整跑一遍（不需要任何凭据）
+# 协议层 / 入口自测：QQ 适配器对着本地假网关完整跑一遍，网站入口对着本地 HTTP 跑一遍（都不需要凭据）
 python tools/ws_selftest.py              # 17 项：握手/掩码/长度编码/分片/心跳
-python tools/qq_protocol_selftest.py     # 72 项：鉴权/事件/回复/去重/隔离/聚批/发送/优雅退出
-python tools/audit.py                    # 10 项：配置与指令的"声明↔实现"双向核对（静态审计）
+python tools/qq_protocol_selftest.py     # 77 项：鉴权/事件/回复/去重/隔离/聚批/发送/优雅退出
+python tools/web_selftest.py             # 36 项：网站入口自测：口令门禁/全链路/静态文件/访客隔离
+python tools/audit.py                    # 11 项：配置与指令的"声明↔实现"双向核对（静态审计）
 python tools/judge_check.py              # LLM 当裁判的触发决策评测（没配 API key 会自动跳过）
 ```
+
+上面五个有固定项数的脚本合计 **461 项**本地断言
+（320 端到端 + 17 WebSocket + 77 QQ 协议 + 36 网站入口 + 11 审计），全部离线、不需要凭据。
 
 接真实模型（DeepSeek）：把 key 写进项目根目录的 `.env`（已被 `.gitignore` 忽略），然后直接启动。
 
@@ -422,11 +427,13 @@ python run.py --reset --yes           # 清空重来
 - **协议细节逐条对照官方文档**（2026-10）：鉴权地址 `api.bot.qq.com`、`Authorization: QQBot {token}`、
   `GET /gateway` 取网关地址、op10/2/1/11/6 的消息序列、被动回复的 `msg_id` + `msg_seq`、
   事件重复推送的去重。**业务失败时 HTTP 仍是 200，必须看响应体里的 `code`**——这条已经处理了。
-- **仍然没有验证的部分**：真实的消息收发。**连接层已经用真实凭据验证过了**（2026-10）：
-  鉴权、`GET /gateway` 取地址、op10 hello、op2 identify、op0 READY 全部走通
-  （intents = `GROUP_AND_C2C_EVENT` 被平台接受，心跳周期 41 秒）。
-  只剩"平台推过来一条消息 → 她回过去"这一步要等你加了机器人才能验。
-  顺带一个真机才发现的事：`GET /gateway` 实际返回的是 `wss://api.sgroup.qq.com/websocket/`，
+- **已经在真实平台上跑着**：QQ 适配器在生产环境运行了数周，真实的消息收发、回复、
+  记忆落库都已经走通（她的记忆和对话是真的，不是演示）。协议层自测有
+  `tools/ws_selftest.py`（17 项）和 `tools/qq_protocol_selftest.py`（77 项），
+  端到端另有 320 项。**连接层也用真实凭据验证过**（2026-10）：鉴权、`GET /gateway` 取地址、
+  op10 hello、op2 identify、op0 READY 全部走通（intents = `GROUP_AND_C2C_EVENT`
+  被平台接受，心跳周期 41 秒）。
+- 一个真机才发现的事：`GET /gateway` 实际返回的是 `wss://api.sgroup.qq.com/websocket/`，
   **不是**文档示例里写的 `api.bot.qq.com` —— 所以代码始终以 `/gateway` 的返回为准。
 
 ### 平台限制（会直接影响她的行为方式）
@@ -440,8 +447,9 @@ python run.py --reset --yes           # 清空重来
 - **主动消息**另有频控（未认证 30/qpm，认证 60/qpm；单关系 20/qpm，每个好友每天最多收 1000 条）。
 - **她其实可以主动找你**——我说错过一次，这里更正：官方提供**互动召回消息**（发消息时带 `is_wakeup`），
   在你主动和她对话后的 30 天内，她可以分 **4 个周期各发 1 条**（当天 / 1–3 天 / 3–7 天 / 7–30 天）。
-  次数用完就没有了。**`use_wakeup = true` 已经接上了它**（本地账本会同步收紧到 4 条 / 30 天），只是真实发送还没在平台上验证过。它和这个项目的主题意外地合拍——
-  一个能主动联系你的次数是有限的、而且会耗尽的她。
+  次数用完就没有了。**`use_wakeup = true` 已经接上了它**（本地账本会同步收紧到 4 条 / 30 天）；
+  不过这一支出厂是 `false`，生产配置走的是普通主动消息，官方「互动召回」的发送没有单独实测过。
+  它和这个项目的主题意外地合拍——一个能主动联系你的次数是有限的、而且会耗尽的她。
 
 **微信：我之前的结论过时了，这里更正。** 我早先写过"微信个人号只能走灰色路径"——那是 2025 年的情况。
 2026-03-22 腾讯发布了**微信官方「ClawBot」插件**，个人微信有了官方通道：
@@ -449,7 +457,7 @@ python run.py --reset --yes           # 清空重来
 （要求微信客户端 8.0.69+，登录后会话列表里会出现一个「微信ClawBot」）。
 所以现在微信侧的正确做法是**走官方通道**，而不是 itchat / gewechat / PadLocal 那一代——
 [dify-on-wechat](https://github.com/hanfangyuan4396/dify-on-wechat) 的 README 顶部已经写明"依赖的 itchat 与 gewechat 均已无法使用"。
-本项目目前只实现了 QQ 适配器；要接微信，建议直接把 `giftia` 挂到 CowAgent 的 channel 层，而不是自己写协议。
+本项目目前只实现了 QQ 适配器（网页入口是同一进程的另一个入口，见 6.5）；要接微信，建议直接把 `giftia` 挂到 CowAgent 的 channel 层，而不是自己写协议。
 
 > 未查证：ClawBot 的开放范围与能力边界（灰度条件、是否支持群聊、频控），用之前自己确认。
 
@@ -570,9 +578,9 @@ rewrite_when_weak = true       # 检索太弱时才改写查询（省调用）
 
 ---
 
-## 6. 下一步：接到 QQ
+## 6. 接到 QQ（她现在就在上面跑着）
 
-**推荐 QQ 官方机器人**（[开放平台](https://q.qq.com) / [文档](https://bot.qq.com/wiki/bot_new_product-intro/)）：不封号、群与单聊全场景、支持 WebSocket（不依赖公网服务器，适合个人单机）。
+**推荐 QQ 官方机器人**（[开放平台](https://q.qq.com) / [文档](https://bot.qq.com/wiki/bot_new_product-intro/)）：不封号、群与单聊全场景、支持 WebSocket（不依赖公网服务器，适合个人单机）。下面是从零接入的步骤；已经接好的话可以直接跳到下面的 6.5 节。
 
 ### 你要在 QQ 那边做的（都是点几下，不用写代码）
 
@@ -631,18 +639,53 @@ python adapters/qq_official.py             # 真正连上 QQ
 其它指令：`/name 小林`（改口：以后她这么叫你）、`/status`（她的寿命与关系状态）、`/people`（她认得群里谁）、`/profile [名字]`（她对每个人的印象）、
 `/impress 名字 一句话`（手动补一条印象）、`/forget 编号`（让她忘掉记错的）、`/reconcile`（手动整理记忆）、`/help`。
 
+## 6.5 网页入口：除了 QQ，她还有一个网站
+
+同一个进程可以再开一个网站入口（`giftia/webgate.py`）。**不是第二个她**：
+网站上说的话进的是同一份记忆，搭档在网页上和在 QQ 上面对的是同一个会话、
+同一个心情、同一条寿命。上线地址是 [giftia.icu](https://giftia.icu)。
+
+```powershell
+# 和 QQ 一起开（只监听 127.0.0.1:8111，公网走 Cloudflare Tunnel）
+python adapters/qq_official.py --web-port 8111
+
+# 只跑网站、不连 QQ（本机调试）
+python adapters/qq_official.py --web-port 8111 --web-only
+```
+
+> `--web-only` 有个代码现状的小别扭：它不连 QQ，但 `main()` 在进入网站循环前
+> 仍会检查 `QQ_BOT_APPID` / `QQ_BOT_SECRET` 非空，空着会以"缺少凭据"退出。
+> 所以本机调试也要在 `.env` 里留两个占位值。详见 [docs/WEB.md](docs/WEB.md)。
+
+**口令就是身份。** 网站没有"注册账号"这回事，只有两套口令：
+
+| 口令（`.env`） | 谁 | 她怎么对待 |
+|---|---|---|
+| `AILA_WEB_SECRET` | 你（搭档） | `scene="c2c"` + 搭档身份 → 和 QQ **共享同一份记忆、同一个会话上下文** |
+| `AILA_WEB_FRIEND_PASS` | 朋友（访客） | `scene="guest"` + 独立 id → 只看得到他自己的事；写自己的记忆分区；**心情/亲密度/寿命完全不动**；额度只有你的一半 |
+
+**为什么必须两套口令**：用同一个口令的话，朋友进来就是"以搭档的身份"——
+她会当着他的面提起你的私事，他的话会写进你的会话，你的心情、关系、寿命会被陌生人推进。
+
+完整细节（架构、接口、PWA、Cloudflare Tunnel、`put_env.sh` 的坑）见
+**[docs/WEB.md](docs/WEB.md)**。
+
 ## 7. 部署到服务器（腾讯云 / 任何 Linux 机器）
 
 ### 先想清楚：你需要服务器吗
 
-**接入本身不需要。** WebSocket 模式是机器人主动连出去（QQ 网关 + DeepSeek API），
+**只接 QQ 的话不需要。** WebSocket 模式是机器人主动连出去（QQ 网关 + DeepSeek API），
 没有任何入站服务，所以**不需要公网 IP、不需要域名、不需要 ICP 备案**。
 一台常开的旧电脑、NAS、树莓派同样能跑。
+
+> 网页入口不改变这件事：它只监听 `127.0.0.1:8111`，公网走 Cloudflare Tunnel（服务器主动出站）。
+> 公开一个网站也不需要开 80/443，仍然不需要 ICP 备案。见 [docs/WEB.md](docs/WEB.md)。
 
 | 什么时候值得租 | 说明 |
 |---|---|
 | **她得一直在** | 你关掉电脑，她就收不到消息、也不会整理记忆 |
 | **回收日要在对的时间** | 进程不在，回收会推迟到你下次启动她（见下方第 3 个坑） |
+| **要公开网页入口** | 已经上线：`giftia.icu` 走 Cloudflare Tunnel，服务器不用开 80/443（见 [docs/WEB.md](docs/WEB.md)） |
 | **以后要接微信客服/公众号** | 那条路需要公网 HTTPS 入口，那时才需要域名和备案 |
 
 ### 买什么
@@ -683,20 +726,21 @@ github.com port 443 after 136041 ms`）。**这不影响部署**——代码不�
 ```powershell
 # 本机（D:\ai chatbot）：打一个不含 data/ 与 .env 的包
 tar czf giftia-src.tar.gz --exclude=./data --exclude=./.git --exclude=./.env `
-    --exclude=./.review --exclude=./__pycache__ --exclude=*/__pycache__ .
+    --exclude=./.env.* --exclude=./.review --exclude=./__pycache__ --exclude=*/__pycache__ .
 # 确认包里没有凭据（应该什么都不输出）
-tar tzf giftia-src.tar.gz | Select-String '\.env$|^\./data/'   # 期望：无输出
+tar tzf giftia-src.tar.gz | Select-String '\.env($|\.)|^\./data/'   # 期望：无输出
 scp giftia-src.tar.gz ubuntu@你的服务器IP:/tmp/
 
 # 服务器：解包 → 用服务同一个解释器自检 → 安装
 ssh ubuntu@你的服务器IP
 mkdir -p /tmp/giftia-src && tar xzf /tmp/giftia-src.tar.gz -C /tmp/giftia-src
-cd /tmp/giftia-src && /usr/bin/python3 tools/selftest.py    # 期望 304 项全绿
+cd /tmp/giftia-src && /usr/bin/python3 tools/selftest.py    # 期望 320 项全绿
 sudo bash deploy/setup.sh
 ```
 
 > **`.env` 永远不要打包传输**：它是你的真凭据，而且服务器上那份已经配好了（权限 600）。
-> `setup.sh` 也不会覆盖它、不会覆盖 `data/`，更不会覆盖你已经改过的 `config/`。
+> `setup.sh` 打 tar 时显式排除 `.env` 和 `.env.*`——不排除的话，源码目录里那份会把服务器上的
+> 覆盖掉，凭据就丢了（真发生过）。`setup.sh` 也不会覆盖 `data/`，更不会覆盖你已经改过的 `config/`。
 
 **同步核对**（本机跑，只读）：
 
@@ -717,16 +761,26 @@ sudo bash deploy/setup.sh
 6. 启动——**但只在你已经填了 QQ 凭据时才启动**
 
 > 第 6 步这个判断很重要：没有 QQ 凭据时服务会立刻退出，而 `Restart=always` 会让她每 5 秒重启一次。
-> 所以脚本会装好、注册好，然后告诉你「等你拿到 AppID/AppSecret 填进 `/opt/giftia/.env`，
-> 再执行 `sudo systemctl start giftia-qq`」。
+> 所以脚本会装好、注册好，然后告诉你「等你拿到 AppID/AppSecret，用 `put_env.sh` 写进
+> `/opt/giftia/.env`，再执行 `sudo systemctl start giftia-qq`」。
 
-拿到凭据之后：
+拿到凭据之后，**不要直接 `nano` 服务器上的 `.env`**。本地写一个 LF 的 `KEY=VALUE` 文件，
+scp 上去，再用 `put_env.sh` 合并：
 
 ```bash
-sudo nano /opt/giftia/.env        # 填 QQ_BOT_APPID / QQ_BOT_SECRET
-sudo systemctl start giftia-qq
+# 本地：keys.env 一行一个键
+scp keys.env ubuntu@你的服务器IP:/tmp/keys.env
+
+# 服务器：逐键替换 + 重启
+sudo bash /opt/giftia/deploy/put_env.sh /tmp/keys.env --restart
 journalctl -u giftia-qq -f        # 看到「[就绪] 机器人「xxx」已上线」就成了
 ```
+
+`put_env.sh` 只替换文件里出现的键，其它键原样保留；写完会 `chown giftia:giftia`、
+`chmod 600`，再逐键回读确认（`KEY✓` / `KEY✗`）。
+不要用 `printf` 拼 `\n`，也不要用 `sudo sh -c "cat >> /opt/giftia/.env"`：
+前者会把 `\n` 写成字面量 `n`，后者的重定向由外层非 root shell 执行，
+删完旧键却追加失败，键就全没了。两次都真踩过，详见 [docs/WEB.md](docs/WEB.md)。
 
 注册的服务 `deploy/giftia-qq.service` 做了几件正经事：
 
@@ -760,8 +814,8 @@ tar czf ~/giftia-backup-$(date +%F).tgz -C /opt/giftia data   # 备份：记忆�
 2. **IP 白名单**：如果你在开放平台开了白名单，发送消息的出口 IP 会变成服务器的公网 IP，
    忘了改就会出现"收得到消息、发不出去"。
 3. **"准时回收"其实还差一步**：现在的回收日是在**你下一条消息进来时**触发的，
-   服务器常开并不能让她在你不在的时候独自走完仪式。要做到真正的定时，需要一个后台定时任务
-   ——注意她的 `Giftia` 不是线程安全的，得把动作投递回主线程。这件事和下面的"主动联系"一起做最合适。
+   服务器常开并不能让她在你不在的时候独自走完仪式。要做到真正的定时，需要一个后台定时任务；
+   她的 `Giftia` 不是线程安全的，得把动作投递回主线程——`webgate.py` 的队列就是一个现成范式。
 
 ---
 
@@ -779,7 +833,7 @@ git tag                    # 看版本标签
 
 | 挡住的 | 为什么 |
 |---|---|
-| `.env` | 里面是你的 DeepSeek key 和 QQ 凭据 |
+| `.env` | 里面是你的 DeepSeek key、QQ 凭据和网页口令 |
 | `data/` | 她的记忆、回收日志、封存档案 —— 而且体积会一直长 |
 | `__pycache__/` | 编译缓存 |
 
@@ -802,7 +856,7 @@ tar czf giftia-backup-$(date +%F).tgz -C /opt/giftia data
 
 > 调研了 GitHub 上一个成熟的同类项目（MIT），把它值得借鉴的机制整理成了一份可打勾的清单：
 > [`docs/BACKLOG.md`](docs/BACKLOG.md) —— **已做 / 待做 / 明确不做**三类都有，每条带理由。
-> 最值得接着做的一条是"让她能主动记一笔"（模型可调的记忆工具）。
+> 清单里"让她能主动记一笔"已经落地（见 3.6.5）；剩下的按性价比排在里面。
 
 - **检索是词面匹配，不是语义**。查"难过"未必想得起"心情不好"。现在用**弱检索时查询改写**缓解（让模型做同义扩展），
   但没上向量库——要升级只需替换 `memory.py` 的 `recall()`，接口不变。
@@ -811,21 +865,26 @@ tar czf giftia-backup-$(date +%F).tgz -C /opt/giftia data
 - **多人共用会串**：现在是一个进程一个她。适配器靠自动认主（私聊第一人 / 群主）+ `/bind` 保证"一个她只服务一个搭档"，
   别人叫她不进记忆、也不消耗她的寿命；要真的多人各有一个她，需要按 `user_id` 建多个 `Giftia`
   并给她自己的 `meta` 命名空间（表结构已按 `instance_no` / `session_id` 分好，但全局 meta 要改）。
-- ~~没有实现主动联系~~ **已实现**（含 `is_wakeup` 互动召回；30 天 4 条的硬限由本地账本同步收紧）。缺的是真实平台验证，不是代码。
-  在服务器上跑时这是最值得做的一块——次数有限且会用完，机制本身就是隐喻。
+- **主动联系已实现**（含 `is_wakeup` 互动召回；30 天 4 条的硬限由本地账本同步收紧）。
+  仓库默认的 `[outreach]` 是 `enabled = true`、`use_wakeup = false`，走普通主动消息；官方互动召回的发送没有单独实测过。
+  首次启用建议先用 `/outreach` 预览几天。
 - **"准时回收"还差一步**：回收日目前是在**你下一条消息进来时**触发的，服务器常开并不能让她在你不在时独自走完仪式。
   需要后台定时任务；注意 `Giftia` 不是线程安全的（见 `brain.py` 顶部注释），动作要投递回主线程。
 - **没有语音**。DeepSeek 支持视觉，发图给她是可行的扩展；语音要接 TTS/ASR。
-- **主动联系的发送没在真实平台验证过**：本地计划、写作、配额、定时器都测了，
-  但真发出去要走官方 OpenAPI，我没有凭据所以没跑过。首次启用建议先用 `/outreach` 预览几天。
-- **QQ 适配器的真实连接未验证**（没有平台凭据）；WebSocket 协议层与业务链路已分别经过本地测试（17 + 72 项）。
+- **QQ 适配器已在生产环境运行**：真实的记忆和对话都在跑；端到端与协议层分别有
+  320 + 77 项本地自测覆盖（`selftest.py` / `qq_protocol_selftest.py`）。
+- **网站入口是串行的**：多个访客同时发会排队（每条大约 1～5 秒），10 个人同时说话，
+  最后一个可能等 40 秒甚至 504；网站请求处理期间 QQ 那条线也会被阻塞同样久。
+  这是"一个她"的必然代价，详见 [docs/WEB.md](docs/WEB.md)。
+- **还没有 Web Push，也还没有自动备份**：她不会主动弹通知找你，只能你点开；
+  全部数据是服务器上 `/opt/giftia/data/giftia.db` 一个文件，零副本（第 7 节那条 `tar` 只是手动命令，要你自己跑）。
 
 ---
 
 ## 10. 项目地图
 
 ```
-.env                    你的 API key（已被 .gitignore 忽略，不要提交）
+.env                    凭据：DeepSeek key / QQ AppID+Secret / 网页口令（已被 .gitignore 忽略，不要提交）
 config/persona.toml     人格内核（改这个就能换人）
 config/settings.toml    模型 / 寿命 / 退化曲线 / 记忆参数
 giftia/config.py        配置加载（含 .env 解析）
@@ -844,14 +903,16 @@ giftia/persona.py       系统提示词组装（人格 + 状态 + 想起的事�
 giftia/recycle.py       回收仪式：回忆录、封存、换代
 giftia/brain.py         编排层 + 平台无关入口 handle_message()
 giftia/cli.py           终端界面与指令
+giftia/webgate.py       网站入口：HTTP 线程只入队，主线程执行（她不是线程安全的）
 giftia/trigger.py       她什么时候开口（响应档位，纯函数、可单测）
 giftia/agent_tools.py   她能自己调用的记忆工具（remember / search / forget）+ 工具协议
 run.py                  启动入口
 tools/selftest.py       端到端自测（离线，不需要 key；项数以脚本自己的汇总行为准）
 tools/show_prompt.py    打印她这一轮实际被注入的内容（人格审计用）
 tools/ws_selftest.py    17 项 WebSocket 协议自测（本地服务端，不联网）
-tools/qq_protocol_selftest.py  72 项 QQ 适配器协议自测（本地假网关，不需要凭据）
-tools/audit.py          10 项静态一致性审计（配置/指令的"声明↔实现"，不 import 被测模块）
+tools/qq_protocol_selftest.py  77 项 QQ 适配器协议自测（本地假网关，不需要凭据）
+tools/web_selftest.py   36 项网站入口自测（口令门禁/全链路/静态文件/访客隔离）
+tools/audit.py          11 项静态一致性审计（配置/指令的"声明↔实现"，不 import 被测模块）
 tools/judge_check.py    LLM 当裁判的触发决策评测（没配 API key 会自动跳过）
 tools/judge_cases.json  上面那套评测的 30 条用例
 tools/ws_testserver.py  两个协议测试共用的服务端帧编解码
@@ -859,9 +920,12 @@ tools/live_check.py     真实 API 连通性检查（临时目录，不碰正式
 tools/check_deploy.py   部署后核对：迁移是否安全、她的记忆还在不在（在服务器上跑）
 tools/check_sync.ps1    同步检查：逐文件比对本地仓库与服务器上的代码（在 Windows 上跑）
 docs/BACKLOG.md         借鉴清单：调研同类项目后整理的可打勾列表（已做/待做/不做）
+docs/WEB.md             网页入口：架构、身份、接口、PWA、Cloudflare Tunnel、凭据
 tools/demo_life.py      一次看完她的一生（离线）
-adapters/qq_official.py QQ 官方机器人适配器（鉴权/连接/收发的真机验证见第 6 节）
+adapters/qq_official.py QQ 官方机器人适配器（生产在跑；`--web-port` / `--web-only` 也在这里）
+web/                    PWA 前端（index.html / app.js / style.css / manifest.json / sw.js / icons）
 deploy/setup.sh         一键部署到 Linux 服务器
+deploy/put_env.sh       安全改服务器 `.env`：逐键替换 + 权限 600 + 回读确认
 deploy/giftia-qq.service  systemd 服务定义
 data/                   运行时生成：giftia.db、回收日志/、封存/
 ```

@@ -1416,7 +1416,15 @@ def main() -> int:
         bot.dry_run_demo()
         return 0
 
-    if not app_id or not secret:
+    # --web-only 只跑网站入口，**压根不连 QQ**，所以不需要 QQ 凭据。
+    # 帮助文本一直是这么写的，但这里原来无条件检查 —— 结果没凭据时
+    # "本机调试不用凭据"是假的：一启动就以"缺少凭据"退出。
+    if args.web_only and (not app_id or not secret):
+        print(
+            "[web] --web-only：没有 QQ 凭据，只跑网站入口（不连 QQ）。",
+            file=sys.stderr,
+        )
+    elif not app_id or not secret:
         print(
             "缺少凭据。请先在 .env 里填好（或设成环境变量）：\n"
             "  QQ_BOT_APPID=你的AppID\n"
