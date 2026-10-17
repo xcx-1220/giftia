@@ -1,1 +1,14 @@
-[]
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "icu.giftia.twa",
+      "sha256_cert_fingerprints": [
+        "32:43:1C:4F:D6:76:18:2C:13:06:19:41:BE:50:39:E2:85:0F:04:01:AC:B4:8E:27:0F:25:17:3B:34:A0:EC:6B"
+      ]
+    }
+  }
+]
