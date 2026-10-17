@@ -73,9 +73,9 @@ def _open_and_count(path: Path) -> tuple[int, int, str]:
     try:
         ok = con.execute("PRAGMA integrity_check").fetchone()[0]
         msgs = con.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        mems = con.execute(
-            "SELECT COUNT(*) FROM memories WHERE archived_at IS NULL"
-        ).fetchone()[0]
+        # 只数总行数：校验备份是「能不能打开、内容在不在」，
+        # 不该依赖业务逻辑（我一开始猜了 archived_at 这个列名，猜错了）
+        mems = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         return msgs, mems, ok
     finally:
         con.close()
