@@ -29,28 +29,39 @@
     }
   }
 
-  async function main() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-    // 有些浏览器根本没有 Notification（比如 iOS Safari 16.4 以下、部分内置浏览器）。
-    // 不先判存在性的话，下面那一行会抛 ReferenceError，整个 main() 直接中断 ——
-    // 表现就是"按钮从来不出现"，而且控制台里一眼看不出原因（踩过）。
-    if (typeof Notification === 'undefined') return;
-    if (Notification.permission === 'denied') return;    // 明确拒绝过，尊重
-    if (!('serviceWorker' in navigator)) return;
-
+  function makeButton() {
     const btn = document.createElement('button');
     btn.textContent = '让她能主动找你';
     btn.setAttribute('aria-label', '开启通知，让她能主动找你');
     btn.style.cssText = [
       'position:fixed', 'left:50%', 'transform:translateX(-50%)',
       'bottom:calc(env(safe-area-inset-bottom, 0px) + 92px)', 'z-index:30',
-      'padding:10px 18px', 'border-radius:999px', 'border:1px solid var(--accent-edge, #8fc9c3)',
+      'padding:10px 18px', 'border-radius:999px',
+      'border:1px solid var(--accent-edge, #8fc9c3)',
       'background:var(--card, #fff)', 'color:var(--accent-ink, #146660)',
       'font-size:13px', 'font-family:inherit', 'cursor:pointer',
       'box-shadow:var(--shadow, 0 2px 8px rgba(20,60,58,.08))',
       'opacity:0', 'transition:opacity .4s ease',
     ].join(';');
+    return btn;
+  }
 
+  async function main() {
+    // 这个浏览器能不能收推送？不能就安静退出，别抛红字。
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    // ★ 有些浏览器没有 Notification（iOS Safari 16.4 以下、微信/QQ 内置浏览器）。
+    //   不先判存在性，下一行就是 ReferenceError，整个 main() 中断 ——
+    //   表现是"按钮从来不出现"，而且控制台里一眼看不出原因（踩过）。
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission === 'denied') return;   // 明确拒绝过，尊重
+
+    const status = await api('/api/push/status');
+    // 访客 / 没登录 → 403 → 这里是 null → 什么都不做
+    if (!status || !status.owner) return;
+    if (status.subscribed) return;                    // 已经订阅过，别反复打扰
+    if (!status.public_key) return;                   // 服务端没配 VAPID
+
+    const btn = makeButton();
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       btn.textContent = '正在开启…';
@@ -87,9 +98,17 @@
     requestAnimationFrame(() => { btn.style.opacity = '1'; });
   }
 
+  function boot() {
+    // 整个流程兜住：任何一步不认识这个浏览器，都只是"不显示按钮"，
+    // 不在控制台里抛红字吓人。
+    main().catch(function (e) {
+      console.warn('[push] 这个浏览器可能不支持通知：', e && e.message);
+    });
+  }
+
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', main, { once: true });
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
   } else {
-    main();
+    boot();
   }
 })();
