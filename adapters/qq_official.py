@@ -1167,6 +1167,21 @@ class QQBot:
             where = "私聊" if kind == "c2c" else "群里"
             print(f"[主动·{where}·{plan_.reason_label}] {text}")
 
+            # 网页那边也推一下（无载荷推送 → 她的 SW 被唤醒 → 来取内容弹通知）。
+            # ★ **只有私聊（= 你）才推**：群里说的事不该弹你手机；
+            #   访客更是连订阅能力都没有（webgate 只允许 owner 订阅），两道保险。
+            # ★ 推送失败绝不影响她的主动联系 —— 这是锦上添花，不是主路径。
+            if kind == "c2c" and self.web_gate is not None:
+                try:
+                    sent_n, total = self.web_gate.push_notify(text)
+                    if total:
+                        print(f"[主动·推送] 已推送到 {sent_n}/{total} 台设备")
+                except Exception as exc:
+                    print(
+                        f"[push] 推送出错（不影响别的功能）：{type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+
     # ══ WebSocket 会话 ═══════════════════════════════════════
     def identify(self, ws: WebSocket) -> None:
         ws.send_text(

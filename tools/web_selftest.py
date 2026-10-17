@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -131,7 +132,13 @@ def main() -> int:
         box: dict = {}
 
         def worker() -> None:
-            box["r"] = _call(url, data=data, cookie=cookie)
+            try:
+                box["r"] = _call(url, data=data, cookie=cookie)
+            except BaseException as exc:      # 别让线程静默死掉，否则只看到 KeyError
+                import traceback
+
+                traceback.print_exc()
+                box["r"] = (0, {"_worker_error": f"{type(exc).__name__}: {exc}"})
 
         th = threading.Thread(target=worker)
         th.start()
@@ -236,6 +243,44 @@ def main() -> int:
         prompt = spy.latest()
         check("★★ 访客的提示词里**检索不到搭档的私事**（这条是硬门槛）",
               MARK not in prompt, prompt[:300])
+
+        print("\n8b. 推送：只有搭档能收，访客一律 403 ★★")
+        # 服务端起一个假的 VAPID 密钥，才能测到订阅/读取/测试推送全链路
+        from giftia.push import generate_keys
+
+        priv, pub = generate_keys()
+        os.environ["VAPID_PRIVATE_KEY"] = priv
+        os.environ["VAPID_PUBLIC_KEY"] = pub
+        os.environ["VAPID_SUBJECT"] = "mailto:test@example.com"
+        gate.max_per_minute = 60
+        gate._hits.clear()
+
+        code, st = call(f"{base}/api/push/status", cookie=owner_cookie)
+        check("★ 搭档能查推送状态", code == 200 and st.get("owner") is True,
+              f"{code} {st}")
+        check("状态里带了 VAPID 公钥（浏览器订阅要用）",
+              len(str(st.get("public_key") or "")) > 80, str(st)[:80])
+
+        code, payload = call(f"{base}/api/push/status", cookie=friend_cookie)
+        check("★★ 访客查推送状态 → 403（她主动发消息绝不打扰访客）",
+              code == 403, f"{code} {payload}")
+
+        fake_sub = {"endpoint": "https://fcm.googleapis.com/fcm/send/fake-1",
+                    "keys": {"p256dh": "x", "auth": "y"}}
+        code, _ = call(f"{base}/api/push/subscribe", data=fake_sub, cookie=friend_cookie)
+        check("★★ 访客想订阅推送 → 403（连订阅的机会都没有）", code == 403, str(code))
+        check("访客没能写进订阅表", len(gate.push_subs) == 0, str(len(gate.push_subs)))
+
+        code, sres = call(f"{base}/api/push/subscribe", data=fake_sub, cookie=owner_cookie)
+        check("★ 搭档能订阅", code == 200 and sres.get("count") == 1, f"{code} {sres}")
+
+        code, lastmsg = call(f"{base}/api/push/last", cookie=owner_cookie)
+        check("搭档能取「最后一条消息」（SW 靠它弹通知）", code == 200, f"{code} {lastmsg}")
+        code, _ = call(f"{base}/api/push/last", cookie=friend_cookie)
+        check("访客取不到那条消息", code == 403, str(code))
+
+        # 记住：推送内容不该泄漏到访客侧的提示词里（间接旁证）
+        gate.push_subs.remove(fake_sub["endpoint"])
 
         print("\n9. 访客不留痕：不进你的会话、不动关系")
         rows = hub.store.all_messages(hub.instance_no, limit=40)

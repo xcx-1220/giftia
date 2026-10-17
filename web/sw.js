@@ -111,3 +111,37 @@ async function asset(req) {
 
   return new Response('', { status: 504, statusText: 'offline' });
 }
+
+// ── 她主动找你（Web Push）──────────────────────────────────────
+// 推送本身是**空的**（无载荷）：标准载荷要 AES-128-GCM，而服务端是零依赖的
+// Python，没有 AES。所以流程是：空响铃 → 这里来取内容 → 弹通知。
+self.addEventListener('push', (event) => {
+  event.waitUntil((async () => {
+    let data = {};
+    try {
+      const r = await fetch('./api/push/last', { credentials: 'same-origin', cache: 'no-store' });
+      if (r.ok) data = await r.json();
+    } catch (e) { /* 取不到就用兜底文案 */ }
+    const text = String(data.text || '她好像有话想跟你说。');
+    await self.registration.showNotification(String(data.title || '艾拉'), {
+      body: text.length > 120 ? text.slice(0, 118) + '…' : text,
+      icon: './icons/icon-192.png',
+      badge: './icons/icon-192.png',
+      tag: 'aila-outreach',       // 同一条只留一个，不刷屏
+      renotify: true,
+      data: { url: './' },
+    });
+  })());
+});
+
+// 点通知 → 回到已经开着的页面，没有就打开一个
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil((async () => {
+    const all = await clients.matchAll({ type: 'window', includeUncontrolled: true });
+    for (const c of all) {
+      if ('focus' in c) return c.focus();
+    }
+    return clients.openWindow('./');
+  })());
+});

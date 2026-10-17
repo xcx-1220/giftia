@@ -113,6 +113,7 @@ class WebGate:
         host: str = "127.0.0.1",
         max_per_minute: int = DEFAULT_MAX_PER_MINUTE,
         friend_pass: str = "",
+        data_dir: Path | None = None,
     ) -> None:
         self.port = int(port)
         self.host = host
@@ -123,6 +124,12 @@ class WebGate:
         self.friend_pass = (friend_pass or "").strip()
         self.static_dir = Path(static_dir)
         self.max_per_minute = max(1, int(max_per_minute))
+        # 推送订阅 + 最后一条消息（只给搭档用，访客连订阅接口都进不去）
+        self._data_dir = Path(data_dir) if data_dir else Path(static_dir).parent / "data"
+        from .push import LastMessage, SubscriptionStore
+
+        self.push_subs = SubscriptionStore(self._data_dir / "push_subs.json")
+        self.push_last = LastMessage(self._data_dir / "push_last.json")
         self.jobs: queue.Queue[Job] = queue.Queue()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -251,6 +258,10 @@ class WebGate:
                 path = self.path.split("?", 1)[0]
                 if path == "/api/health":
                     return self._json(HTTPStatus.OK, {"ok": True})
+                if path == "/api/push/status":
+                    return self._guard(self._push_status)
+                if path == "/api/push/last":
+                    return self._guard(self._push_last)
                 return self._guard(lambda: self._static(path))
 
             def do_POST(self) -> None:  # noqa: N802
@@ -259,6 +270,10 @@ class WebGate:
                     return self._guard(self._login)
                 if path == "/api/chat":
                     return self._guard(self._chat)
+                if path == "/api/push/subscribe":
+                    return self._guard(self._push_subscribe)
+                if path == "/api/push/test":
+                    return self._guard(self._push_test)
                 return self._json(HTTPStatus.NOT_FOUND, {"error": "没有这个接口"})
 
             def _login(self) -> None:
@@ -302,10 +317,13 @@ class WebGate:
                         HTTPStatus.TOO_MANY_REQUESTS,
                         {"error": "你说得太快了，等一下下。"},
                     )
+                # ★ 先把请求体读掉，再做任何提前返回。
+                #   503 时若不读 body，keep-alive 连接上会留下未读字节，
+                #   下一个请求就错位 —— 表现为客户端莫名其妙"连接被掐断"。
                 text = str((self._body().get("text") or "")).strip()
                 if not text:
                     return self._json(HTTPStatus.BAD_REQUEST, {"error": "空消息"})
-                # 排队太深就先谢客 —— 比让ta干等 60 秒再看到 504 体面
+                # 排队太深就先谢客 —— 比让人干等 60 秒再看到 504 体面
                 if gate.pending >= MAX_PENDING:
                     return self._json(
                         HTTPStatus.SERVICE_UNAVAILABLE,
@@ -330,6 +348,44 @@ class WebGate:
                     HTTPStatus.OK,
                     {"reply": job.reply, "parts": split_parts(job.reply)},
                 )
+
+            # ── 推送（**只给搭档**）────────────────────────────
+            def _owner_only(self) -> bool:
+                return gate.role_of_cookie(self._cookie("aila_auth")) == "owner"
+
+            def _push_status(self) -> None:
+                if not self._owner_only():
+                    # 访客一律 403：她主动发消息只对搭档，绝不打扰访客
+                    return self._json(HTTPStatus.FORBIDDEN, {"error": "只有搭档能收她的通知"})
+                return self._json(HTTPStatus.OK, {
+                    "owner": True,
+                    "subscribed": len(gate.push_subs) > 0,
+                    "count": len(gate.push_subs),
+                    "public_key": gate.push_public_key(),
+                })
+
+            def _push_subscribe(self) -> None:
+                if not self._owner_only():
+                    return self._json(HTTPStatus.FORBIDDEN, {"error": "只有搭档能收她的通知"})
+                try:
+                    gate.push_subs.add(self._body())
+                except ValueError as exc:
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return self._json(HTTPStatus.OK, {"ok": True, "count": len(gate.push_subs)})
+
+            def _push_last(self) -> None:
+                if not self._owner_only():
+                    return self._json(HTTPStatus.FORBIDDEN, {"error": "只有搭档能看"})
+                return self._json(HTTPStatus.OK, gate.push_last.get() or {})
+
+            def _push_test(self) -> None:
+                if not self._owner_only():
+                    return self._json(HTTPStatus.FORBIDDEN, {"error": "只有搭档能收她的通知"})
+                good, total = gate.push_notify("这是一条测试通知 ✓")
+                return self._json(HTTPStatus.OK, {
+                    "sent": good, "total": total,
+                    "error": "" if total else "还没有任何设备订阅",
+                })
 
             def _static(self, path: str) -> None:
                 rel = "index.html" if path in ("/", "") else path.lstrip("/")
@@ -364,6 +420,40 @@ class WebGate:
         self._thread.start()
         print(f"[web] 网站入口已启动：http://{self.host}:{self.port}（口令已设）")
         return True
+
+    # ── 推送（给适配器调用）──────────────────────────────────
+    def push_public_key(self) -> str:
+        from .push import public_key_from_private
+
+        priv = self._push_private()
+        return public_key_from_private(priv) if priv else ""
+
+    def _push_private(self) -> str:
+        import os
+
+        return str(os.environ.get("VAPID_PRIVATE_KEY") or "").strip()
+
+    def push_notify(self, text: str) -> tuple[int, int]:
+        """记下消息并推给所有搭档设备。**绝不能抛异常** ——
+        推送是锦上添花，不能因为它让她连"主动联系"都做不了。"""
+        try:
+            import os
+
+            from .push import notify_all
+
+            priv = self._push_private()
+            if not priv:
+                return 0, 0
+            return notify_all(
+                self.push_subs, self.push_last, text,
+                private_b64=priv,
+                public_b64=self.push_public_key(),
+                subject=str(os.environ.get("VAPID_SUBJECT") or "mailto:aila@giftia.icu"),
+            )
+        except Exception as exc:
+            print(f"[push] 推送失败（不影响她别的功能）：{type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return 0, 0
 
     def stop(self) -> None:
         if self._server is not None:
