@@ -8,6 +8,7 @@
   "display": "standalone",
   "display_override": [
     "standalone",
+    "window-controls-overlay",
     "minimal-ui"
   ],
   "orientation": "portrait",
@@ -44,5 +45,6 @@
       "url": "./",
       "description": "打开她的页面"
     }
-  ]
+  ],
+  "dir": "ltr"
 }
