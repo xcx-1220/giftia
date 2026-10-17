@@ -1,0 +1,14 @@
+[Unit]
+Description=Giftia —— 每天给她的数据库做备份
+Documentation=file:/opt/giftia/docs/WEB.md
+
+[Timer]
+# 每天凌晨 4 点（她的安静时段里，聊天最少）
+OnCalendar=*-*-* 04:00:00
+# 服务器在凌晨关机/重启过的话，开机后补跑一次
+Persistent=true
+# 加一点随机抖动，避免和其他任务撞在同一秒
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

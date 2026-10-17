@@ -132,6 +132,15 @@ systemctl daemon-reload
 systemctl enable "$SERVICE" >/dev/null
 echo "已注册为开机自启"
 
+# 备份定时器：她的全部身家是一个 SQLite 文件，没有副本就等于随时可能全丢
+if [ -f "$SRC_DIR/deploy/giftia-backup.service" ]; then
+  install -m 644 "$SRC_DIR/deploy/giftia-backup.service" /etc/systemd/system/giftia-backup.service
+  install -m 644 "$SRC_DIR/deploy/giftia-backup.timer" /etc/systemd/system/giftia-backup.timer
+  systemctl daemon-reload
+  systemctl enable --now giftia-backup.timer >/dev/null
+  echo "已注册每日备份（每天 04:00，留最近 14 份）"
+fi
+
 # ── 6. 启动 ────────────────────────────────────────────────────
 say "6/6 启动"
 if [ $HAS_QQ -eq 1 ]; then

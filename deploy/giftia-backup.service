@@ -1,0 +1,32 @@
+[Unit]
+Description=Giftia —— 备份她的数据库（SQLite 在线热备）
+Documentation=file:/opt/giftia/docs/WEB.md
+
+[Service]
+Type=oneshot
+User=giftia
+Group=giftia
+WorkingDirectory=/opt/giftia
+
+# 只做一件事：在线热备 + 轮转 + 立刻校验
+# 备份是"她的全部身家"，所以**每次跑完都要验一遍能打开**（脚本里已含）
+ExecStart=/usr/bin/python3 /opt/giftia/deploy/backup_db.py
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# 加固：只读文件系统，只有 data/ 可写（和主服务一致）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/giftia/data
+
+# 日志给 journald：journalctl -u giftia-backup
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=giftia-backup
