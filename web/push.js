@@ -31,13 +31,12 @@
 
   async function main() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-
-    const status = await api('/api/push/status');
-    // 访客 / 没登录 → 403 → 这里是 null → 什么都不做
-    if (!status || !status.owner) return;
-    if (status.subscribed) return;                       // 已经订阅过，别反复打扰
+    // 有些浏览器根本没有 Notification（比如 iOS Safari 16.4 以下、部分内置浏览器）。
+    // 不先判存在性的话，下面那一行会抛 ReferenceError，整个 main() 直接中断 ——
+    // 表现就是"按钮从来不出现"，而且控制台里一眼看不出原因（踩过）。
+    if (typeof Notification === 'undefined') return;
     if (Notification.permission === 'denied') return;    // 明确拒绝过，尊重
-    if (!status.public_key) return;                      // 服务端没配 VAPID
+    if (!('serviceWorker' in navigator)) return;
 
     const btn = document.createElement('button');
     btn.textContent = '让她能主动找你';
