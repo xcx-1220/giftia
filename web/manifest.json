@@ -32,5 +32,17 @@
       "type": "image/png",
       "purpose": "maskable"
     }
+  ],
+  "id": "/",
+  "categories": [
+    "social",
+    "lifestyle"
+  ],
+  "shortcuts": [
+    {
+      "name": "和艾拉说话",
+      "url": "./",
+      "description": "打开她的页面"
+    }
   ]
 }
