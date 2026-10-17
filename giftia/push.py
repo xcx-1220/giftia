@@ -187,6 +187,14 @@ def send_push(
         sep = "&" if "?" in relay_url else "?"
         target = f"{relay_url}{sep}to={quote(endpoint, safe='')}"
         req = urllib.request.Request(target, data=b"", method="POST")
+        # ★ 必须带一个正常浏览器的 User-Agent：Cloudflare 的"浏览器完整性检查"
+        # 会把 urllib 的默认 UA 当成爬虫，直接回 `error code: 1010` ——
+        # 表现为推送一直发不出去，而 Worker 日志里什么都看不到（踩过）。
+        req.add_header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
         req.add_header("X-Relay-Secret", relay_secret)
         req.add_header("X-Push-Authorization", headers["Authorization"])
         req.add_header("X-Push-TTL", str(ttl))
