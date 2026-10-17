@@ -29,6 +29,58 @@
     }
   }
 
+  // 她主动联系你时，正文是发到 **QQ** 的；这里只把同一条消息补进网页的聊天记录，
+  // 这样"点通知进来"就能直接看到她说了什么，而不是一片空白。
+  //
+  // 为什么用"写 localStorage + reload 一次"而不是直接往 DOM 里塞节点：
+  // 渲染逻辑在 app.js 里（气泡结构、旁白斜体、历史裁剪都在那儿）。在这里复刻一套
+  // 一定会随 app.js 改动而失配。写进存储再让 app.js 自己渲染，是最不容易坏的接口。
+  async function mergeOutreach() {
+    const KEY = 'ella.history';          // 和 app.js 的 KEY_HISTORY 一致
+    const MARK = 'ella.pushMerged';
+    const last = await api('/api/push/last');
+    if (!last || !last.text || !last.ts) return;
+
+    // 已经合并过这条了？直接返回（这行也是防重载循环的关键：重载后标记仍在）
+    try {
+      if (localStorage.getItem(MARK) === last.ts) return;
+    } catch (e) {
+      return; // localStorage 不可用就别折腾了
+    }
+
+    let hist = [];
+    try {
+      hist = JSON.parse(localStorage.getItem(KEY) || '[]');
+    } catch (e) {
+      hist = [];
+    }
+    if (!Array.isArray(hist)) hist = [];
+
+    // 万一 app.js 已经自己写进去了（比如刚才在网页上聊过），只打标记
+    if (hist.some((m) => m && (m.text === last.text || m.content === last.text))) {
+      try { localStorage.setItem(MARK, last.ts); } catch (e) {}
+      return;
+    }
+
+    // text 和 content 都填上：不确定 app.js 读哪个字段，两个都给最稳
+    hist.push({
+      role: 'her',
+      text: last.text,
+      content: last.text,
+      ts: last.ts,
+      fromOutreach: true,
+    });
+    if (hist.length > 100) hist = hist.slice(-100);
+
+    try {
+      localStorage.setItem(KEY, JSON.stringify(hist));
+      localStorage.setItem(MARK, last.ts);
+    } catch (e) {
+      return;
+    }
+    location.reload();   // 让 app.js 用正常路径把它渲染出来
+  }
+
   function makeButton() {
     const btn = document.createElement('button');
     btn.textContent = '让她能主动找你';
@@ -58,8 +110,15 @@
     const status = await api('/api/push/status');
     // 访客 / 没登录 → 403 → 这里是 null → 什么都不做
     if (!status || !status.owner) return;
-    if (status.subscribed) return;                    // 已经订阅过，别反复打扰
+    if (status.subscribed) {
+      // 已经订阅过：看看有没有"她主动发的、网页上还没有的"消息，补进来
+      mergeOutreach().catch(function () {});
+      return;
+    }
     if (!status.public_key) return;                   // 服务端没配 VAPID
+
+    // 还没订阅：先补合并，再显示订阅按钮
+    mergeOutreach().catch(function () {});
 
     const btn = makeButton();
     btn.addEventListener('click', async () => {
