@@ -277,6 +277,33 @@ class QQBot:
             print("\n[退出] 收到停止信号，正在收尾…")
         self._stopping = True
 
+    def _outreach_push_only(self) -> None:
+        """--web-only 模式下的主动联系：没有 QQ，只剩推送这条路。
+
+        为什么不复用 _maybe_outreach：那个函数最终要 `self.send(...)` 发到 QQ 上，
+        QQ 关掉之后整个流程会卡在发送失败、`continue` 掉，推送也就跟着没了 ✗
+        所以这里只做三件事：判断该不该开口 → 让她想一句话 → 记进历史并推送。
+        """
+        try:
+            from giftia.brain import get_default
+            from giftia.outreach import can_send
+
+            hub = get_default(self.settings)
+            if not self.settings.outreach.enabled:
+                return
+            if not can_send(self.settings, hub.store, hub.clock.now()):
+                return
+            plan_, text = hub.compose_outreach(record=False, target="owner")
+            if not plan_ or not text.strip():
+                return
+            hub.note_outreach_sent(text, keep_in_history=True)
+            if self.web_gate is not None:
+                sent_n, total = self.web_gate.push_notify(text)
+                label = getattr(plan_, "reason_label", getattr(plan_, "reason", ""))
+                print(f"[主动·推送·{label}] {text[:20]}… → {sent_n}/{total} 台设备")
+        except Exception as exc:              # 主动联系出问题绝不能拖垮网站
+            print(f"[主动] 推送模式出错：{type(exc).__name__}: {exc}", file=sys.stderr)
+
     def start_web_gate(self) -> None:
         """开网站入口（**一个进程、两个入口**）。
 
@@ -1324,12 +1351,20 @@ class QQBot:
                       file=sys.stderr)
                 return
             print("[web] 只跑网站入口（不连 QQ）。Ctrl+C 退出。")
+            last_outreach = time.monotonic()
             while not self._stopping:
                 try:
                     self.web_gate.drain(self.settings)
                 except Exception as exc:
                     print(f"[web] 处理请求出错：{type(exc).__name__}: {exc}",
                           file=sys.stderr)
+                # ★ 主动联系：原本这条挂在 QQ 的发送路径上（QQ 发成功了才推）。
+                #   QQ 关掉之后那条路不会走，她就会变成**永远不会主动找你**——
+                #   一个不会主动的陪伴机器人，和网页聊天室没区别。
+                now = time.monotonic()
+                if now - last_outreach >= self.outreach_interval:
+                    last_outreach = now
+                    self._outreach_push_only()
                 time.sleep(0.05)
             return
         backoff = 5.0

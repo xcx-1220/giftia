@@ -508,6 +508,9 @@ class WebGate:
                         job.user_id or hub.handler_id or "handler",
                         settings=settings,
                         scene="c2c",
+                        # QQ 那边一直传了这个（她的昵称），网页之前没传 →
+                        # 她"知道你是谁"的程度会差一点，表现就是"感觉不太一样"
+                        speaker_name=getattr(hub, "handler_name", "") or "椎名",
                     )
                 job.finish(reply=reply)
             except Exception as exc:  # 网页出问题绝不能拖垮 QQ 那条线

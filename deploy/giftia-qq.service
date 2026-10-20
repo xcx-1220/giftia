@@ -23,7 +23,9 @@ WorkingDirectory=/opt/giftia
 #   · HTTP 线程只入队，真正的执行在这个进程的主循环里 —— 她不是线程安全的
 #   · 只监听 127.0.0.1:8111，**不对外开任何端口**；公网走 cloudflared 隧道
 #   · 门禁口令在 /opt/giftia/.env 的 AILA_WEB_SECRET（没配就不开这个入口）
-ExecStart=/usr/bin/python3 /opt/giftia/adapters/qq_official.py --web-port 8111
+# --web-only：暂停 QQ，只保留网页/APP（2026-10-20 起）。
+# 想恢复 QQ：去掉 --web-only 即可（别的都不用动）
+ExecStart=/usr/bin/python3 /opt/giftia/adapters/qq_official.py --web-port 8111 --web-only
 
 # 退出与重启
 Restart=always
