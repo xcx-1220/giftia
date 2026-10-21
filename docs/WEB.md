@@ -1,28 +1,37 @@
 # 网页入口（giftia.icu）
 
-除了 QQ，她还有一个网页入口：<https://giftia.icu>。
+当前使用网页 <https://giftia.icu> 和加载同一网站的安卓 App；QQ 自 2026-10-20 起暂停。
 
 不是另起一个服务，也不是复制一个她。`giftia/webgate.py` 在**同一个进程**里开了一个
 HTTP 线程：请求排进队列，由主线程交给她执行。所以网站上的你和 QQ 上的你，
 面对的是**同一份记忆、同一个会话上下文、同一条寿命**。
 
-> 本文写的是当前代码和已经上线的部署。端口、口令名、项数都以仓库里的实现为准；
-> 代码改了，先改代码，再回来改这里。
+> 2026-10-21 按代码与项目会话更新。最近一次会话中的线上验收为 2026-10-20、提交 `f5d0139`；
+> 本次未连接服务器，文中的历史部署记录不代表刚刚完成的线上健康检查。
 
 ---
 
-## 1. 架构：一个进程，两个入口
+## 1. 架构：一个进程，网页 / App 共用内核
+
+当前 `deploy/giftia-qq.service` 的启动命令是：
+
+```bash
+/usr/bin/python3 /opt/giftia/adapters/qq_official.py --web-port 8111 --web-only
+```
+
+服务名仍是 `giftia-qq`，但不会连接 QQ。主线程排空网页队列，每 600 秒检查一次搭档主动联系；
+恢复 QQ 后，网页队列改由 QQ WebSocket 主循环一起处理。
 
 ```
-QQ WebSocket 循环（主线程）                    HTTP 线程（辅助）
+主循环（主线程；当前不连 QQ）                   HTTP 线程（辅助）
 ────────────────────────────                  ─────────────────────────────
-收事件 → 处理 → 回 QQ                          POST /api/login  → 验口令、发 cookie
+处理网页任务、检查主动联系                      POST /api/login  → 验口令、发 cookie
    │                                           POST /api/chat   → 验 cookie、限流、入队
    │  每个 tick：                              GET  /api/health → 活着
    ├── web_gate.drain(settings) ◄──── 队列 ◄──┤ GET  /*         → 静态文件（PWA 壳）
    │        │                                  └─ 等结果（最多 60 秒）
    │        └── 最多 2 个/次 → handle_message(scene="c2c" / "guest")
-   └── 继续收 QQ
+   └── 继续循环（恢复 QQ 时还会收发 QQ 事件）
 ```
 
 ### HTTP 线程只做四件事
@@ -42,9 +51,9 @@ QQ WebSocket 循环（主线程）                    HTTP 线程（辅助）
 两个线程同时进去，轻则状态错乱，重则 SQLite 直接报
 `recursive use of cursors`。**队列是唯一安全的形状。**
 
-真正的执行在主循环里：`self.web_gate.drain(self.settings)`，每 tick 最多处理
-`DRAIN_PER_TICK = 2` 个请求。网站在等回话时，WebSocket 那边的 `recv` 最多睡 0.2 秒
-就回来排空一次——让排队的人不用干等，同时每 tick 只做 2 个，别让一次排空把 QQ 收消息卡太久。
+真正的执行在主循环里：`self.web_gate.drain(self.settings)`，每次最多处理
+`DRAIN_PER_TICK = 2` 个请求。`--web-only` 循环每次排空后睡 0.05 秒；
+恢复 QQ 时，WebSocket 循环也会定期调用 `drain()`。模型调用仍是同步串行执行。
 
 ### 踩过的坑：在 HTTP 线程里读一下 `handler_id` 也会炸
 
@@ -70,8 +79,9 @@ ProgrammingError: SQLite objects created in a thread can only be used in that sa
 
 | 目的 | 命令 | 说明 |
 |---|---|---|
-| 和 QQ 一起开 | `python adapters/qq_official.py --web-port 8111` | 服务器上的 systemd 就是这么配的 |
-| 只跑网站 | `python adapters/qq_official.py --web-port 8111 --web-only` | 不连 QQ，适合本机调试 |
+| 只跑网站 / App | `python adapters/qq_official.py --web-port 8111 --web-only` | 当前部署模板，不需要 QQ 凭据 |
+| 和 QQ 一起开 | `python adapters/qq_official.py --web-port 8111` | 恢复 QQ 时使用，需要 QQ 凭据 |
+| 本机离线调试 | `python adapters/qq_official.py --web-port 8111 --web-only --mock-llm` | 仍需网页口令；使用本机配置的数据目录 |
 | 看入口活着没 | `curl http://127.0.0.1:8111/api/health` | 返回 `{"ok": true}` |
 
 `--web-port 8111` **只监听 `127.0.0.1`**，不对外开端口。公网访问走 Cloudflare Tunnel
@@ -80,10 +90,10 @@ ProgrammingError: SQLite objects created in a thread can only be used in that sa
 没配 `AILA_WEB_SECRET` 时，`--web-port` 不会开入口：日志会提示去 `.env` 里加口令，
 QQ 那条线照常跑。`--web-only` 则必须同时给 `--web-port` 和口令，否则直接退出。
 
-> **代码现状的一个小别扭**：`--web-only` 确实不连 QQ，但 `main()` 在进入 `run()` 之前
-> 仍会检查 `QQ_BOT_APPID` / `QQ_BOT_SECRET` 是否非空。空着会以「缺少凭据」退出
-> （帮助文本写的是“本机调试不用凭据”，两处不一致）。本机调试时保留已有凭据，
-> 或先填两个非空占位值；占位值从代码看能跑，但没在空凭据的机器上实跑过。
+`--web-only` 已跳过 QQ 凭据检查，不需要填占位 AppID / Secret。真实对话需要 DeepSeek key。
+要从当前 systemd 恢复 QQ，确认 QQ 凭据后，移除实际 unit 中的 `--web-only`，
+执行 `sudo systemctl daemon-reload`、`sudo systemctl restart giftia-qq`。
+仓库 service 模板仍是网页模式，下次运行 `setup.sh` 会重新安装模板。
 
 ---
 
@@ -107,6 +117,10 @@ QQ 那条线照常跑。`--web-only` 则必须同时给 `--web-port` 和口令�
 
 **这就是“一个她”**：不是两个前端连到两个她，而是两个入口连到同一个她。
 
+2026-10-20 的修正还让网页搭档路径传入 `speaker_name`，取已知搭档称呼，空值时回退到
+代码中的“椎名”。这补齐了 QQ 原本就传入的昵称信息，但不保证不同场景每次回复都相同。
+如果感觉她更礼貌、有距离，先确认是否用访客口令登录；两种角色的提示词与记忆视角本来就不同。
+
 ### 访客：看得见自己，看不见你
 
 用 `AILA_WEB_FRIEND_PASS` 登录后：
@@ -114,7 +128,7 @@ QQ 那条线照常跑。`--web-only` 则必须同时给 `--web-port` 和口令�
 - `scene="guest"`，身份是 `aila_visitor` cookie 里的独立 id；
 - 视角只有 `person(他自己)`——**检索不到搭档的私事**；
 - 写进他自己的记忆分区，**不进搭档的会话**；
-- `is_handler=False` → 心情、亲密度、寿命**一点都不动**；
+- `is_handler=False` → 不推进搭档亲密度或心情，也不触发到期回收；寿命仍按时间自然流逝；
 - 限流额度只有搭档的一半（他花的是搭档的 token）。
 
 访客第一次登录时，服务端会发一个随机的 `aila_visitor`（16 个十六进制字符）。
@@ -128,7 +142,7 @@ QQ 那条线照常跑。`--web-only` 则必须同时给 `--web-port` 和口令�
 |---|---|
 | 她当着他的面提起你的私事 | 他拿到的是搭档的视角 |
 | 他的话写进你的会话 | 同一个 c2c 会话上下文 |
-| 你的心情、关系、寿命被陌生人推进 | `is_handler=True`，一切照常结算 |
+| 搭档关系和心情被陌生人推进，可能触发到期回收 | `is_handler=True`，进入搭档路径 |
 
 这不是“权限没配细”，是**身份模型错了**。所以两套口令不是可选项。
 
@@ -157,19 +171,27 @@ cookie 是 `HttpOnly; SameSite=Strict; Max-Age=31536000`。
 | 方法 | 路径 | 请求 | 成功 | 失败 |
 |---|---|---|---|---|
 | `POST` | `/api/login` | `{"pass": "..."}` | `200 {"ok":true,"role":"owner"\|"friend"}` + `Set-Cookie` | 口令错 `401`（强制延迟 0.4 秒） |
-| `POST` | `/api/chat` | `{"text": "..."}` | `200 {"reply":"...","parts":[...]}` | 未登录 `401`；超频 `429`；空消息 `400`；60 秒没处理完 `504`；执行出错 `502` |
+| `POST` | `/api/chat` | `{"text": "..."}` | `200 {"reply":"...","parts":[...]}` | 未登录 `401`；超频 `429`；空消息 `400`；队列繁忙 `503`；等待超时 `504`；执行出错 `502` |
 | `GET` | `/api/health` | — | `200 {"ok":true}` | — |
+| `GET` | `/api/push/status` | 搭档 cookie | `200 {owner,subscribed,count,public_key}` | 非搭档 `403` |
+| `POST` | `/api/push/subscribe` | 浏览器订阅 JSON、搭档 cookie | `200 {ok,count}` | 非搭档 `403`；缺 endpoint `400` |
+| `GET` | `/api/push/last` | 搭档 cookie | 最近消息 `{title,text,ts}`，没有时 `{}` | 非搭档 `403` |
+| `POST` | `/api/push/test` | 搭档 cookie | `200 {sent,total,error}` | 非搭档 `403`；发送结果要看 `sent`，不能只看 HTTP 200 |
 | `GET` | `/*` | — | 静态文件 | 目录穿越/不支持的后缀 `404` |
 
 几个实现细节：
 
 - 聊天文本最多 2000 字，超出截断。
+- 入队前检查 `pending >= 5` 就返回 `503 {busy:true,...}`，但队列本身无容量上限，检查也非原子操作。
+- 服务端等待任务最多 60 秒；前端 `TIMEOUT_CHAT` 是 45 秒。任一端超时都不会取消已排队的任务。
+- `/api/health` 只说明 HTTP 入口活着，不会检测模型、主线程任务或推送服务。
+- `/api/chat` 直接走 `handle_message()`，没有 CLI / QQ 的斜杠指令分发。
 - 口令错误也慢 0.4 秒再回，别让它成为一个高速爆破口。
 - `parts` 是后端把回复按换行和句末标点切出来的 1～3 段；前端一段一段播。
 - 静态文件按后缀白名单发（html/js/css/json/png/jpg/svg/ico/webmanifest/txt/woff2），
   解析后的路径必须还在 `web/` 里，否则 404。
-- HTML/JS/CSS 用 `no-cache`，改完刷新就能看到；图标之类缓存一天。
-- API 响应统一 `Cache-Control: no-store`。
+- HTTP 层的 HTML/JS/CSS 使用 `no-cache`，图标缓存一天；service worker 仍可能先显示旧壳再后台更新。
+- 经 `_json()` 返回的 API 响应带 `Cache-Control: no-store`；登录响应单独构造，当前未显式设置此头。
 
 ---
 
@@ -184,6 +206,8 @@ cookie 是 `HttpOnly; SameSite=Strict; Max-Age=31536000`。
 | `style.css` | 手机优先的布局与配色 |
 | `manifest.json` | PWA 清单 |
 | `sw.js` | service worker：只缓存静态壳 |
+| `push.js` | 搭档通知授权、订阅、最近主动消息合并 |
+| `.well-known/assetlinks.json` | 网站与安卓签名的关联声明 |
 | `icons/icon-192.png`、`icons/icon-512.png` | 图标 |
 
 ### 分段出现
@@ -202,6 +226,12 @@ cookie 是 `HttpOnly; SameSite=Strict; Max-Age=31536000`。
   **绝不缓存 `/api/`**——聊天是实时的，缓存住就会“她永远说上一句”；
 - 页面导航用“先给本地壳、后台再取新的”的策略，第二次打开瞬间出画面。
 
+清空网页显示历史不会删除服务端 SQLite 的消息和长期记忆。换设备不会自动拉取服务端历史；
+`push.js` 在页面初始化时尝试补入最近一条主动消息，不是完整聊天同步。
+若通知点击只聚焦已经打开的窗口而未重新初始化页面，消息可能需要刷新后才补入。
+
+当前视觉是冷白与青绿，保留深色模式。安卓 APK 加载同一网站，签名维护见 [ANDROID.md](ANDROID.md)。
+
 ### 手机端
 
 - 高度用 `100vh → 100dvh → var(--vvh, 100dvh)` 三层兜底；
@@ -211,7 +241,7 @@ cookie 是 `HttpOnly; SameSite=Strict; Max-Age=31536000`。
 
 ---
 
-## 6. 部署：Cloudflare Tunnel（已上线）
+## 6. 部署：Cloudflare Tunnel（历史部署记录）
 
 | 项 | 值 |
 |---|---|
@@ -235,7 +265,7 @@ cookie 是 `HttpOnly; SameSite=Strict; Max-Age=31536000`。
 
 - 公网没有暴露任何 Web 端口；
 - 服务器安全组不需要开 80/443；
-- **不需要 ICP 备案**——境内 IP 上没有 80/443 在对外服务，公网入口在 Cloudflare 边缘。
+- 公网入口位于 Cloudflare 边缘。这是网络拓扑说明，不能仅由源站是否开放 80/443 推导备案义务。
 
 ### 安装 cloudflared 的坑
 
@@ -256,13 +286,27 @@ cookie 是 `HttpOnly; SameSite=Strict; Max-Age=31536000`。
 | 键 | 用途 | 没有会怎样 |
 |---|---|---|
 | `DEEPSEEK_API_KEY` | 模型 | 只能用 mock，真实对话起不来 |
-| `QQ_BOT_APPID` | QQ 机器人 AppID | 适配器不启动 |
-| `QQ_BOT_SECRET` | QQ 机器人 AppSecret | 适配器不启动 |
+| `QQ_BOT_APPID` | QQ 机器人 AppID | 仅恢复 QQ 时需要，`--web-only` 可空 |
+| `QQ_BOT_SECRET` | QQ 机器人 AppSecret | 仅恢复 QQ 时需要，`--web-only` 可空 |
 | `AILA_WEB_SECRET` | 搭档口令 | 网站入口不启动（QQ 照常） |
 | `AILA_WEB_FRIEND_PASS` | 访客口令 | 只有搭档能登录，朋友进不来 |
+| `VAPID_PRIVATE_KEY` | VAPID 私钥，服务端据此推导公钥并签名 | 可以聊天，但不能订阅 / 发送通知 |
+| `VAPID_PUBLIC_KEY` | 密钥生成命令同时输出的公钥 | 当前服务端不直接读它，以私钥推导结果为准 |
+| `VAPID_SUBJECT` | VAPID 联系标识 | 默认 `mailto:aila@giftia.icu` |
+| `PUSH_RELAY_URL` | 推送中转完整地址，含 `/push` | 直连浏览器推送服务 |
+| `PUSH_RELAY_SECRET` | 中转鉴权，匹配 Worker 的 `RELAY_SECRET` | 已配置中转但鉴权不匹配时，发送失败 |
 
 `.env` 在项目根目录，已被 `.gitignore` 挡住；服务器上是 `/opt/giftia/.env`，权限 600。
-`.env.example` 目前只列了 DeepSeek 和 QQ 两组，网页这两组要自己加。
+`.env.example` 目前只列 DeepSeek 和 QQ，网页与推送键需要自行补充。下面只展示键名和占位值：
+
+```ini
+AILA_WEB_SECRET=替换为搭档口令
+AILA_WEB_FRIEND_PASS=替换为另一套访客口令
+VAPID_PRIVATE_KEY=替换为生成的私钥
+VAPID_SUBJECT=mailto:你的联系邮箱
+PUSH_RELAY_URL=https://你的Worker域名/push
+PUSH_RELAY_SECRET=替换为与Worker一致的密钥
+```
 
 ### 部署时不要覆盖服务器上的 `.env`
 
@@ -314,16 +358,67 @@ sudo bash /opt/giftia/deploy/put_env.sh /tmp/keys.env --restart
 
 规矩就一句：**本地写 LF 文件 → scp → `put_env.sh`**。全程不碰引号和转义。
 
+### 当前安装脚本的启动条件
+
+`setup.sh` 保留 `.env`、`data/` 和 `config/*.local.toml`，但会更新仓库默认配置及 service 模板。
+它会安装并启用 `giftia-backup.timer`。第 6 步仍按 QQ 凭据是否齐全决定自动重启，
+与当前 `--web-only` 模板存在不一致：纯网页部署配好模型和网页口令后，应手动
+`sudo systemctl restart giftia-qq` 并检查本机 `/api/health`。
+脚本不会替你生成 VAPID 密钥或部署 Tunnel / Worker。
+
+### Web Push：只通知搭档
+
+当前无 QQ 的主动联系路径是：每 600 秒检查理由和额度 → 生成一句话 →
+记入同一个搭档会话并记额度 → `push_notify()` 保存最近消息、通知已订阅设备。
+访客不能访问推送状态、订阅、最近消息和测试接口，均返回 403。
+
+1. 首次配置时在可信终端运行 `python -m giftia.push --gen`，私钥写入服务器 `.env` 后重启。
+   已有安装保留原私钥；生成新密钥不会迁移旧设备订阅。
+2. 如服务器无法直连浏览器推送服务，部署 [`deploy/cf-push-relay/worker.js`](../deploy/cf-push-relay/worker.js)，
+   Worker 设置 Secret `RELAY_SECRET`，服务端设置 `PUSH_RELAY_URL=https://…/push` 和匹配的 `PUSH_RELAY_SECRET`。
+   Worker 只转发白名单推送域名；本项目历史上用它绕过源站直连 FCM 超时。
+3. 用搭档口令登录支持通知的浏览器 / App，允许系统通知，点击“让她能主动找你”。
+   前端缺少 `Notification` / `PushManager` 或权限已拒绝时会直接跳过按钮。
+4. 用同一搭档会话调用 `POST /api/push/test` 查看 `sent / total`，再确认设备实际收到通知。
+
+推送是空载荷唤醒，service worker 再用搭档 cookie 从 `/api/push/last` 取正文；取不到时显示兜底文案。
+最多保留最近 12 个订阅，404 / 410 的失效订阅会清理。数据存于 `data/push_subs.json` 和 `data/push_last.json`。
+`push.js` 只在初始化时合并最近一条消息到本机 `ella.history`，并用 `ella.pushMerged` 记录合并时间。
+
+主动规则仍受 `[outreach]` 约束：仓库配置为每天最多 3 条、30 天最多 60 条、间隔至少 3 小时，
+23:30～08:00 安静，临近终端服务的理由除外。`--web-only` 固定按 owner 规划，
+不会按 `target="both"` 再给 QQ 群发一份。当前实现会在通知成功前记额度，失败不回滚。
+
+### 自动备份
+
+`giftia-backup.timer` 在服务器本地时间每天 04:00 起执行，随机延迟最多 300 秒，停机错过后补跑。
+`deploy/backup_db.py` 用 SQLite 在线备份 API 写入 `data/backups/giftia-YYYY-MM-DD.db`，
+保留最近 14 份，同日重跑覆盖当天备份，随后检查完整性并打印消息 / 记忆条数。
+
+```bash
+systemctl list-timers giftia-backup.timer --all
+sudo systemctl start giftia-backup.service
+journalctl -u giftia-backup --no-pager -n 30
+sudo -u giftia /usr/bin/python3 /opt/giftia/deploy/backup_db.py --list
+sudo -u giftia /usr/bin/python3 /opt/giftia/deploy/backup_db.py --check
+```
+
+自动任务只覆盖数据库，同机备份不覆盖磁盘丢失；回忆录、封存、推送 JSON、凭据、个人配置和 APK 签名材料需另行保存。
+完整迁移应先停主服务再归档，或使用在线备份生成的一致数据库副本。
+
 ---
 
 ## 8. 已知限制
 
 | 限制 | 具体表现 | 为什么 |
 |---|---|---|
-| **网站请求是串行的** | 多个访客同时发，会排队一条一条处理（每条大约 1～5 秒）。10 个人同时说话，最后一个可能等 40 秒甚至 504 | 她不是线程安全的；并行只有“给每个访客一个独立的她”，那就不是同一个艾拉了 |
-| **QQ 会被阻塞** | 网站请求处理期间，QQ 那条线同样停下来等 | 两边在同一个主线程里执行 |
-| **还没有 Web Push** | 她不会主动弹通知找你，只能你点开网页 | 现在只有请求-响应，没有推送通道 |
-| **还没有自动备份** | 她的全部数据是服务器上 `/opt/giftia/data/giftia.db` 一个文件，零副本；README 里有手动 `tar` 命令，但要你自己跑 | 备份要单独做；删掉 `data/` 就等于抹掉一切 |
+| **网站请求串行** | 慢模型调用会让后面的请求等待；排队深度检查返回 503，不是严格有界队列 | 当前对象与 SQLite 连接在主线程使用 |
+| **超时不取消任务** | 浏览器可能已报错，而她后来仍处理并写入数据库；立即重试可能重复 | 前端 45 秒、服务端 60 秒的超时没有取消或幂等协议 |
+| **恢复 QQ 后共享阻塞** | 网站处理期间会延迟 QQ 收事件，当前暂停 QQ 时不涉及 | 入口共用主线程 |
+| **历史只在本机** | 换设备看不到完整显示历史，推送仅补最近一条 | 尚无服务端历史拉取接口 |
+| **订阅状态按所有设备汇总** | 一台设备订阅后，另一台设备可能不再显示订阅按钮 | `status.subscribed` 是总订阅数是否大于 0，没有核对本机订阅 |
+| **推送失败仍占主动额度** | 没有订阅或通知发送失败时，主动消息仍可能记入会话和账本 | `--web-only` 先记账后发送 |
+| **没有异地自动备份** | 当前定时器只保留源站同机数据库副本 | 未实现异地复制与自动恢复演练 |
 
 另外几条来自代码的现实：
 
@@ -339,7 +434,7 @@ sudo bash /opt/giftia/deploy/put_env.sh /tmp/keys.env --restart
 ### 自测
 
 ```powershell
-python tools/web_selftest.py     # 36 项：口令门禁/全链路/静态文件/访客隔离
+python tools/web_selftest.py     # 44 项：口令/全链路/静态文件/访客隔离/推送接口权限
 ```
 
 它是真的起一个 HTTP 入口（`port=0` 让系统分配端口）、真的走队列，覆盖：
@@ -350,17 +445,21 @@ python tools/web_selftest.py     # 36 项：口令门禁/全链路/静态文件/
 - 静态文件（`/`、`app.js`、`style.css`、`manifest.json`、`sw.js`、图标）；
 - 目录穿越、空消息、限流；
 - 访客：独立身份、检索不到搭档私事、不进搭档会话、不动亲密度/心情。
+- 推送：搭档能读状态、订阅与取最近消息，访客收到 403；不向真实推送服务发通知。
 
-五个固定项数脚本的合计（2026-10-17 实测）：
+五个脚本的合计（2026-10-21 实测，均 0 失败；审计另有 3 条提示）：
 
 | 脚本 | 项数 |
 |---|---|
 | `tools/selftest.py` | 320 |
 | `tools/ws_selftest.py` | 17 |
 | `tools/qq_protocol_selftest.py` | 77 |
-| `tools/web_selftest.py` | 36 |
+| `tools/web_selftest.py` | 44 |
 | `tools/audit.py` | 11 |
-| **合计** | **461** |
+| **合计** | **469** |
+
+测试不调用真实模型 / QQ。协议与网页套件需要允许本机回环连接；沙箱若报 `WinError 10013`，
+应在允许本地套接字的环境复跑。本次这些套件已复跑通过；未重验线上 Tunnel、设备通知和备份定时器。
 
 ### 排障
 
@@ -371,8 +470,13 @@ python tools/web_selftest.py     # 36 项：口令门禁/全链路/静态文件/
 | 公网打不开、本机却正常 | cloudflared 的 systemd 服务、Cloudflare 的 DNS/隧道配置 |
 | 登录一直 401 | 口令是不是改过；改口令会让旧 cookie 失效，重新登录 |
 | 聊天 429 | 说太快，限流了；等一分钟 |
-| 聊天 504 | 她那边排队或正在处理别的请求；这是串行的代价，不是网络超时 |
+| 聊天 503 / `busy` | 等待队列过深，稍后重试 |
+| 聊天 504 / 前端超时 | 检查排队深度、模型耗时和日志；任务可能还会执行，不要连续重复提交 |
 | 页面 404 | `web/` 没部署全；用 `.\tools\check_sync.ps1` 逐文件对一遍 |
+| 网页和原 QQ 感觉不同 | 检查搭档 / 访客身份、称呼和实际加载的人格配置；访客不具备搭档记忆 |
+| “让她能主动找你”按钮不出现 | 搭档登录、浏览器能力 / 权限、VAPID 私钥、多设备汇总订阅状态；登录后可刷新页面 |
+| 测试接口 200 却没通知 | 看 `sent / total`，再看 Worker `/push` 路径与密钥、上游状态和设备权限 |
+| 备份没出现 | `systemctl list-timers giftia-backup.timer --all` 和 `journalctl -u giftia-backup`；核对服务器时区 |
 
 她自己的日志里，网站相关的前缀是 `[web]`；处理请求出错会打印异常栈，
 不会拖垮 QQ 那条线（`drain()` 里每个 job 单独兜底）。
@@ -386,7 +490,11 @@ python tools/web_selftest.py     # 36 项：口令门禁/全链路/静态文件/
 | `giftia/webgate.py` | HTTP 入口、口令、限流、队列、静态文件 |
 | `adapters/qq_official.py` | `--web-port` / `--web-only` 的接线，主循环里 `drain()` |
 | `web/` | PWA 前端 |
-| `tools/web_selftest.py` | 网站入口自测（36 项） |
-| `deploy/giftia-qq.service` | systemd：`ExecStart` 带 `--web-port 8111` |
+| `giftia/push.py` | VAPID、推送发送、订阅与最近消息存储 |
+| `tools/web_selftest.py` | 网站入口自测（44 项） |
+| `deploy/giftia-qq.service` | systemd：`--web-port 8111 --web-only` |
+| `deploy/backup_db.py`、`deploy/giftia-backup.*` | 在线热备、轮转、校验与每日定时器 |
+| `deploy/cf-push-relay/worker.js` | 浏览器推送服务的 Cloudflare 中转 |
+| `docs/ANDROID.md` | [安卓套壳与签名维护](ANDROID.md) |
 | `deploy/put_env.sh` | 安全改服务器 `.env` |
 | `README.md` | [项目总览](../README.md)；网页入口那一节链到这里 |

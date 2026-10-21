@@ -8,7 +8,23 @@
 - 到回收日，**回忆录交给你、记忆封存、实例换代**，新的她不认识你。
 
 零第三方依赖（纯 Python 标准库 + SQLite），**不需要 API key 就能跑通全流程**。
-除了 QQ，她还有一个网页入口：[giftia.icu](https://giftia.icu)——不是另一个她，是同一个她的另一扇门（见第 6.5 节）。
+当前入口是网页 [giftia.icu](https://giftia.icu) 和安卓套壳 App；QQ 已暂停，适配器保留，恢复后仍使用同一个她（见第 6、6.5 节）。
+
+## 当前状态（2026-10-21 核对）
+
+本次按仓库代码、提交历史和 DeepSeek harness 的项目会话同步文档，未连接服务器重新验收。
+最近一次会话验收在 **2026-10-20**，对应提交 `f5d0139`；下表描述仓库实现与当时的部署记录。
+
+| 项目 | 状态与入口 |
+|---|---|
+| 网页 / App | 已实现 PWA 和安卓 TWA 套壳；部署模板使用 `--web-port 8111 --web-only`，暂停 QQ |
+| 人格 | 2026-10-18 选定方案 C：原本开朗、三年前封闭；保留 81920 小时寿命，主题是记忆变淡。见[人设说明](docs/人设卡-v2-艾拉.md) |
+| 主动联系 | `--web-only` 有独立的推送路径，只主动联系搭档，不向访客推送 |
+| Web Push | VAPID、订阅、最近一条主动消息与 Cloudflare Worker 中转均已实现；需设备授权和服务端配置 |
+| 自动备份 | SQLite 在线热备，每天服务器本地时间 04:00 起、随机延迟最多 5 分钟，保留最近 14 份 |
+| 本地验证 | 本次五个自测脚本 **469 项通过 / 0 失败**，详见第 1 节；不代表线上推送或备份已重新验收 |
+
+日常运行见 [WEB.md](docs/WEB.md)，APK 与签名维护见 [ANDROID.md](docs/ANDROID.md)，后续事项见 [BACKLOG.md](docs/BACKLOG.md)。
 
 ---
 
@@ -35,13 +51,15 @@ python tools/live_check.py
 # 协议层 / 入口自测：QQ 适配器对着本地假网关完整跑一遍，网站入口对着本地 HTTP 跑一遍（都不需要凭据）
 python tools/ws_selftest.py              # 17 项：握手/掩码/长度编码/分片/心跳
 python tools/qq_protocol_selftest.py     # 77 项：鉴权/事件/回复/去重/隔离/聚批/发送/优雅退出
-python tools/web_selftest.py             # 36 项：网站入口自测：口令门禁/全链路/静态文件/访客隔离
+python tools/web_selftest.py             # 44 项：网站入口自测：口令门禁/全链路/静态文件/访客隔离/推送接口权限
 python tools/audit.py                    # 11 项：配置与指令的"声明↔实现"双向核对（静态审计）
 python tools/judge_check.py              # LLM 当裁判的触发决策评测（没配 API key 会自动跳过）
 ```
 
-上面五个有固定项数的脚本合计 **461 项**本地断言
-（320 端到端 + 17 WebSocket + 77 QQ 协议 + 36 网站入口 + 11 审计），全部离线、不需要凭据。
+上面五个脚本在 **2026-10-21** 实测合计 **469 项**本地断言
+（320 端到端 + 17 WebSocket + 77 QQ 协议 + 44 网站入口 + 11 审计），全部通过。
+这些测试不调用真实模型、不需要 QQ 凭据；协议与网页测试需要允许本机回环套接字。
+审计另有 3 条提示，不计为失败。上述通过数不包括真实 API 检查或 LLM 裁判评测。
 
 接真实模型（DeepSeek）：把 key 写进项目根目录的 `.env`（已被 `.gitignore` 忽略），然后直接启动。
 
@@ -73,12 +91,12 @@ python run.py --reset --yes           # 清空重来
 
 ---
 
-## 2. 五个机制，分别在哪
+## 2. 核心机制，分别在哪
 
 > **人格是怎么进去的？** 每一轮请求只有一条 system 消息，由 `giftia/persona.py` 的
-> `build_system_prompt()` 拼成六块：人格内核（来自 `config/persona.toml`，永不变，稳定命中缓存）
-> → 出戏提示 → 此刻状态（时间/剩余寿命/记忆阶段）→ 关于记忆 → 你现在想起的事（带置信度标记）
-> → 对话规则。想看实物，跑 `python tools/show_prompt.py`，或在会话里输入 `/prompt 一句话`。
+> `build_system_prompt()` 组装：人格内核（来自 `config/persona.toml`）与出戏提示、称呼、关系、
+> 心情、纪念日、梦、场景与人物信息、此刻状态、带置信度的回忆、工具协议和对话规则。
+> 想看实际文本，跑 `python tools/show_prompt.py`，或在 CLI / QQ 中输入 `/prompt 一句话`。
 
 | 机制 | 文件 | 怎么实现的 |
 |---|---|---|
@@ -91,7 +109,7 @@ python run.py --reset --yes           # 清空重来
 | **心情** | `giftia/mood.py` | 三股力量按优先级：**寿命压力 > 你的语气 > 每日漂移**。每天按日期确定性地掷一次骰子，所以她也会有说不清的心情。 |
 | **纪念日** | `giftia/occasions.py` | 认识第 1/3/7/30/100/365… 天她会自己想起来；你说过的"下周三要考试"会被算成具体日期，到那天她惦记着。 |
 | **做梦** | `giftia/dream.py` | 闲置时把最近的记忆**重度模糊**后揉成一场梦，第二天讲给你听。梦不进检索、不参与退化。 |
-| **主动联系** | `giftia/outreach.py` | 她主动开口的理由与配额：快到终端服务 > 你的大日子 > 纪念日 > 想讲梦 > 太久没见。**额度有限，用完就没有。** |
+| **主动联系** | `giftia/outreach.py` | 理由按优先级选择：终端服务迫近、大日子、事后回访、分享心情、纪念日、梦、太久没见；受额度、间隔与安静时段约束。 |
 
 ### 五个我认为最关键的设计
 
@@ -122,7 +140,7 @@ python run.py --reset --yes           # 清空重来
 
 ### 出厂状态：她一开始什么都不知道
 
-**没有任何预设。** 她刚被激活时，档案是空的：
+**没有关于搭档的预设。** 她刚被激活时，关于你的档案是空的；她自己的终端服务、香月和三年前事件等背景来自人格设定：
 
 - **不知道你叫什么** —— 不是预设成"搭档"再等你改，而是真的不知道。
   第一次说话她会问一句：「请问，我该怎么称呼你？」（只问一次）。
@@ -158,14 +176,16 @@ python run.py --reset --yes           # 清空重来
 |---|---|
 | 1 | 快到终端服务（她不安，只想确认你还在；**不许提"回收"，不许道别**） |
 | 2 | 你今天/明天有件大事 |
-| 3 | 今天正好是纪念日（错过的那几天不补，免得像打卡） |
-| 4 | 做了梦还没讲 |
-| 5 | 太久没说话（`idle_days`：出厂配置 2 天、代码默认 3 天） |
+| 3 | 前几天那件事办得怎样（默认回访最近 2 天） |
+| 4 | 想分享自己的心情（需满足闲置时长，同日同种心情只说一次） |
+| 5 | 今天正好是纪念日（错过的那几天不补，免得像打卡） |
+| 6 | 做了梦还没讲 |
+| 7 | 太久没说话（`idle_days`：出厂配置 2 天、代码默认 3 天） |
 
 **额度是有限的，用完就没有了**：出厂配置是 60 条 / 30 天、两次之间至少 3 小时（代码默认值是 4 条 / 30 天、6 小时间隔；`use_wakeup = true` 时按官方互动召回的硬限收紧成 4 条 / 30 天）。真正的第一道闸是**每天 3 条**。
 本地也记账、也限流——这本身就是这个项目的隐喻之一。
 
-**发到哪**由 `[outreach] target` 决定：
+**恢复 QQ 后发到哪**由 `[outreach] target` 决定；当前 `--web-only` 固定面向搭档推送：
 
 | 值 | 行为 |
 |---|---|
@@ -183,8 +203,10 @@ python run.py --reset --yes           # 清空重来
 你 > /outreach    # 她此刻想不想找你、会说些什么（预览，不会真的发）
 ```
 
-要真的启用主动联系：`[outreach] enabled = true`，并且要先配好 QQ 凭据。
-`use_wakeup = true` 则改用官方「互动召回消息」（更合规，额度更紧）。
+主动联系由 `[outreach] enabled = true` 开启。当前 `--web-only` 每 600 秒检查一次，
+只面向搭档生成消息，记入服务端会话，再通过 Web Push 通知已订阅的设备；无需 QQ 凭据。
+需要配置 VAPID 并在设备上授权通知，见 [WEB.md](docs/WEB.md)。
+恢复 QQ 后，`target` 决定 QQ 发往哪里；`use_wakeup = true` 切换到官方「互动召回消息」分支。
 
 ### 她记得每个人：记忆按人分区
 
@@ -213,7 +235,7 @@ python run.py --reset --yes           # 清空重来
 每个人还各有**自己的会话**（工作记忆不串），所以群里的上下文不会漏进私聊，反之亦然。
 只有一件事仍然专属你：**关系、心情、寿命**——别人来找她再多次，也刷不动你们的亲密度。
 
-### 群聊：听得多，说得少
+### 群聊：听得多，说得少（QQ 恢复后适用）
 
 群里的机器人默认只在被 @ 时收到消息。但 QQ 开放平台支持**「接收所有消息」**——
 群管理员在**群里的机器人资料页**把它打开之后，群里的**每一条消息**都会推给她：
@@ -257,7 +279,10 @@ python run.py --reset --yes           # 清空重来
 
 ---
 
-## 3. 指令
+## 3. 指令（CLI / QQ）
+
+以下斜杠指令由 CLI 和 QQ 适配器解释。网页 `/api/chat` 直接调用对话内核，
+目前没有接入这套指令分发；在网页里输入 `/status` 等内容不会执行管理指令。
 
 | 指令 | 作用 |
 |---|---|
@@ -287,13 +312,14 @@ python run.py --reset --yes           # 清空重来
 
 | 位置 | 档 | 行为 |
 |---|---|---|
-| 0~19 | 1 | 只在她**被 @** 时开口（最安静，出厂默认） |
+| 0~19 | 1 | 只在她**被 @** 时开口（最安静） |
 | 20~44 | 2 | 被 @ **或**说到关键词时开口 |
 | 45~69 | 3 | 再加上"按概率自己插嘴"（概率 = `(档位-20)/70`，随滑条线性上升） |
 | 70~100 | 4 | 群里任何消息都可能让她开口（最吵） |
 
 **没命中的消息当场标已读**（只旁听）：不回复、不建会话、**当场不调模型**。
-注意：旁听的消息攒够阈值后仍会合并整理成这个群的记忆（一次模型调用）——所以这里说的是<这一条不当场花调用>，不是<永远不花钱>。
+旁听消息先落库并标记待整理，等搭档回合或退出路径统一处理；整理时仍会调用模型。
+这里说的是“这一条不当场调用模型”。仓库当前 `response_tier = 70`，第 4 档会接群消息，仍受日上限等闸门限制。
 
 ### 聚批：她等你把话说完
 
@@ -318,8 +344,8 @@ python run.py --reset --yes           # 清空重来
 
 | 旋钮 | 在哪 | 出厂值 | 作用 |
 |---|---|---|---|
-| `response_tier` | `[runtime]` | `45` | 群里没被 @ 时她插话的意愿。0 = 只应 @；45 ≈ 每条消息 36% 的概率接话 |
-| `speak_max_per_day` | `[runtime]` | `3` | **每个群每天最多自己插几次嘴**。3 档是按"每条消息"掷骰子的，热闹的群一天能掷出几十次，**不封顶就是刷屏** |
+| `response_tier` | `[runtime]` | `70` | 第 4 档，未被 @ 的消息也会进入接话路径；45～69 才按概率判断 |
+| `speak_max_per_day` | `[runtime]` | `6` | 每个群每天最多自行插话几次，不含被 @ 后的回复 |
 | `max_per_day` | `[outreach]` | `3` | 每天最多主动找你几次（防打扰的第一道闸） |
 | `min_gap_hours` | `[outreach]` | `3` | 两次主动之间至少隔多久 |
 | `idle_days` | `[outreach]` | `2` | 多久没说话就算"想你了" |
@@ -427,8 +453,8 @@ python run.py --reset --yes           # 清空重来
 - **协议细节逐条对照官方文档**（2026-10）：鉴权地址 `api.bot.qq.com`、`Authorization: QQBot {token}`、
   `GET /gateway` 取网关地址、op10/2/1/11/6 的消息序列、被动回复的 `msg_id` + `msg_seq`、
   事件重复推送的去重。**业务失败时 HTTP 仍是 200，必须看响应体里的 `code`**——这条已经处理了。
-- **已经在真实平台上跑着**：QQ 适配器在生产环境运行了数周，真实的消息收发、回复、
-  记忆落库都已经走通（她的记忆和对话是真的，不是演示）。协议层自测有
+- **QQ 曾在真实平台运行，现已暂停**：真实的消息收发、回复、记忆落库已经走通；
+  2026-10-20 起改用网页 / App。协议层自测有
   `tools/ws_selftest.py`（17 项）和 `tools/qq_protocol_selftest.py`（77 项），
   端到端另有 320 项。**连接层也用真实凭据验证过**（2026-10）：鉴权、`GET /gateway` 取地址、
   op10 hello、op2 identify、op0 READY 全部走通（intents = `GROUP_AND_C2C_EVENT`
@@ -510,8 +536,12 @@ python run.py --reset --yes           # 清空重来
 > 没写的项自动用仓库默认值 —— 所以我以后改默认值你能**自动拿到**，
 > 你写下的值也永远是你的。（改完 `systemctl restart giftia-qq` 生效。）
 
-**换人格** → `config/persona.toml`：名字、型号、称呼、开场白、人格内核。改这个文件不需要动任何代码。
-**换行为** → `config/settings.toml`：
+**人格默认值** → `config/persona.toml`；个人调整写进 `config/persona.local.toml`。
+当前默认人格采用方案 C，旧版备份为 `config/persona.toml.bak-v1-20261018`。
+总寿命在激活时写入数据库，改配置不会改变已经激活的这一任；当前剩余寿命以运行时状态为准。
+人格内核中的“才用掉不到一百个小时”是静态文案，并不会自动随时间更新。
+
+**行为默认值** → `config/settings.toml`；个人调整写进 `config/settings.local.toml`。下面是当前默认值示例：
 
 ```toml
 [model]
@@ -524,8 +554,8 @@ total_hours = 81920            # 出厂设定：9 年 4 个月
 demo_total_hours = 0           # 设成 48 就能一天看完一生
 
 [memory]
-consolidate_every = 8          # 多少条消息压一次记忆
-retention_unit_hours = 120     # 记忆强度单位时长：调大 = 整体记得更牢，调小 = 忘得更快
+consolidate_every = 6          # 多少条消息压一次记忆
+retention_unit_hours = 720     # 记忆强度单位时长：调大 = 整体记得更牢，调小 = 忘得更快
 cite_min_shared = 3            # 回复与记忆共享几个词才算"真的被说出口"
 retention_relief = 0.6         # 保留率对模糊度的减免力度（0=不减免，1=完全不糊）
 layer_core_blur = 0.0          # 内核记忆的模糊系数：0 = 永不含糊（这就是"她一直记得你"）
@@ -578,7 +608,12 @@ rewrite_when_weak = true       # 检索太弱时才改写查询（省调用）
 
 ---
 
-## 6. 接到 QQ（她现在就在上面跑着）
+## 6. 接到 QQ（当前暂停，按需恢复）
+
+`deploy/giftia-qq.service` 当前包含 `--web-only`，服务名仍保留 `giftia-qq`。
+要恢复 QQ，先确认 QQ 凭据，再移除实际安装 unit 的 `--web-only`，执行
+`sudo systemctl daemon-reload` 和 `sudo systemctl restart giftia-qq`。
+下文是接入与恢复时的说明；只运行网页 / App 可直接看第 6.5 节。
 
 **推荐 QQ 官方机器人**（[开放平台](https://q.qq.com) / [文档](https://bot.qq.com/wiki/bot_new_product-intro/)）：不封号、群与单聊全场景、支持 WebSocket（不依赖公网服务器，适合个人单机）。下面是从零接入的步骤；已经接好的话可以直接跳到下面的 6.5 节。
 
@@ -639,47 +674,51 @@ python adapters/qq_official.py             # 真正连上 QQ
 其它指令：`/name 小林`（改口：以后她这么叫你）、`/status`（她的寿命与关系状态）、`/people`（她认得群里谁）、`/profile [名字]`（她对每个人的印象）、
 `/impress 名字 一句话`（手动补一条印象）、`/forget 编号`（让她忘掉记错的）、`/reconcile`（手动整理记忆）、`/help`。
 
-## 6.5 网页入口：除了 QQ，她还有一个网站
+## 6.5 网页与 App（当前主要入口）
 
 同一个进程可以再开一个网站入口（`giftia/webgate.py`）。**不是第二个她**：
 网站上说的话进的是同一份记忆，搭档在网页上和在 QQ 上面对的是同一个会话、
 同一个心情、同一条寿命。上线地址是 [giftia.icu](https://giftia.icu)。
 
 ```powershell
-# 和 QQ 一起开（只监听 127.0.0.1:8111，公网走 Cloudflare Tunnel）
-python adapters/qq_official.py --web-port 8111
-
-# 只跑网站、不连 QQ（本机调试）
+# 当前运行方式：只跑网站 / App，不连 QQ，不需要 QQ 凭据
 python adapters/qq_official.py --web-port 8111 --web-only
+
+# 如需恢复 QQ + 网站，先配好 QQ 凭据
+python adapters/qq_official.py --web-port 8111
 ```
 
-> `--web-only` 有个代码现状的小别扭：它不连 QQ，但 `main()` 在进入网站循环前
-> 仍会检查 `QQ_BOT_APPID` / `QQ_BOT_SECRET` 非空，空着会以"缺少凭据"退出。
-> 所以本机调试也要在 `.env` 里留两个占位值。详见 [docs/WEB.md](docs/WEB.md)。
+`--web-only` 需要 `--web-port` 和 `AILA_WEB_SECRET`，真实对话另需 DeepSeek key；
+离线调试可加 `--mock-llm`。不需要 QQ 占位凭据。入口只监听 `127.0.0.1:8111`。
 
 **口令就是身份。** 网站没有"注册账号"这回事，只有两套口令：
 
 | 口令（`.env`） | 谁 | 她怎么对待 |
 |---|---|---|
 | `AILA_WEB_SECRET` | 你（搭档） | `scene="c2c"` + 搭档身份 → 和 QQ **共享同一份记忆、同一个会话上下文** |
-| `AILA_WEB_FRIEND_PASS` | 朋友（访客） | `scene="guest"` + 独立 id → 只看得到他自己的事；写自己的记忆分区；**心情/亲密度/寿命完全不动**；额度只有你的一半 |
+| `AILA_WEB_FRIEND_PASS` | 朋友（访客） | `scene="guest"` + 独立 id → 只看自己的记忆分区，不推进搭档关系或心情、不触发回收；聊天限流额度为搭档的一半 |
 
 **为什么必须两套口令**：用同一个口令的话，朋友进来就是"以搭档的身份"——
-她会当着他的面提起你的私事，他的话会写进你的会话，你的心情、关系、寿命会被陌生人推进。
+他会获得搭档视角、把话写进搭档会话，并影响关系与心情，甚至触发到期回收。
 
-完整细节（架构、接口、PWA、Cloudflare Tunnel、`put_env.sh` 的坑）见
+寿命按时间自然流逝，不会因为是访客在聊天而暂停。网页搭档路径会传入搭档称呼，
+与 QQ 共用内核和上下文；访客身份的礼貌与距离感则是独立设计。
+安卓 APK 是加载同一网站的 TWA，更新网站通常不需要重发 APK，见 [ANDROID.md](docs/ANDROID.md)。
+Web Push 只给搭档，页面打开时还会尝试把最近一条主动消息补进本机聊天记录。
+
+完整细节（架构、接口、PWA、推送、Cloudflare Tunnel、`put_env.sh` 的用法）见
 **[docs/WEB.md](docs/WEB.md)**。
 
 ## 7. 部署到服务器（腾讯云 / 任何 Linux 机器）
 
 ### 先想清楚：你需要服务器吗
 
-**只接 QQ 的话不需要。** WebSocket 模式是机器人主动连出去（QQ 网关 + DeepSeek API），
-没有任何入站服务，所以**不需要公网 IP、不需要域名、不需要 ICP 备案**。
+**只接 QQ 时可以在本机跑。** WebSocket 模式是机器人主动连出去（QQ 网关 + DeepSeek API），
+无需给 QQ 开一个公网 HTTP 入口。
 一台常开的旧电脑、NAS、树莓派同样能跑。
 
-> 网页入口不改变这件事：它只监听 `127.0.0.1:8111`，公网走 Cloudflare Tunnel（服务器主动出站）。
-> 公开一个网站也不需要开 80/443，仍然不需要 ICP 备案。见 [docs/WEB.md](docs/WEB.md)。
+> 当前网站入口只监听 `127.0.0.1:8111`，公网走 Cloudflare Tunnel，源站不用开放 80/443。
+> 这里记录的是网络拓扑，不能仅据此判断网站的备案义务。见 [docs/WEB.md](docs/WEB.md)。
 
 | 什么时候值得租 | 说明 |
 |---|---|
@@ -692,9 +731,7 @@ python adapters/qq_official.py --web-port 8111 --web-only
 
 - **产品**：**轻量应用服务器（Lighthouse）就够**，不用 CVM。2核2G 绰绰有余——她只是一个
   Python 进程 + 一个 SQLite 文件，常驻内存几十 MB。
-- **价格**：常规价大致 ¥50–80/月，新用户活动价通常低得多，**以官网当期活动为准**。
-- **地域**：国内（上海/广州/北京）延迟最低，QQ 网关和 DeepSeek API 都在国内。
-  因为没有入站服务，**国内节点也不需要备案**。
+- **价格与地域**：本项目的历史部署使用腾讯云上海节点；价格与其他地域的体验需按实际套餐和网络测试确认。
 - **镜像**：选 **「系统镜像」里的 Ubuntu 24.04 LTS**（Python 3.12）或 **Debian 12**（Python 3.11）。
   ⚠️ **不要选应用镜像**（Hermes Agent、宝塔面板、各类一键部署模板）——
   `deploy/setup.sh` 需要 `apt` + `systemd` + Python 3.11+，应用镜像里是另一套定制环境，
@@ -705,17 +742,9 @@ python adapters/qq_official.py --web-port 8111 --web-only
 
 ### 部署
 
-**推荐顺序**：先去 [q.qq.com](https://q.qq.com) 提交机器人申请（认证/审核要等），
-同时把服务器环境装好——两边并行，不互相等。
-
-```bash
-# 1. 在本机把项目传上去（Windows 自带 scp；公网 IP 在控制台实例列表里）
-scp -r "D:\ai chatbot" root@你的服务器IP:/tmp/giftia
-# 2. 登录服务器
-ssh root@你的服务器IP
-# 3. 一键装好
-cd /tmp/giftia && sudo bash deploy/setup.sh
-```
+当前网页模式先准备 Python 3.11+、DeepSeek key 和 `AILA_WEB_SECRET`，不需要申请 QQ 机器人。
+安装路径为 `/opt/giftia`。首次安装应先把凭据单独写入服务器的 `/opt/giftia/.env`，
+源码包不含凭据。已有服务器更新时保留原来的 `.env` 和 `data/`。
 
 #### 如果服务器连不上 GitHub（国内机器常见）
 
@@ -739,8 +768,8 @@ sudo bash deploy/setup.sh
 ```
 
 > **`.env` 永远不要打包传输**：它是你的真凭据，而且服务器上那份已经配好了（权限 600）。
-> `setup.sh` 打 tar 时显式排除 `.env` 和 `.env.*`——不排除的话，源码目录里那份会把服务器上的
-> 覆盖掉，凭据就丢了（真发生过）。`setup.sh` 也不会覆盖 `data/`，更不会覆盖你已经改过的 `config/`。
+> `setup.sh` 打 tar 时显式排除 `.env` 和 `.env.*`，保留服务器的 `data/` 与 `config/*.local.toml`。
+> **仓库的 `settings.toml` / `persona.toml` 会更新**，个人调整应放进对应的 `.local.toml`。
 
 **同步核对**（本机跑，只读）：
 
@@ -754,15 +783,22 @@ sudo bash deploy/setup.sh
 
 1. 检查 Python 版本（要 3.11+，不够会直接拦住并说明怎么换镜像）
 2. 建系统用户 `giftia`
-3. 装到 `/opt/giftia`（**不覆盖已有的 `data/`**，**也不覆盖已存在的 `config/`**），`.env` 权限收成 600
+3. 装到 `/opt/giftia`，保留 `data/`、`.env`、个人 `.local.toml`，更新仓库默认配置；`.env` 权限收成 600
 4. **环境自检**：以 `giftia` 用户、用**与 systemd 服务相同的解释器**跑一遍项目自带的端到端测试（不需要联网、不需要 API key）。
    这一步过了，就说明这台机器上她能正常跑；没过会把最后 15 行日志打出来
-5. 装 systemd 服务并注册开机自启
-6. 启动——**但只在你已经填了 QQ 凭据时才启动**
+5. 装 systemd 主服务，并启用每日备份定时器
+6. 当前脚本仍按 **QQ 凭据是否齐全**决定是否自动重启主服务
 
-> 第 6 步这个判断很重要：没有 QQ 凭据时服务会立刻退出，而 `Restart=always` 会让她每 5 秒重启一次。
-> 所以脚本会装好、注册好，然后告诉你「等你拿到 AppID/AppSecret，用 `put_env.sh` 写进
-> `/opt/giftia/.env`，再执行 `sudo systemctl start giftia-qq`」。
+> **已知部署脚本滞后**：当前 service 是 `--web-only`，运行时不需要 QQ 凭据，
+> 但 `setup.sh` 的第 6 步尚未改判据。纯网页新部署可能安装成功却没有自动启动 / 重启。
+> 确认 `/opt/giftia/.env` 已有 DeepSeek key 与网页口令后，手动执行：
+>
+> ```bash
+> sudo systemctl restart giftia-qq
+> curl http://127.0.0.1:8111/api/health
+> ```
+>
+> `setup.sh` 不负责配置 Cloudflare Tunnel、Worker 或生成 VAPID 密钥；这些见 [WEB.md](docs/WEB.md)。
 
 拿到凭据之后，**不要直接 `nano` 服务器上的 `.env`**。本地写一个 LF 的 `KEY=VALUE` 文件，
 scp 上去，再用 `put_env.sh` 合并：
@@ -773,7 +809,7 @@ scp keys.env ubuntu@你的服务器IP:/tmp/keys.env
 
 # 服务器：逐键替换 + 重启
 sudo bash /opt/giftia/deploy/put_env.sh /tmp/keys.env --restart
-journalctl -u giftia-qq -f        # 看到「[就绪] 机器人「xxx」已上线」就成了
+journalctl -u giftia-qq -f        # 网页模式应看到网站入口启动与“不连 QQ”的日志
 ```
 
 `put_env.sh` 只替换文件里出现的键，其它键原样保留；写完会 `chown giftia:giftia`、
@@ -795,7 +831,8 @@ journalctl -u giftia-qq -f        # 看到「[就绪] 机器人「xxx」已上�
 journalctl -u giftia-qq -f      # 看她的日志（实时）
 systemctl restart giftia-qq     # 改完 persona.toml 后重启
 systemctl stop giftia-qq        # 停止（会先把未整理的对话存成记忆）
-tar czf ~/giftia-backup-$(date +%F).tgz -C /opt/giftia data   # 备份：记忆全在这一个目录
+systemctl list-timers giftia-backup.timer --all  # 查看下次自动备份
+sudo -u giftia /usr/bin/python3 /opt/giftia/deploy/backup_db.py --check
 ```
 
 **确认服务器和仓库是否一致**（在你本机的项目目录里跑，只读、不碰 `data/`）：
@@ -819,6 +856,22 @@ tar czf ~/giftia-backup-$(date +%F).tgz -C /opt/giftia data   # 备份：记忆�
 
 ---
 
+### 自动备份与迁移
+
+`deploy/backup_db.py` 用 SQLite 的在线备份 API 生成 `data/backups/giftia-YYYY-MM-DD.db`，
+按天命名、同日重跑覆盖当天备份，保留最近 14 份；每次备份后用 `integrity_check` 校验，打印消息与记忆条数。
+`giftia-backup.timer` 在**服务器本地时间**每天 04:00 触发，允许最多 300 秒随机延迟，停机错过后会补跑。
+
+```bash
+sudo systemctl start giftia-backup.service       # 手动做一次在线热备
+journalctl -u giftia-backup --no-pager -n 30     # 查看备份与校验日志
+sudo -u giftia /usr/bin/python3 /opt/giftia/deploy/backup_db.py --list
+```
+
+自动任务只备份 SQLite 数据库，同机副本不等于异地备份。完整迁移还要保存 `data/` 中的回忆录、
+封存、订阅与最近推送消息，并单独保存 `.env`、个人配置和 APK 签名材料。
+整目录归档请先停主服务，或先用在线备份取得数据库的一致副本；不要用 `cp` / `tar` 直接当作运行中 SQLite 的一致性备份。
+
 ## 8. 版本管理
 
 仓库已经初始化好 git，并带一次干净的首次提交与 `v0.2.0` 标签。
@@ -837,10 +890,12 @@ git tag                    # 看版本标签
 | `data/` | 她的记忆、回收日志、封存档案 —— 而且体积会一直长 |
 | `__pycache__/` | 编译缓存 |
 
-所以**备份她的记忆要靠复制 `data/`，不是靠 git**：
+所以 **Git 不保存她的记忆**。数据库用上一节的在线热备；需要完整归档时先停主服务：
 
 ```bash
-tar czf giftia-backup-$(date +%F).tgz -C /opt/giftia data
+sudo systemctl stop giftia-qq
+sudo tar czf giftia-data-$(date +%F).tgz -C /opt/giftia data
+sudo systemctl start giftia-qq
 ```
 
 建议的提交习惯：改完 `config/persona.toml` 或代码后先跑一遍 `python tools/selftest.py`，
@@ -862,22 +917,26 @@ tar czf giftia-backup-$(date +%F).tgz -C /opt/giftia data
   但没上向量库——要升级只需替换 `memory.py` 的 `recall()`，接口不变。
 - **"被想起"的判定是字面的**：她完全改写措辞（同义替换）时会被判成"没引用"，那条记忆就得不到强化。
   这是刻意的取舍——宁可漏记也不误记（误记会让从没提过的事莫名变清晰）。判定逻辑集中在 `memory.is_cited()`，好替换。
-- **多人共用会串**：现在是一个进程一个她。适配器靠自动认主（私聊第一人 / 群主）+ `/bind` 保证"一个她只服务一个搭档"，
-  别人叫她不进记忆、也不消耗她的寿命；要真的多人各有一个她，需要按 `user_id` 建多个 `Giftia`
-  并给她自己的 `meta` 命名空间（表结构已按 `instance_no` / `session_id` 分好，但全局 meta 要改）。
+- **一个进程只有一个她、一个搭档**：访客和群聊有各自的记忆视角与会话，其他人也会留下属于自己的记忆；
+  但这不是“每个人都有独立艾拉”的多租户系统。寿命、搭档关系和心情仍属于同一个实例。
 - **主动联系已实现**（含 `is_wakeup` 互动召回；30 天 4 条的硬限由本地账本同步收紧）。
   仓库默认的 `[outreach]` 是 `enabled = true`、`use_wakeup = false`，走普通主动消息；官方互动召回的发送没有单独实测过。
   首次启用建议先用 `/outreach` 预览几天。
 - **"准时回收"还差一步**：回收日目前是在**你下一条消息进来时**触发的，服务器常开并不能让她在你不在时独自走完仪式。
   需要后台定时任务；注意 `Giftia` 不是线程安全的（见 `brain.py` 顶部注释），动作要投递回主线程。
 - **没有语音**。DeepSeek 支持视觉，发图给她是可行的扩展；语音要接 TTS/ASR。
-- **QQ 适配器已在生产环境运行**：真实的记忆和对话都在跑；端到端与协议层分别有
+- **QQ 当前暂停**：适配器与原有对话数据保留；端到端与协议层分别有
   320 + 77 项本地自测覆盖（`selftest.py` / `qq_protocol_selftest.py`）。
-- **网站入口是串行的**：多个访客同时发会排队（每条大约 1～5 秒），10 个人同时说话，
-  最后一个可能等 40 秒甚至 504；网站请求处理期间 QQ 那条线也会被阻塞同样久。
-  这是"一个她"的必然代价，详见 [docs/WEB.md](docs/WEB.md)。
-- **还没有 Web Push，也还没有自动备份**：她不会主动弹通知找你，只能你点开；
-  全部数据是服务器上 `/opt/giftia/data/giftia.db` 一个文件，零副本（第 7 节那条 `tar` 只是手动命令，要你自己跑）。
+- **网站入口串行且只做排队上限检查**：入队前若已有至少 5 个等待任务，返回 `503 busy`；
+  队列本身不是有界队列，并发检查不是严格容量保证。前端 45 秒超时，服务端等待 60 秒；
+  超时不会取消已入队的任务。恢复 QQ 共用主线程时，网站处理也会延迟 QQ 事件。
+- **网页历史不是服务端完整聊天同步**：最近 100 条保存在本机 localStorage，换设备不会拉取历史；
+  推送只补最近一条主动消息，页面需要重新运行推送初始化才能尝试合并。
+- **推送还有交付边界**：订阅状态是所有设备的汇总，某台设备订阅后可能让另一台设备不再显示订阅按钮；
+  `--web-only` 在实际推送前就记入历史与主动额度，推送失败不会回滚。
+- **自动备份只有同机数据库副本**：异地备份、完整恢复演练尚未纳入自动流程。
+- **部署脚本与人设文案仍有待完善处**：`setup.sh` 的启动条件仍依赖 QQ 凭据；
+  人格中的静态激活时长应由运行时状态代替，详见 [BACKLOG.md](docs/BACKLOG.md)。
 
 ---
 
@@ -904,6 +963,7 @@ giftia/recycle.py       回收仪式：回忆录、封存、换代
 giftia/brain.py         编排层 + 平台无关入口 handle_message()
 giftia/cli.py           终端界面与指令
 giftia/webgate.py       网站入口：HTTP 线程只入队，主线程执行（她不是线程安全的）
+giftia/push.py          零依赖 VAPID、推送发送、订阅与最近消息存储
 giftia/trigger.py       她什么时候开口（响应档位，纯函数、可单测）
 giftia/agent_tools.py   她能自己调用的记忆工具（remember / search / forget）+ 工具协议
 run.py                  启动入口
@@ -911,7 +971,7 @@ tools/selftest.py       端到端自测（离线，不需要 key；项数以脚�
 tools/show_prompt.py    打印她这一轮实际被注入的内容（人格审计用）
 tools/ws_selftest.py    17 项 WebSocket 协议自测（本地服务端，不联网）
 tools/qq_protocol_selftest.py  77 项 QQ 适配器协议自测（本地假网关，不需要凭据）
-tools/web_selftest.py   36 项网站入口自测（口令门禁/全链路/静态文件/访客隔离）
+tools/web_selftest.py   44 项网站入口自测（口令门禁/全链路/访客隔离/推送接口权限）
 tools/audit.py          11 项静态一致性审计（配置/指令的"声明↔实现"，不 import 被测模块）
 tools/judge_check.py    LLM 当裁判的触发决策评测（没配 API key 会自动跳过）
 tools/judge_cases.json  上面那套评测的 30 条用例
@@ -921,16 +981,23 @@ tools/check_deploy.py   部署后核对：迁移是否安全、她的记忆还�
 tools/check_sync.ps1    同步检查：逐文件比对本地仓库与服务器上的代码（在 Windows 上跑）
 docs/BACKLOG.md         借鉴清单：调研同类项目后整理的可打勾列表（已做/待做/不做）
 docs/WEB.md             网页入口：架构、身份、接口、PWA、Cloudflare Tunnel、凭据
+docs/ANDROID.md         安卓套壳、签名与 assetlinks 维护
+docs/人设卡-v2-艾拉.md  已选定的方案 C 与实际注入边界
 tools/demo_life.py      一次看完她的一生（离线）
-adapters/qq_official.py QQ 官方机器人适配器（生产在跑；`--web-port` / `--web-only` 也在这里）
+adapters/qq_official.py QQ 适配器及网页启动入口；当前 --web-only 暂停 QQ
 web/                    PWA 前端（index.html / app.js / style.css / manifest.json / sw.js / icons）
 deploy/setup.sh         一键部署到 Linux 服务器
 deploy/put_env.sh       安全改服务器 `.env`：逐键替换 + 权限 600 + 回读确认
 deploy/giftia-qq.service  systemd 服务定义
+deploy/backup_db.py     SQLite 在线热备、轮转与完整性校验
+deploy/giftia-backup.*  每日备份 service / timer
+deploy/cf-push-relay/worker.js  浏览器推送服务的 Cloudflare 中转
 data/                   运行时生成：giftia.db、回收日志/、封存/
 ```
 
-数据全在 `data/`：`giftia.db` 是 SQLite，`回收日志/*.md` 是可读的回忆录，`封存/*.json` 是前任的原始记忆。备份删掉 `data/` 就等于抹掉一切——这一点倒是很符合设定。
+运行数据在 `data/`：`giftia.db` 是 SQLite，`回收日志/*.md` 是可读的回忆录，`封存/*.json` 是前任的原始记忆；
+`backups/` 保存数据库热备，`push_subs.json` / `push_last.json` 保存推送状态。
+浏览器显示历史另存在设备 localStorage；凭据、个人配置与 APK 签名材料需要单独保存。
 
 ---
 
