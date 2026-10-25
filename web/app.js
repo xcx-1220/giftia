@@ -21,8 +21,9 @@
 
   var MAX_HISTORY = 100;      // localStorage 不是数据库，只留最近 100 条
   var MAX_PARTS   = 6;        // 万一后端切太多段，这里兜一下，别刷屏
+  var TIME_GAP = 5 * 60 * 1000; // 相邻消息相隔五分钟或跨日时，显示居中的时间
 
-  // 她每两段之间的停顿：500~900ms 随机。
+  // 她每两段之间的短暂停顿。
   // 固定值会听出机械感，随机区间才像人在打字。
   var PART_MIN = 60;
   var PART_MAX = 160;
@@ -167,6 +168,64 @@
 
   /* ---------------- 渲染 ---------------- */
 
+  var lastMessageTime = null;
+  var timeLabels = [];
+
+  function messageTime(value) {
+    var timestamp = typeof value === 'number' ? value :
+      (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value) ? Date.parse(value) : NaN);
+    return isFinite(timestamp) && timestamp > 0 && !isNaN(new Date(timestamp).getTime()) ? timestamp : null;
+  }
+
+  function sameDay(a, b) {
+    return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  }
+
+  function clockText(date) {
+    return ('0' + date.getHours()).slice(-2) + ':' + ('0' + date.getMinutes()).slice(-2);
+  }
+
+  function formatMessageTime(timestamp, now) {
+    var date = new Date(timestamp);
+    var today = new Date(now === undefined ? Date.now() : now);
+    var clock = clockText(date);
+    if (sameDay(date, today)) return clock;
+    var yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+    if (sameDay(date, yesterday)) return '昨天 ' + clock;
+    var day = (date.getMonth() + 1) + '月' + date.getDate() + '日 ' + clock;
+    return date.getFullYear() === today.getFullYear() ? day : date.getFullYear() + '年' + day;
+  }
+
+  function refreshTimeLabels(now) {
+    if (now === undefined) now = Date.now();
+    timeLabels.forEach(function (label) {
+      label.el.textContent = formatMessageTime(label.timestamp, now);
+    });
+  }
+
+  function appendTimeSeparator(value) {
+    var timestamp = messageTime(value);
+    if (timestamp === null) {
+      // 老记录没有有效时间时不编造日期；下一条有效消息重新建立时间锚点。
+      lastMessageTime = null;
+      return;
+    }
+    var separate = lastMessageTime === null || timestamp - lastMessageTime >= TIME_GAP ||
+      timestamp < lastMessageTime || !sameDay(new Date(timestamp), new Date(lastMessageTime));
+    lastMessageTime = timestamp;
+    if (!separate) return;
+    var row = document.createElement('li');
+    row.className = 'message-time';
+    var time = document.createElement('time');
+    time.setAttribute('datetime', new Date(timestamp).toISOString());
+    var date = new Date(timestamp);
+    time.setAttribute('title', date.getFullYear() + '年' + (date.getMonth() + 1) + '月' + date.getDate() + '日 ' + clockText(date));
+    time.textContent = formatMessageTime(timestamp);
+    row.appendChild(time);
+    streamEl.appendChild(row);
+    timeLabels.push({ el: time, timestamp: timestamp });
+  }
+
   // 全角括号优先；顺手兼容半角，免得后端偶尔写成 (笑)
   var ASIDE_RE = /（[^（）]*）|\([^()]*\)/;
 
@@ -217,6 +276,8 @@
     var animate = opts.animate !== false;
     var persist = opts.persist !== false;
 
+    refreshTimeLabels();
+    appendTimeSeparator(msg.ts);
     var li = renderRow(msg);
     // 从历史里恢复的气泡不播动画：一屏 100 条一起飘进来太吵
     if (!animate) li.className += ' msg--static';
@@ -559,6 +620,8 @@
 
   function clearStream() {
     while (streamEl.firstChild) streamEl.removeChild(streamEl.firstChild);
+    lastMessageTime = null;
+    timeLabels = [];
   }
 
   function onMenuClick(event) {
@@ -639,6 +702,10 @@
   }
 
   function bindEvents() {
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) refreshTimeLabels();
+    });
+    window.addEventListener('focus', function () { refreshTimeLabels(); });
     gateForm.addEventListener('submit', onGateSubmit);
     formEl.addEventListener('submit', function (e) { e.preventDefault(); send(); });
 

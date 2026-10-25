@@ -357,6 +357,18 @@ body {
 .msg--her { justify-content: flex-start; }
 .msg--me  { justify-content: flex-end; }
 
+/* 时间属于消息流，不占左右气泡；网页与 TWA App 使用同一套展示。 */
+.message-time {
+  align-self: center;
+  margin: 4px 0;
+  padding: 4px 8px;
+  color: var(--note);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 /* 刷新后从历史里恢复的气泡：直接就位，不播动画 —— 一屏 100 条一起飘进来太吵 */
 .msg--static .bubble { animation: none; }
 
@@ -411,7 +423,7 @@ body {
 .aside { color: var(--note); font-style: italic; }
 
 /* 气泡落下的小动画：位移很短，只是"出现"，不要抢戏。
-   每段之间 500~900ms 的停顿在 app.js 里控制 —— 节奏感靠停顿，不靠动画。 */
+   每段之间的短暂停顿在 app.js 里控制。 */
 @keyframes rise {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: none; }
