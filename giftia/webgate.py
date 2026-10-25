@@ -38,6 +38,9 @@ import hashlib
 import hmac
 import json
 import queue
+import re
+from urllib.parse import parse_qs, urlsplit
+from .requests import RequestLedger
 import secrets
 import sys
 import threading
@@ -81,6 +84,10 @@ class Job:
     """一个待处理的请求。结果通过 `done` 事件回传。"""
 
     text: str
+    request_id: str = ""
+    principal: str = ""
+    recover_only: bool = False
+    enqueued_at: float = field(default_factory=time.monotonic)
     # ★ 由**主线程**在 drain() 里填。HTTP 线程不许自己去查——
     #   查 handler_id 会碰 SQLite，而那个连接是主线程建的
     #   （踩过：ProgrammingError: SQLite objects created in a thread can only be used
@@ -130,7 +137,22 @@ class WebGate:
 
         self.push_subs = SubscriptionStore(self._data_dir / "push_subs.json")
         self.push_last = LastMessage(self._data_dir / "push_last.json")
-        self.jobs: queue.Queue[Job] = queue.Queue()
+        self.jobs: queue.Queue[Job] = queue.Queue(maxsize=MAX_PENDING)
+        self.ledger = RequestLedger(self._data_dir / 'web_requests.json')
+        self._sessions = {}
+        self._owner_epoch = ''
+        self._requests_lock = threading.Lock()
+        self._live_jobs = {}
+        for key, row in list(self.ledger.rows.items()):
+            if row.get('status') not in ('queued', 'running'):
+                continue
+            job = Job(text=row['text'], request_id=row['request_id'], principal=row['principal'],
+                      role=row['role'], user_id=row['user_id'], recover_only=row['status']=='running')
+            try:
+                self.jobs.put_nowait(job)
+                self._live_jobs[key] = job
+            except queue.Full:
+                self.ledger.update(key, status='failed', error='服务重启时队列已满；此请求没有自动重发')
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         # 每个 IP 的请求时间戳（限流用）
@@ -138,6 +160,33 @@ class WebGate:
         self._lock = threading.Lock()
         self.served = 0          # 处理过几个请求（心跳/日志用）
         self.rejected = 0        # 被限流挡掉几个
+
+    def principal(self, role, visitor='web-guest'):
+        identity = self.token(role) + ':' + self._owner_epoch
+        if role == 'friend':
+            identity += ':' + visitor
+        return hashlib.sha256(identity.encode()).hexdigest()
+
+    def submit(self, text, role, user_id, request_id, principal):
+        key = principal + ':' + request_id
+        with self._requests_lock:
+            old = self.ledger.get(key)
+            if old:
+                if old['text'] != text:
+                    raise ValueError('同一请求编号不能用于不同消息')
+                if key in self._live_jobs:
+                    return self._live_jobs[key]
+                job = Job(text=text, request_id=request_id, principal=principal, role=role, user_id=user_id)
+                job.finish(reply=old.get('reply', ''), error=old.get('error', ''))
+                return job
+            if self.jobs.full():
+                raise queue.Full
+            row = dict(text=text, role=role, user_id=user_id, request_id=request_id, principal=principal)
+            self.ledger.reserve(key, row)
+            job = Job(**row)
+            self._live_jobs[key] = job
+            self.jobs.put_nowait(job)
+            return job
 
     # ── 口令 ──────────────────────────────────────────────
     @property
@@ -169,6 +218,8 @@ class WebGate:
         if not raw:
             return ""
         for role in ("owner", "friend"):
+            if role == 'friend' and not self.friend_pass:
+                continue
             if hmac.compare_digest(raw, self.token(role)):
                 return role
         return ""
@@ -258,6 +309,10 @@ class WebGate:
                 path = self.path.split("?", 1)[0]
                 if path == "/api/health":
                     return self._json(HTTPStatus.OK, {"ok": True})
+                if path == "/api/chat/result":
+                    return self._guard(self._chat_result)
+                if path == "/api/session":
+                    return self._guard(self._session)
                 if path == "/api/push/status":
                     return self._guard(self._push_status)
                 if path == "/api/push/last":
@@ -317,37 +372,53 @@ class WebGate:
                         HTTPStatus.TOO_MANY_REQUESTS,
                         {"error": "你说得太快了，等一下下。"},
                     )
-                # ★ 先把请求体读掉，再做任何提前返回。
-                #   503 时若不读 body，keep-alive 连接上会留下未读字节，
-                #   下一个请求就错位 —— 表现为客户端莫名其妙"连接被掐断"。
-                text = str((self._body().get("text") or "")).strip()
+                data = self._body()
+                text = str(data.get('text') or '').strip()[:2000]
                 if not text:
-                    return self._json(HTTPStatus.BAD_REQUEST, {"error": "空消息"})
-                # 排队太深就先谢客 —— 比让人干等 60 秒再看到 504 体面
-                if gate.pending >= MAX_PENDING:
-                    return self._json(
-                        HTTPStatus.SERVICE_UNAVAILABLE,
-                        {"error": "她正忙着，过一会儿再来找她吧。", "busy": True},
-                    )
-                # 访客的身份只能用 cookie 里的字符串（**不能在这里读库**）
-                visitor = self._cookie("aila_visitor") or "web-guest"
-                job = Job(
-                    text=text[:2000],
-                    role=role,
-                    user_id=visitor if role == "friend" else "",
-                )
-                gate.jobs.put(job)
-                if not job.wait(JOB_TIMEOUT):
-                    return self._json(
-                        HTTPStatus.GATEWAY_TIMEOUT,
-                        {"error": "她那边正忙着，稍后再试。"},
-                    )
-                if job.error:
-                    return self._json(HTTPStatus.BAD_GATEWAY, {"error": job.error})
-                return self._json(
-                    HTTPStatus.OK,
-                    {"reply": job.reply, "parts": split_parts(job.reply)},
-                )
+                    return self._json(HTTPStatus.BAD_REQUEST, {'error': '空消息'})
+                request_id = str(data.get('request_id') or secrets.token_hex(16))
+                if not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', request_id):
+                    return self._json(HTTPStatus.BAD_REQUEST, {'error': '请求编号无效'})
+                principal = self._principal(role)
+                visitor = self._cookie('aila_visitor') or 'web-guest'
+                try:
+                    job = gate.submit(text, role, visitor if role == 'friend' else '', request_id, principal)
+                except ValueError as exc:
+                    return self._json(HTTPStatus.CONFLICT, {'error': str(exc)})
+                except (queue.Full, OverflowError):
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE, {'error': '她正忙着，稍后再试。', 'busy': True})
+                job.wait(JOB_TIMEOUT)
+                return self._request_payload(gate.ledger.get(principal + ':' + request_id))
+
+            def _principal(self, role):
+                visitor = self._cookie('aila_visitor') or 'web-guest'
+                return gate.principal(role, visitor)
+
+            def _request_payload(self, row):
+                if not row:
+                    return self._json(HTTPStatus.NOT_FOUND, {'error': '没有这个请求'})
+                payload = {'request_id': row['request_id'], 'status': row['status']}
+                if row['status'] == 'completed':
+                    payload.update(reply=row['reply'], parts=split_parts(row['reply']))
+                    return self._json(HTTPStatus.OK, payload)
+                if row['status'] == 'failed':
+                    payload['error'] = row.get('error') or '这条消息未能完成'
+                    return self._json(HTTPStatus.BAD_GATEWAY, payload)
+                return self._json(HTTPStatus.ACCEPTED, payload)
+
+            def _chat_result(self):
+                role = gate.role_of_cookie(self._cookie('aila_auth'))
+                if not role:
+                    return self._json(HTTPStatus.UNAUTHORIZED, {'error': '还没登录'})
+                request_id = parse_qs(urlsplit(self.path).query).get('request_id', [''])[0]
+                return self._request_payload(gate.ledger.get(self._principal(role) + ':' + request_id))
+
+            def _session(self):
+                role = gate.role_of_cookie(self._cookie('aila_auth'))
+                if not role:
+                    return self._json(HTTPStatus.UNAUTHORIZED, {'error': '还没登录'})
+                payload = gate._sessions.get(role, {'known': True, 'greeting': '你来了。'})
+                return self._json(HTTPStatus.OK, dict(payload, role=role, view_id=self._principal(role)[:20]))
 
             # ── 推送（**只给搭档**）────────────────────────────
             def _owner_only(self) -> bool:
@@ -480,6 +551,15 @@ class WebGate:
         from .brain import handle_message, get_default
 
         hub = get_default(settings)
+        self._owner_epoch = json.dumps([hub.instance_no, hub.handler_id,
+                                       hub.handler_bound_at, hub._int_meta('handler_bound_msg_id')])
+        latest_user = hub.store._one("SELECT * FROM messages WHERE instance_no=? AND scope='private' AND role='user' ORDER BY id DESC LIMIT 1", (hub.instance_no,))
+        known = bool(hub._since_floor([dict(latest_user)] if latest_user else [], private=True))
+        self._sessions = {'owner': {'known': known, 'greeting': '你来了。' if known else settings.persona.line('opening_line')},
+                          'friend': {'known': True, 'greeting': '你好。'}}
+        if not hasattr(hub, '_maintenance'):
+            hub.schedule_maintenance()
+        hub.poll_maintenance()
         handled = 0
         while handled < limit:
             try:
@@ -487,37 +567,62 @@ class WebGate:
             except queue.Empty:
                 break
             handled += 1
+            key = job.principal + ':' + job.request_id
+            mid = 'web:' + key
+            self.ledger.update(key, status='running')
             try:
-                # ★ 唯一的执行点，都在主线程（她不是线程安全的）
-                if job.role == "friend":
-                    # 访客：scene="guest" + 他自己的 id →
-                    #   · 视角只有 [("person", 他自己)]，**检索不到搭档的私事**
-                    #   · 写进他自己的记忆分区，不进你的会话
-                    #   · is_handler=False → 心情/关系/寿命一点都不动
-                    reply = handle_message(
-                        job.text,
-                        job.user_id or "web-guest",
-                        settings=settings,
-                        scene="guest",
-                    )
+                if job.principal != self.principal(job.role, job.user_id or 'web-guest'):
+                    raise RuntimeError('会话身份已经改变，旧请求没有重新执行')
+                old_reply = hub.store._one("SELECT content FROM messages WHERE mid=? ORDER BY id DESC LIMIT 1", (mid + ':reply',))
+                if old_reply:
+                    reply = old_reply['content']
+                elif job.recover_only:
+                    raise RuntimeError('服务重启时上一轮已中断，没有自动重复发送；请检查聊天记录后再继续')
                 else:
-                    # 搭档：scene="c2c" → 和 QQ 那边共享同一份记忆、同一个会话上下文。
-                    # user_id 在这里才解析（读 handler_id 要碰 SQLite，HTTP 线程不能碰）
-                    reply = handle_message(
-                        job.text,
-                        job.user_id or hub.handler_id or "handler",
-                        settings=settings,
-                        scene="c2c",
-                        # QQ 那边一直传了这个（她的昵称），网页之前没传 →
-                        # 她"知道你是谁"的程度会差一点，表现就是"感觉不太一样"
-                        speaker_name=getattr(hub, "handler_name", "") or "椎名",
-                    )
+                    reply = self._run_job(hub, settings, job, mid)
+                self.ledger.update(key, status='completed', reply=reply, error='')
                 job.finish(reply=reply)
-            except Exception as exc:  # 网页出问题绝不能拖垮 QQ 那条线
-                job.finish(error=f"{type(exc).__name__}: {exc}")
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self.ledger.update(key, status='failed', error=error)
+                job.finish(error=error)
+            finally:
+                self._live_jobs.pop(key, None)
+                self.jobs.task_done()
         if handled:
             self.served += handled
+        hub.poll_maintenance()
         return handled
+
+    def _run_job(self, hub, settings, job, mid):
+        from .brain import handle_message
+        # ★ 唯一的执行点，都在主线程（她不是线程安全的）
+        if job.role == "friend":
+            # 访客：scene="guest" + 他自己的 id →
+            #   · 视角只有 [("person", 他自己)]，**检索不到搭档的私事**
+            #   · 写进他自己的记忆分区，不进你的会话
+            #   · is_handler=False → 心情/关系/寿命一点都不动
+            reply = handle_message(
+                job.text,
+                job.user_id or "web-guest",
+                settings=settings,
+                scene="guest",
+                mid=mid, defer_maintenance=True,
+            )
+        else:
+            # 搭档：scene="c2c" → 和 QQ 那边共享同一份记忆、同一个会话上下文。
+            # user_id 在这里才解析（读 handler_id 要碰 SQLite，HTTP 线程不能碰）
+            reply = handle_message(
+                job.text,
+                job.user_id or hub.handler_id or "handler",
+                settings=settings,
+                scene="c2c",
+                mid=mid, defer_maintenance=True,
+                # QQ 那边一直传了这个（她的昵称），网页之前没传 →
+                # 她"知道你是谁"的程度会差一点，表现就是"感觉不太一样"
+                speaker_name=getattr(hub, "handler_name", "") or "",
+            )
+        return reply
 
 
 def split_parts(text: str, *, limit: int = 3, max_chars: int = 60) -> list[str]:

@@ -76,11 +76,14 @@ def tone_of(text: str) -> float:
     所以：命中的词前面有否定词就**反向**计一分，`累` 用词边界避免"积累"误伤。
     """
     text = text or ""
+    # 完成动作中的“完了”不是灾难；保留独立的“完了”。
+    text = re.sub(r"(?:吃|做|看|读|写|说|用|忙|弄|学|考|买|卖|办|洗|打|处理)完了", "完成", text)
+    negative_events = bool(re.search(r"停服|倒闭|去世|被裁|被拒|当空气|被忽视", text))
     pos = neg = 0
     for word in POSITIVE:
         start = 0
         while (idx := text.find(word, start)) != -1:
-            if _negated(text, idx):
+            if _negated(text, idx) or re.match(re.escape(word) + r"(?:不起来|不了|不成)", text[idx:]):
                 neg += 1
             else:
                 pos += 1
@@ -100,6 +103,8 @@ def tone_of(text: str) -> float:
             pos += 1
         else:
             neg += 1
+    if negative_events:
+        neg += max(1, pos + 1)
     if pos == 0 and neg == 0:
         return 0.0
     score = (pos - neg) / float(pos + neg)
@@ -107,7 +112,9 @@ def tone_of(text: str) -> float:
     # 典型例子：「我升职失败了」——`升职` 是正面词、`失败` 是负面词，机械对消成 0 分，
     # 而她本该担心你。只有真的正负都不沾才返回 0（上面那条）。
     if pos and neg and score == 0.0:
-        score = -0.1
+        score = -0.5
+    if negative_events:
+        score = min(score, -0.6)
     if text.count("！") + text.count("!") >= 2:
         score += 0.1 if score >= 0 else -0.1
     if "哈哈" in text or "233" in text:

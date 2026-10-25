@@ -17,8 +17,10 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from datetime import datetime
 
+from .conversation import Conversation, reply_focus, question_restraint, explicit_feedback, asks_question
 from .bond import Bond, BondTracker
 from .clock import Clock
 from .config import Settings, load_settings
@@ -29,6 +31,7 @@ from .llm import BaseLLM, DeepSeekLLM, LLMError, MockLLM
 from .memory import (
     CONFIDENCE_CITE,
     day_label,
+    human_age,
     Recalled,
     consolidate,
     flush_sessions,
@@ -293,6 +296,8 @@ class Giftia:
     def _has_private_history(self) -> bool:
         """库里还有"前任留下的"private 记忆吗（换人时决定要不要设遮蔽下界）。"""
         try:
+            if self.store._one("SELECT 1 FROM messages WHERE instance_no=? AND scope='private' LIMIT 1", (self.instance_no,)):
+                return True
             return bool(
                 self.store.active_memories(self.instance_no, view=[("private", "")])
             )
@@ -331,6 +336,32 @@ class Giftia:
             return not (happened and happened < floor)
         written = str(mem.get("created_ts") or mem.get("happened_ts") or "")
         return written > floor
+
+    def schedule_maintenance(self):
+        if not self.settings.memory.background_maintenance:
+            return
+        if not hasattr(self, "_maintenance"):
+            from .maintenance import Maintenance
+            self._maintenance = Maintenance(self)
+        self._maintenance.schedule()
+
+    def poll_maintenance(self):
+        if hasattr(self, "_maintenance"):
+            self._maintenance.poll()
+
+    def conversation_state(self, scope=None, subject=None):
+        sc, sub = self.memory_scope if scope is None else (scope, subject or "")
+        epoch = json.dumps([self.handler_id, self.handler_bound_at, self._int_meta("handler_bound_msg_id")]) if sc == "private" else ""
+        return Conversation(self.store, self.instance_no, sc, sub, epoch)
+
+    def context_history(self, limit=None):
+        scope, subject = self.memory_scope
+        if self.settings.memory.context_hours == 0:
+            return self._since_floor(self.store.recent_messages(self.session_id, limit or self.settings.memory.session_window))
+        rows = self._since_floor(self.store.context_messages(
+            self.instance_no, self.history_prefix, scope, subject,
+            limit or self.settings.memory.session_window))
+        return [m for m in rows if _gap_hours(self.clock.iso(), m['ts']) <= self.settings.memory.context_hours]
 
     def visible_memories(self, view=None) -> list[dict]:
         """她**此刻真的能想起来**的记忆：视角闸门（view）+ 绑定时刻遮蔽（P0-3b）。
@@ -769,7 +800,7 @@ class Giftia:
         """最近的聊天记录（跨天，含她自己的回复）——和她在 QQ 里看到的视角一致。"""
         return self._since_floor(self.store.messages_by_prefix(self.history_prefix, limit))
 
-    def _since_floor(self, rows: list[dict]) -> list[dict]:
+    def _since_floor(self, rows: list[dict], *, private: bool = False) -> list[dict]:
         """"我们之间没有共同的过去"——换人之后，工作记忆里也不该有前任的话（P0-3b）。
 
         记忆那一层有 `_memory_visible` 遮着，但**聊天记录窗口是另一条路**：
@@ -779,7 +810,7 @@ class Giftia:
         只裁搭档私聊会话；群聊记录是公开的，不受"换人"影响。
         """
         floor = self._private_floor()
-        if not floor or self.scope_key != "m":
+        if not floor or (self.scope_key != "m" and not private):
             return rows
         watermark = self._int_meta("handler_bound_msg_id")
         kept: list[dict] = []
@@ -836,6 +867,7 @@ class Giftia:
         is_handler: bool | None = None,
         log_only: bool = False,
         mid: str = "",
+        defer_maintenance: bool = False,
     ) -> str:
         """平台无关入口。
 
@@ -851,11 +883,16 @@ class Giftia:
                     认主后就按搭档处理；群里一律不算（群里只有群主认主或 /bind 才算）。
         log_only：只把这句话记进聊天记录、不回复（群里全量模式下的"旁听"）。
         """
+        defer_maintenance = defer_maintenance and self.settings.memory.background_maintenance
+        self._turn_started = time.monotonic()
+        self._defer_maintenance = defer_maintenance
+        self.turn_timings = {}
         self.notices = []
         self.tool_writes = []
         # 清掉上一条回复的记账：适配器回报送达情况时只能作用在**这一轮**的回复上
         self.last_reply_id = None
         self.last_reply_text = ""
+        self.current_user_message_id = 0
         self.current_mid = str(mid or "")   # 平台消息 id：撤回时要按它找
         self.last_scene = scene if scene in ("c2c", "group", "guest") else "c2c"
         text = (text or "").strip()
@@ -949,8 +986,11 @@ class Giftia:
             self._note_error("这一轮", exc)
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
         try:
-            if self.is_handler:
+            if defer_maintenance:
+                self.schedule_maintenance()
+            elif self.is_handler:
                 self._post_turn()
+                self._maybe_dream(self.clock.now())
             else:
                 self.consolidate()
         except Exception as exc:
@@ -1040,11 +1080,7 @@ class Giftia:
         life = self.status()
         now = self.clock.now()
         # 工作记忆也过绑定时刻遮蔽：换人之后，新搭档看不到前任留下的对话窗口（P0-3b）
-        recent = self._since_floor(
-            self.store.recent_messages(
-                self.session_id, self.settings.memory.session_window
-            )
-        )
+        recent = self.context_history()
         query = self._recall_query(recent, text)
         # ★ 只在她"此刻能看到"的记忆里检索 —— 群聊时检索不到别人私聊的内容，
         #   换人之后也检索不到前任的私事（visible_memories 里含绑定时刻遮蔽）
@@ -1059,7 +1095,7 @@ class Giftia:
         if self.settings.memory.rewrite_when_weak and memories and is_weak(
             recalled, self.settings.memory
         ):
-            variants = self._rewrite_queries(text)
+            variants = self._rewrite_queries(self._recall_query(recent[-6:], text))
             if variants:
                 merged = self._recall_merged(
                     memories, query, text, life.stage, now,
@@ -1127,6 +1163,10 @@ class Giftia:
                 text, present_only=self.last_scene in ("group", "guest")
             ),
             tool_rules=agent_tools.TOOL_RULES if agent_tools.specs(self) else "",
+            conversation=self.conversation_state().render(now,
+                self._int_meta("handler_bound_msg_id") if self.memory_scope[0] == "private" else 0, stage=life.stage)
+                if self.settings.memory.conversation_state_enabled else "",
+            focus=reply_focus(text, recent),
         )
         messages: list[dict] = [{"role": "system", "content": system}]
         messages.extend(self._window(recent))
@@ -1162,6 +1202,7 @@ class Giftia:
         光在提示词里催"请说话"是不够的，她可能又去调工具，用户就永远等不到回复。
         拿掉工具才是真正的保证。
         """
+        self._reply_context = list(messages)
         tools = agent_tools.specs(self)
         if not tools:
             return self.llm.chat(messages)
@@ -1175,9 +1216,11 @@ class Giftia:
             if round_no == rounds:
                 # 最后一轮：nudge + 不给工具 —— 保证她说得出一句话
                 convo.append({"role": "system", "content": TOOL_LAST_ROUND_NUDGE})
+                self._reply_context = list(convo)
                 return self.llm.chat(convo)
             reply = self.llm.chat_with_tools(convo, tools=tools)
             if not reply.tool_calls:
+                self._reply_context = list(convo)
                 return reply.text
             convo.append(
                 reply.raw_message or {"role": "assistant", "content": reply.text or ""}
@@ -1219,6 +1262,9 @@ class Giftia:
                 "out_chars": len(reply),
                 "prompt_chars": prompt_chars,      # 提示词有多大（记忆注入的代价）
                 "recalled": len(recalled),         # 想起来几条
+                "timings_ms": getattr(self, "turn_timings", {}),
+                "reply_ready_ms": round((time.monotonic() - getattr(self, "_turn_started", time.monotonic())) * 1000),
+                "prompt_version": "quality-v1",
                 "said": len(self.last_cited),      # 真的说出口几条（→ 记得更久）
             }
             with path.open("a", encoding="utf-8") as fh:
@@ -1241,13 +1287,9 @@ class Giftia:
                 self._tick_inner(text, now)
             except Exception as exc:
                 self._note_error("推进关系与心情", exc)
+        prepared_at = time.monotonic()
         messages, recalled = self._prepare(text)
-        # 做梦放在回复之后：这一场梦下次说话时再讲，免得"刚做完就讲"
-        if self.is_handler:
-            try:
-                self._maybe_dream(now)
-            except Exception as exc:
-                self._note_error("做梦", exc)
+        self.turn_timings["prepare_ms"] = round((time.monotonic() - prepared_at) * 1000)
         self.last_recalled = recalled
         if recalled:
             # 被塞进提示词 ≠ 被想起。这里只记账，强化要等她真的说出口。
@@ -1259,7 +1301,7 @@ class Giftia:
                 self._note_error("记录被注入的记忆", exc)
 
         try:
-            self.store.add_message(
+            self.current_user_message_id = self.store.add_message(
                 self.session_id,
                 self.instance_no,
                 "user",
@@ -1271,10 +1313,18 @@ class Giftia:
                 self.memory_scope[1],
                 self.current_mid,
             )
+            feedback = explicit_feedback(text) if self.settings.memory.conversation_state_enabled else None
+            if feedback:
+                from .llm import MemoryDraft
+                key, summary, status = feedback
+                evidence = self.store.messages_by_ids([self.current_user_message_id])
+                self.conversation_state().update(MemoryDraft(summary=summary,kind='interaction_feedback',
+                    behavior_key=key,status=status,source_ids=[self.current_user_message_id]), evidence, now)
         except Exception as exc:
             # 你的话没记下来是遗憾，但不该让她这一轮哑掉
             self._note_error("记下你说的这句话", exc)
 
+        generated_at = time.monotonic()
         try:
             reply = self._reply_with_tools(messages)
         except LLMError as exc:
@@ -1285,6 +1335,18 @@ class Giftia:
             # 都不能冒穿：给一句兜底台词 + 留痕（P1-3）
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
             self._note_error("生成回复", exc)
+        if question_restraint(text, self.context_history()) and asks_question(str(reply)):
+            # One bounded retry only for a recent explicit user constraint. Never delete sentences from a reply.
+            try:
+                retry = [*getattr(self, '_reply_context', messages), {'role':'assistant','content':reply},
+                         {'role':'system','content':'他最近明确要求不要连续追问。上一稿仍在问问题。现在直接回应已有内容，说出自己的反应，不提出任何问题。只输出发给他的回复，不解释改写过程。'}]
+                replacement = self.llm.chat(retry)
+                if str(replacement or '').strip():
+                    reply = replacement
+                self.turn_timings['feedback_retry'] = 1
+            except Exception as exc:
+                self._note_error('落实少问的明确反馈', exc)
+        self.turn_timings["generation_ms"] = round((time.monotonic() - generated_at) * 1000)
         if not str(reply or "").strip():
             # 空回复不能写成一条空的 assistant 记录：她"以为自己说了句空话"（P3）
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
@@ -1300,6 +1362,7 @@ class Giftia:
                 "",
                 self.memory_scope[0],
                 self.memory_scope[1],
+                self.current_mid + ":reply" if self.current_mid.startswith("web:") else "",
             )
         except Exception as exc:
             self.last_reply_id = None
@@ -1456,6 +1519,10 @@ class Giftia:
     ) -> tuple[OutreachPlan | None, str]:
         """她想主动找你（或群里）时说的一句。record=True 才真的记账。"""
         for_group = target != "owner"
+        if not force and not for_group:
+            recent_user = self.store._one("SELECT ts FROM messages WHERE instance_no=? AND scope='private' AND role='user' ORDER BY id DESC LIMIT 1", (self.instance_no,))
+            if recent_user and _gap_hours(self.clock.iso(), recent_user['ts']) < 0.5 and not self.lifespan.is_terminal_warning():
+                return None, ""
         plan_ = self.outreach_plan(force=force, for_group=for_group)
         if plan_ is None:
             return None, ""
@@ -1486,10 +1553,23 @@ class Giftia:
             occasions=occasions,
             dream=None if for_group else dream,
         )
+        if not for_group:
+            recent = self._since_floor(self.store.context_messages(
+                self.instance_no, f"i{self.instance_no}-m-", "private", "", 12), private=True)
+            context = self.conversation_state('private', '').render(now, self._int_meta('handler_bound_msg_id'), stage=self.status().stage)
+            # Raw recent chat is already private; do not include other visitors' messages.
+            from .memory import build_transcript
+            system += "\n\n【近期交流与仍在关注的事】\n" + build_transcript(recent, self.settings.persona.name)[-2200:] + "\n" + context
+            recent_out = [m['content'] for m in recent if m['role']=='assistant'][-3:]
+            system += "\n不要重演近期已经说过的桥段；没有新内容时可以不发。近期说过：\n" + "\n".join(recent_out)
         text = compose_outreach_text(self.settings, self.llm, plan_, system_prompt=system)
+        if text and not for_group:
+            from .memory import similarity
+            if any(similarity(text, old) >= 0.72 for old in recent_out):
+                return plan_, ""
         if text and record:
             self.store.add_message(
-                self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
+                f"i{self.instance_no}-m-{now.strftime('%Y%m%d')}", self.instance_no, "assistant", text, self.clock.iso(now)
             )
             record_sent(self.store, now)
             if dream is not None and not for_group:
@@ -1544,7 +1624,7 @@ class Giftia:
         now = self.clock.now()
         if keep_in_history:
             self.store.add_message(
-                self.session_id, self.instance_no, "assistant", text, self.clock.iso(now)
+                f"i{self.instance_no}-m-{now.strftime('%Y%m%d')}", self.instance_no, "assistant", text, self.clock.iso(now)
             )
         # 心情分享一天只发一次：记下来，免得同一种心情一天里反复"分享"。
         # 用**计划里记下的**心情 key，不重新取一次——中间心情可能已经变了。
@@ -1734,6 +1814,12 @@ class Giftia:
             picked.append({"role": m["role"], "content": content})
             total += cost
         picked.reverse()
+        if picked and recent:
+            first = recent[-len(picked)]
+            if _gap_hours(self.clock.iso(), str(first.get('ts', ''))) >= 0.5:
+                picked.insert(0, {'role': 'system', 'content':
+                    '时间线索：下方历史对话最早开始于' + human_age(str(first.get('ts', '')), self.clock.now()) +
+                    '。这是时间元数据，不是说话内容，不要在回复中打印时间标签。'})
         return picked
 
     # ── 每轮之后 ──────────────────────────────────────────
@@ -1807,6 +1893,7 @@ class Giftia:
             subject_id=subject,
             speaker_id=self.speaker_id if scope != "private" else "",
             stats=stats,
+            conversation=self.conversation_state() if self.settings.memory.conversation_state_enabled else None,
             # 只有**私聊里**跟搭档的对话才推进关系、才能改她的称呼。
             # 群聊再热闹也不给亲密度加分——关系奖励的是"你来了"，不是"你说了多少"。
             on_draft=(
@@ -2102,6 +2189,10 @@ class Giftia:
         return "\n".join(lines).strip()
 
     def close(self) -> None:
+        if hasattr(self, "_maintenance"):
+            self._maintenance.close()
+            self.store.close()
+            return
         try:
             # 关掉之前把**所有**还卡着没整理的会话都补上（不只是当前这个）——
             # 不然聊到一半停了、或者跨过零点的会话，那几条会永远变不成记忆。
@@ -2147,6 +2238,7 @@ def handle_message(
     is_handler: bool | None = None,
     log_only: bool = False,
     mid: str = "",
+    defer_maintenance: bool = False,
 ) -> str:
     """一行代码接入任何平台：
 
@@ -2167,6 +2259,7 @@ def handle_message(
         is_handler=is_handler,
         log_only=log_only,
         mid=mid,
+        defer_maintenance=defer_maintenance,
     )
 
 def current() -> Giftia | None:

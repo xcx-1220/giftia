@@ -35,6 +35,7 @@ import base64
 import hashlib
 import json
 import secrets
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -279,20 +280,34 @@ class LastMessage:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self.lock = threading.RLock()
 
-    def set(self, text: str, *, title: str = "艾拉") -> None:
+    def _write(self, payload):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({
-            "title": title,
-            "text": text,
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }, ensure_ascii=False), encoding="utf-8")
+        tmp=self.path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(payload,ensure_ascii=False),encoding='utf-8')
+        tmp.replace(self.path)
+
+    def set(self, text: str, *, title: str = "艾拉") -> str:
+        token=secrets.token_hex(12)
+        with self.lock:
+            self._write({'id':token,'title':title,'text':text,'ts':time.strftime('%Y-%m-%dT%H:%M:%S')})
+        return token
+
+    def restore_if(self, token, previous):
+        with self.lock:
+            if self.get().get('id')!=token:
+                return
+            if previous:self._write(previous)
+            else:self.path.unlink(missing_ok=True)
 
     def get(self) -> dict:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+        with self.lock:
+            try:
+                value=json.loads(self.path.read_text(encoding="utf-8"))
+                return value if isinstance(value,dict) else {}
+            except (OSError, ValueError):
+                return {}
 
 
 def notify_all(
@@ -311,7 +326,8 @@ def notify_all(
 
     返回 (成功数, 总订阅数)。失效的订阅（404/410）会被清掉。
     """
-    last.set(text, title=title)
+    previous = last.get()
+    token = last.set(text, title=title)
     subs = store.load()
     good = 0
     dead: list[str] = []
@@ -319,16 +335,24 @@ def notify_all(
         endpoint = str(sub.get("endpoint") or "")
         if not endpoint:
             continue
-        sent, code, _ = send_push(
-            endpoint, private_b64, public_b64, subject=subject,
-            relay_url=relay_url, relay_secret=relay_secret,
-        )
+        try:
+            sent, code, _ = send_push(
+                endpoint, private_b64, public_b64, subject=subject,
+                relay_url=relay_url, relay_secret=relay_secret,
+            )
+        except Exception:
+            sent, code = False, 0
         if sent:
             good += 1
         elif code in (404, 410):
             dead.append(endpoint)   # 这个设备已经卸了/订阅过期
     for endpoint in dead:
-        store.remove(endpoint)
+        try:
+            store.remove(endpoint)
+        except OSError:
+            pass
+    if good == 0:
+        last.restore_if(token, previous)
     return good, len(subs)
 
 

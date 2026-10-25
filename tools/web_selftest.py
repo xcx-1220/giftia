@@ -113,7 +113,7 @@ def main() -> int:
     secret = "correct-horse-battery"
     friend_pass = "let-my-friends-in"
     gate = WebGate(port=0, secret=secret, static_dir=ROOT / "web",
-                   friend_pass=friend_pass)
+                   friend_pass=friend_pass, data_dir=root / 'web-data')
     # port=0 → 让系统分配一个空闲端口
     gate.port = 0
     check("没有口令就不启动（公网无口令 = 谁都能烧 token）",
@@ -306,6 +306,40 @@ def main() -> int:
 
         code, _ = call(f"{base}/api/login", data={"pass": "neither-one"})
         check("两套口令之外的都进不来", code == 401, str(code))
+
+        print("\n10. 可恢复请求与身份隔离")
+        gate._hits.clear()
+        rid = 'quality-request-123456789'
+        count_before = hub.store.count_messages()
+        code, first = call(f"{base}/api/chat", data={'text': '这条只发送一次', 'request_id': rid}, cookie=owner_cookie)
+        count_after = hub.store.count_messages()
+        code2, second = call(f"{base}/api/chat", data={'text': '这条只发送一次', 'request_id': rid}, cookie=owner_cookie)
+        check('相同编号返回相同结果', code == 200 and code2 == 200 and first == second)
+        check('重试不重复写入对话', count_after == count_before + 2 and hub.store.count_messages() == count_after)
+        code, result = call(f"{base}/api/chat/result?request_id={rid}", cookie=owner_cookie)
+        check('超时后可查询已完成结果', code == 200 and result.get('status') == 'completed' and result.get('reply') == first.get('reply'))
+        code, _ = call(f"{base}/api/chat/result?request_id={rid}", cookie=friend_cookie)
+        check('访客不能猜编号读取搭档结果', code == 404)
+        code, _ = call(f"{base}/api/chat/result?request_id={rid}")
+        check('结果接口要求身份认证', code == 401)
+        code, _ = call(f"{base}/api/chat", data={'text': '换一个内容', 'request_id': rid}, cookie=owner_cookie)
+        check('同编号不能换内容', code == 409)
+        code, _ = call(f"{base}/api/chat", data={'text': '编号太短', 'request_id': 'bad'}, cookie=owner_cookie)
+        check('无效编号被拒绝', code == 400)
+        code, session = call(f"{base}/api/session", cookie=owner_cookie)
+        check('服务端认识搭档，不再重复初见介绍', code == 200 and session.get('known') and '初次见面' not in session.get('greeting', ''))
+        restored = WebGate(port=0, secret=secret, static_dir=ROOT/'web', friend_pass=friend_pass, data_dir=root/'web-data')
+        restored._owner_epoch = gate._owner_epoch
+        persisted = restored.ledger.get(restored.principal('owner') + ':' + rid)
+        check('请求结果落盘，入口重建后仍可读取', persisted and persisted.get('reply') == first.get('reply'))
+        key = gate.principal('owner') + ':' + rid
+        gate.ledger.update(key, status='running', reply='')
+        interrupted = WebGate(port=0, secret=secret, static_dir=ROOT/'web', friend_pass=friend_pass, data_dir=root/'web-data')
+        before_recover = hub.store.count_messages()
+        interrupted.drain(settings)
+        recovered = interrupted.ledger.get(key)
+        check('回复已落库但HTTP未交付时，重启后能恢复结果', recovered and recovered.get('status') == 'completed' and recovered.get('reply') == first.get('reply'))
+        check('重启恢复不会重新生成或重复写聊天', hub.store.count_messages() == before_recover)
 
     finally:
         gate.stop()

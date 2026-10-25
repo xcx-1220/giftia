@@ -502,6 +502,8 @@ def mark_cited(
     同时比对"她看到的模糊版"和"原始条目"：只要有一边对得上就算数。
     """
     for r in recalled:
+        if r.memory.get("quality_kind") in {"interaction_feedback", "assistant_statement"}:
+            continue
         if is_cited(reply, r.text, cfg) or is_cited(reply, str(r.memory.get("summary", "")), cfg):
             store.mark_cited([r.memory["id"]], now_iso)
             return [r.memory["id"]]
@@ -588,7 +590,7 @@ def build_transcript(messages: list[dict], persona_name: str) -> str:
             who = str(m.get("speaker_name") or "").strip() or "搭档"
         else:
             who = persona_name
-        lines.append(f"{who}：{str(m['content']).strip()}")
+        lines.append(f"#{m.get('id', 0)} {who}：{str(m['content']).strip()}")
     return "\n".join(lines)
 
 
@@ -640,6 +642,8 @@ def consolidate(
     speaker_id: str = "",
     on_draft=None,
     stats: dict | None = None,
+    prepared: tuple[list[dict], list[MemoryDraft]] | None = None,
+    conversation=None,
 ) -> int:
     """把未整理的对话压成记忆条目。返回新增条数。
 
@@ -650,7 +654,7 @@ def consolidate(
     "记住了一件关于他本人的事"加分，称呼系统用它来发现"他要求改口"。
     """
     instance_no = store.meta_get_int("instance_no", 1)
-    pending = load_pending(store, instance_no, session_id)
+    pending = prepared[0] if prepared is not None else load_pending(store, instance_no, session_id)
     if not pending:
         return 0
     if not force and len(pending) < settings.memory.consolidate_every:
@@ -663,7 +667,7 @@ def consolidate(
 
     drafts: list[MemoryDraft] = []
     try:
-        drafts = llm.extract_memories(
+        drafts = prepared[1] if prepared is not None else llm.extract_memories(
             build_transcript(pending, settings.persona.name),
             name=settings.persona.name,
             today=now_iso[:10],
@@ -699,7 +703,17 @@ def consolidate(
             d for d in drafts
             if d.summary.strip() and d.importance >= settings.memory.min_importance
         ]
+        from .conversation import LIMITS, is_performance
         for index_in_batch, d in enumerate(accepted, start=1):
+            evidence = [m for m in pending if int(m["id"]) in d.source_ids]
+            if conversation is not None and d.kind in LIMITS:
+                conversation.update(d, pending, datetime.fromisoformat(now_iso), commit=False)
+            if d.kind in {"topic", "open_loop", "interaction_feedback", "self_interest"}:
+                continue
+            if d.kind == "assistant_statement" or is_performance(d.summary):
+                continue
+            if d.kind == "preference" and not any(m["role"] == "user" for m in evidence):
+                continue
             layer = d.layer if d.layer in ("core", "important", "normal") else infer_layer(
                 d.importance, d.emotion
             )
@@ -751,6 +765,14 @@ def consolidate(
                 about=d.about,
                 commit=False,
             )
+            store.annotate_memory(new_id, d.kind, evidence,
+                                  behavior=d.behavior_key, commit=False)
+            if d.kind == 'preference' and d.behavior_key:
+                store.conn.execute(
+                    "UPDATE memory_annotations SET policy='background',reason='用户明确更新了同一偏好' "
+                    "WHERE kind='preference' AND behavior_key=? AND memory_id!=? AND memory_id IN "
+                    "(SELECT id FROM memories WHERE instance_no=? AND scope=? AND subject_id=?)",
+                    (d.behavior_key, new_id, instance_no, scope, subject_id))
             added += 1
             # 同一批里后面的条目也要跟刚写进去的做去重
             existing = [*existing, {"id": new_id, "summary": d.summary.strip()}]

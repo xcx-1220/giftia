@@ -17,14 +17,15 @@
   var KEY_PASS    = 'ella.pass';
   var KEY_HISTORY = 'ella.history';
   var KEY_FIRST   = 'ella.first';
+  var KEY_PENDING = 'ella.pending';
 
   var MAX_HISTORY = 100;      // localStorage 不是数据库，只留最近 100 条
   var MAX_PARTS   = 6;        // 万一后端切太多段，这里兜一下，别刷屏
 
   // 她每两段之间的停顿：500~900ms 随机。
   // 固定值会听出机械感，随机区间才像人在打字。
-  var PART_MIN = 500;
-  var PART_MAX = 900;
+  var PART_MIN = 60;
+  var PART_MAX = 160;
 
   var TIMEOUT_CHAT  = 45000;  // 后端自己会给 504；这个只是防止请求永远挂着
   var TIMEOUT_SHORT = 10000;  // 登录 / 健康检查
@@ -115,7 +116,38 @@
 
   /* ---------------- 历史 ---------------- */
 
-  var history = loadHistory();
+  var activeView = store.get('ella.view');
+  if (activeView) {
+    KEY_HISTORY = 'ella.history.' + activeView;
+    KEY_PENDING = 'ella.pending.' + activeView;
+  }
+  var history = activeView ? loadHistory() : [];
+
+  function syncSession() {
+    return api('/api/session', undefined, TIMEOUT_SHORT).then(function (data) {
+      var view = data.view_id;
+      if (!view) return data;
+      if (KEY_HISTORY !== 'ella.history.' + view) {
+        KEY_HISTORY = 'ella.history.' + view;
+        KEY_PENDING = 'ella.pending.' + view;
+        history = loadHistory();
+        // Legacy local history belongs to the owner; never adopt it for visitors.
+        if (!activeView && data.role === 'owner' && !history.length) {
+          var legacy = [];
+          try { legacy = JSON.parse(store.get('ella.history') || '[]'); } catch (e) {}
+          if (Array.isArray(legacy)) {
+            history = legacy.filter(function (m) { return m && (m.role === 'her' || m.role === 'me') && typeof m.text === 'string'; }).slice(-MAX_HISTORY);
+            saveHistory();
+          }
+        }
+        clearStream();
+        restoreHistory();
+      }
+      activeView = view;
+      store.set('ella.view', view);
+      return data;
+    });
+  }
 
   function loadHistory() {
     var raw;
@@ -315,7 +347,7 @@
   var greetingOn = false;    // 首次进入的招呼还在播
 
   function setComposerEnabled(on) {
-    inputEl.disabled = !on;
+    inputEl.disabled = false;  // 等待回复时可以继续写草稿
     sendEl.disabled = !on;
     // 她说完之后把光标交回输入框（iOS 上 disabled 会丢焦点，所以这里补回来）
     if (on) { try { inputEl.focus({ preventScroll: true }); } catch (e) { inputEl.focus(); } }
@@ -357,6 +389,10 @@
 
   function handleChatError(err) {
     var status = err && err.status;
+    if (err && err.pending) {
+      addNote('（回复还在处理中，已保留这条请求。再次点击发送可继续等待，草稿不会丢。）');
+      return;
+    }
 
     if (err && err.empty) {
       addNote('（她这次什么都没说）');
@@ -383,10 +419,43 @@
     showBanner('现在连不上后端。之前的消息还能看，等她那边好了再说话。');
   }
 
+  function recoverableChat(request) {
+    var deadline = Date.now() + 180000;
+    function poll() {
+      if (Date.now() > deadline) {
+        var pendingError = makeError(0, 'pending'); pendingError.pending = true;
+        throw pendingError;
+      }
+      return wait(1000).then(function () {
+        return api('/api/chat/result?request_id=' + encodeURIComponent(request.request_id), undefined, TIMEOUT_SHORT);
+      }).then(function (data) {
+        return data.status === 'completed' || typeof data.reply === 'string' ? data : poll();
+      }).catch(function (err) {
+        if (err.pending) throw err;
+        if (err.status === 404) return post(); // 相同编号安全重试，不能重新编号
+        if (!err.status) return poll();
+        if (err.status === 502 || err.status === 409) store.del(KEY_PENDING);
+        throw err;
+      });
+    }
+    function post() {
+      return api('/api/chat', request, TIMEOUT_CHAT).then(function (data) {
+        return data.status === 'completed' || typeof data.reply === 'string' ? data : poll();
+      }).catch(function (err) {
+        if (!err.status || err.status === 504) return poll();
+        if (err.status === 502 || err.status === 409) store.del(KEY_PENDING);
+        throw err;
+      });
+    }
+    return post();
+  }
+
   function send() {
     if (busy) return;
 
-    var text = inputEl.value.replace(/^\s+|\s+$/g, '');
+    var saved = null;
+    try { saved = JSON.parse(store.get(KEY_PENDING) || 'null'); } catch (e) {}
+    var text = saved ? saved.text : inputEl.value.replace(/^\s+|\s+$/g, '');
     if (!text) return;
 
     busy = true;
@@ -394,14 +463,22 @@
     if (typingEl) hideTyping();
     setComposerEnabled(false);       // ★ 整段回复播完才解锁，她还在说时不会又追问一句
 
-    inputEl.value = '';
+    if (!saved) {
+      var bytes = new Uint8Array(16);
+      if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes);
+      else for (var b = 0; b < bytes.length; b++) bytes[b] = Math.floor(Math.random()*256);
+      var rid = Array.prototype.map.call(bytes, function (x) { return ('0'+x.toString(16)).slice(-2); }).join('');
+      saved = {request_id: rid, text: text};
+      store.set(KEY_PENDING, JSON.stringify(saved));
+      inputEl.value = '';
+      appendMessage({ role: 'me', text: text, ts: Date.now() }, { animate: true });
+    }
     autoGrow();
     hideBanner();
-
-    appendMessage({ role: 'me', text: text, ts: Date.now() }, { animate: true });
     showTyping();                    // 等网络这段时间也得有反馈，不然像卡住了
 
-    api('/api/chat', { text: text }, TIMEOUT_CHAT)
+    recoverableChat(saved)
+
       .then(function (data) {
         var parts = normalizeParts(data);
         if (!parts.length) {
@@ -409,6 +486,7 @@
           empty.empty = true;
           throw empty;
         }
+        store.del(KEY_PENDING);
         hideTyping();
         return speakParts(parts, null);
       })
@@ -428,11 +506,10 @@
   // 第一次打开时她不该只是一片空白，但这句话不是"她说过的记录"。
   function playGreeting() {
     greetingOn = true;
-    speakParts([
-      '（她抬起头，把手里那杯温水往你这边推了推）',
-      '我是艾拉。Giftia，Type-07。',
-      '……今天，想说点什么？'
-    ], function () { return !greetingOn; }, false);
+    api('/api/session', undefined, TIMEOUT_SHORT).then(function (data) {
+      if (!greetingOn || history.length) return;
+      return speakParts([data.greeting || '你来了。'], function () { return !greetingOn; }, false);
+    }).catch(function () {});
   }
 
   /* ---------------- 键盘遮挡 ---------------- */
@@ -523,6 +600,7 @@
     setGateMsg('');
 
     api('/api/login', { pass: pass }, TIMEOUT_SHORT)
+      .then(function () { return syncSession(); })
       .then(function () {
         store.set(KEY_PASS, pass);   // 存下来，下次自动登录
         gatePass.value = '';
@@ -621,8 +699,10 @@
     if (!history.length) playGreeting();
 
     api('/api/login', { pass: saved }, TIMEOUT_SHORT)
+      .then(function () { return syncSession(); })
       .then(function () {
         hideBanner();
+        if (store.get(KEY_PENDING)) send();
       })
       .catch(function (err) {
         if (err && err.status === 401) {

@@ -347,7 +347,7 @@ def main() -> int:
     rw = Giftia(make_settings(tmp / "rewrite", 100.0), llm=SynonymLLM(settings.model))
     rw.handle("我下周三要考驾照，有点紧张")
     rw.consolidate(force=True)
-    rw.clock.advance(24)  # 换一天：工作记忆清空，查询只由这一句决定
+    rw.clock.advance(48)  # 超过短期上下文时限，再验证弱检索改写
     rw_st = rw.status()
     rw_mems = rw.store.active_memories(1, view=Store.ALL_SCOPES)
     bare = recall("那个证件的事情办得怎么样了", rw_mems, rw_st.stage, settings.memory, rw.clock.now())

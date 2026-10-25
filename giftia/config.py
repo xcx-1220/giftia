@@ -257,6 +257,9 @@ class OutreachConfig:
 
 @dataclass(frozen=True)
 class MemoryConfig:
+    context_hours: float = 36.0
+    background_maintenance: bool = True
+    conversation_state_enabled: bool = True
     consolidate_every: int = 8
     session_window: int = 24
     session_char_budget: int = 6000
@@ -368,6 +371,7 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class Persona:
+    interests: list = field(default_factory=list)
     name: str = "艾拉"
     model_code: str = "Giftia-Type-07"
     # 还不知道该怎么称呼他时，人格文本里用的兜底代词（不是称呼本身）
@@ -667,6 +671,7 @@ def _validated_outreach(oc: OutreachConfig) -> OutreachConfig:
 def _validated_memory(mc: MemoryConfig) -> MemoryConfig:
     where = "settings.toml [memory]"
     for key, lo, hi in (
+        ("context_hours", 0, 24 * 365),
         ("consolidate_every", 1, 1e6),
         ("session_window", 1, 1e6),
         ("session_char_budget", 0, 1e9),
@@ -762,6 +767,8 @@ def load_settings(
     )
     # persona.toml 的 [bond] / [moods] 是单独的段，不算"未知键"
     persona = _sub(Persona, praw, where="persona.toml", ignore={"bond", "moods"})
+    if not isinstance(persona.interests, list) or any(not isinstance(x, str) for x in persona.interests):
+        raise _cfg_error('persona.toml interests 必须是字符串列表')
 
     return Settings(
         model=model,

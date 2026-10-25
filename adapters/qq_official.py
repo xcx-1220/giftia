@@ -289,16 +289,17 @@ class QQBot:
             from giftia.outreach import can_send
 
             hub = get_default(self.settings)
-            if not self.settings.outreach.enabled:
+            if not self.settings.outreach.enabled or self.web_gate is None or not len(self.web_gate.push_subs):
                 return
             if not can_send(self.settings, hub.store, hub.clock.now()):
                 return
             plan_, text = hub.compose_outreach(record=False, target="owner")
             if not plan_ or not text.strip():
                 return
-            hub.note_outreach_sent(text, keep_in_history=True)
             if self.web_gate is not None:
                 sent_n, total = self.web_gate.push_notify(text)
+                if sent_n > 0:
+                    hub.note_outreach_sent(text, keep_in_history=True)
                 label = getattr(plan_, "reason_label", getattr(plan_, "reason", ""))
                 print(f"[主动·推送·{label}] {text[:20]}… → {sent_n}/{total} 台设备")
         except Exception as exc:              # 主动联系出问题绝不能拖垮网站

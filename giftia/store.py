@@ -125,6 +125,19 @@ CREATE TABLE IF NOT EXISTS state (
 # 索引单独一份、在 _migrate() **之后**建：
 # 老库可能连索引用到的列都还没有（mid 是后加的），先建索引会直接
 # `no such column` 打不开库。索引不是数据，晚一步没有任何代价。
+QUALITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS memory_annotations (
+ memory_id INTEGER PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'event',
+ behavior_key TEXT NOT NULL DEFAULT '', policy TEXT NOT NULL DEFAULT 'normal',
+ reason TEXT NOT NULL DEFAULT '', revision TEXT NOT NULL DEFAULT 'quality-v1');
+CREATE TABLE IF NOT EXISTS memory_evidence (
+ memory_id INTEGER NOT NULL, message_id INTEGER NOT NULL, role TEXT NOT NULL,
+ PRIMARY KEY(memory_id,message_id));
+CREATE TABLE IF NOT EXISTS quality_repairs (
+ repair_id TEXT NOT NULL, memory_id INTEGER NOT NULL, previous TEXT NOT NULL,
+ PRIMARY KEY(repair_id,memory_id));
+"""
+
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_msg_session  ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_msg_open     ON messages(instance_no, consolidated);
@@ -275,6 +288,7 @@ class Store:
         self._migrate()
         # 索引在补列之后建（见 INDEXES 的注释：老库可能连 mid 列都还没有）
         self.conn.executescript(INDEXES)
+        self.conn.executescript(QUALITY_SCHEMA)
         self.conn.commit()
 
     # ── 显式事务 ──────────────────────────────────────────
@@ -354,6 +368,31 @@ class Store:
             return default
 
     # ── messages ──────────────────────────────────────────
+    def messages_by_ids(self, ids: list[int]) -> list[dict]:
+        ids = [int(i) for i in ids][:200]
+        if not ids:
+            return []
+        return self._rows("SELECT * FROM messages WHERE id IN (" + ",".join("?" * len(ids)) + ") ORDER BY id", ids)
+
+    def context_messages(self, instance_no: int, prefix: str, scope: str, subject: str,
+                         limit: int = 40) -> list[dict]:
+        # substr uses literal matching; identifiers containing %/_ are not SQL wildcards.
+        rows = self._rows("SELECT * FROM messages WHERE instance_no=? AND substr(session_id,1,?)=? "
+                          "AND scope=? AND subject_id=? AND recalled=0 ORDER BY id DESC LIMIT ?",
+                          (instance_no, len(prefix), prefix, scope, subject, max(1, min(200, limit))))
+        return list(reversed(rows))
+
+    def annotate_memory(self, memory_id: int, kind: str, evidence: list[dict], *,
+                        behavior: str = "", policy: str = "normal", reason: str = "",
+                        commit: bool = True):
+        self.conn.execute("INSERT OR REPLACE INTO memory_annotations(memory_id,kind,behavior_key,policy,reason) "
+                          "VALUES(?,?,?,?,?)", (memory_id, kind, behavior, policy, reason))
+        for row in evidence:
+            self.conn.execute("INSERT OR IGNORE INTO memory_evidence VALUES(?,?,?)",
+                              (memory_id, int(row["id"]), row["role"]))
+        if commit:
+            self.conn.commit()
+
     def add_message(
         self,
         session_id: str,
@@ -816,8 +855,10 @@ class Store:
         """
         extra, args = self._view_clause(view)
         return self._rows(
-            "SELECT * FROM memories WHERE instance_no = ? AND sealed = 0 "
-            "AND merged_into = 0 AND forgotten = 0"
+            "SELECT memories.*, COALESCE(a.kind,'event') quality_kind FROM memories "
+            "LEFT JOIN memory_annotations a ON a.memory_id=memories.id "
+            "WHERE instance_no = ? AND sealed = 0 AND merged_into = 0 AND forgotten = 0 "
+            "AND COALESCE(a.policy,'normal')='normal'"
             + extra
             + " ORDER BY id ASC",
             (instance_no, *args),
@@ -847,6 +888,8 @@ class Store:
         cur = self.conn.execute(
             "UPDATE memories SET forgotten = 1 WHERE id = ?", (memory_id,)
         )
+        if cur.rowcount:
+            self.meta_set('memory_revision', self.meta_get_int('memory_revision', 0) + 1, commit=False)
         self.conn.commit()
         return bool(cur.rowcount)
 

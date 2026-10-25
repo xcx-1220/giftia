@@ -70,6 +70,11 @@ TOOL_SPECS: list[dict[str, Any]] = [
                         "type": "number",
                         "description": "0~1，越重要越接近 1。日常小事 0.4，重要的事 0.8。",
                     },
+                    "kind": {
+                        "type": "string", "enum": ["event", "fact", "preference", "interaction_feedback", "open_loop"],
+                        "description": "用户对聊天方式的纠正选 interaction_feedback；未完成约定选 open_loop，其余按事实/偏好区分。",
+                    },
+                    "behavior_key": {"type": "string", "description": "同一互动偏好或未完事项使用同一个主题名。"},
                 },
                 "required": ["content"],
             },
@@ -206,6 +211,17 @@ def _remember(hub: Any, args: dict) -> str:
         return "（content 不能为空）"
     if len(content) > 120:
         content = content[:120]
+    evidence = hub.store.messages_by_ids([getattr(hub, 'current_user_message_id', 0)])
+    kind = args.get('kind', 'event')
+    if kind in ('interaction_feedback', 'open_loop'):
+        from .llm import MemoryDraft
+        if not evidence:
+            return '（没有可核对的原话，先不要当成长期反馈。）'
+        hub.conversation_state().update(MemoryDraft(summary=content, kind=kind,
+            source_ids=[m['id'] for m in evidence], behavior_key=str(args.get('behavior_key') or '')[:40]),
+            evidence, hub.clock.now())
+        hub.tool_writes.append(content)
+        return '（已留意这件事，接着自然说话，不必汇报。）'
     about = str(args.get("about") or "").strip()
     if about and about not in _valid_names(hub):
         return (
@@ -233,6 +249,8 @@ def _remember(hub: Any, args: dict) -> str:
         about=about,
         source_session="tool",
     )
+    hub.store.annotate_memory(mem_id, kind if kind in ('event','fact','preference') else 'event', evidence,
+                              behavior=str(args.get('behavior_key') or '')[:40])
     hub.tool_writes.append(content)
     hub.notices.append(f"[记忆] 她自己记下了一条：{content}")
     return f"记下了（#{mem_id}）。"
@@ -255,6 +273,13 @@ def _search(hub: Any, args: dict) -> str:
         query, memories, hub.status().stage, hub.settings.memory, hub.clock.now()
     )
     if not hits:
+        # Only recent, same-view, non-retracted raw messages; never bypass the privacy floor.
+        from .memory import tokenize
+        words = set(tokenize(query))
+        rows = [m for m in hub.context_history(80) if words & set(tokenize(m['content']))][-5:]
+        if rows:
+            return "近期原话（不是模糊的长期记忆）：\n" + "\n".join(
+                f"{m['ts']} {m['role']}：{m['content'][:400]}" for m in rows)
         return "（想不起来相关的事。）"
     lines = [f"#{h.memory['id']}　{h.text}" for h in hits[:5]]
     return "想起来这些：\n" + "\n".join(lines)

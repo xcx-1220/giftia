@@ -56,6 +56,10 @@ class MemoryDraft:
     layer: str = ""          # core | important | normal（空 = 由程序按重要性判定）
     preferred_name: str = ""  # 他明确要求改称呼时才填（例如"以后叫我小林"）
     event_date: str = ""      # 他说过的"将来某一天"（YYYY-MM-DD），没有就留空
+    kind: str = "event"
+    source_ids: list[int] = field(default_factory=list)
+    behavior_key: str = ""
+    status: str = "open"
     about: str = ""           # 这条记忆是关于谁的（搭档 / 某人的名字 / 群里）
 
 
@@ -66,6 +70,16 @@ LAYERS = ("core", "important", "normal")
 CONSOLIDATE_SYSTEM = """你是 Giftia 的记忆整理模块（她本人看不到这段指令）。
 把下面这段对话，压缩成 0～5 条长期记忆条目。
 {scene_rule}
+
+先区分事实、互动反馈与助手自己的台词。不要把每次动作、道别时答得很快、汇报自己改好了记成新偏好。
+用户明确要求忘记或不再使用的内容，不要从这批旧原话中再次提炼出来。
+用户的行程和经历必须有用户原话或明确确认。助手提问、猜测和建议中的时间、地点、安排，不是用户事实。
+偏好和互动反馈必须有用户原话依据；共同事件与承诺注明双方来源。
+还可以提炼少量仍在继续的话题/未完事项/你自己的持续兴趣，不为凑数生成。
+每条新增字段 kind=event|fact|preference|interaction_feedback|topic|open_loop|self_interest|assistant_statement，
+source_ids 为稿子中实际支持此条目的 #消息编号；behavior_key 是稳定的主题名（同一偏好保持同一主题），
+status=open|completed|dismissed（已完成/撤销的事项带原主题名）。不要从助手自己的表达推断用户偏好。
+每批至多两个 topic、三个 open_loop；无依据则不写。更新和结束已有事项时保留其主题名。
 
 只记对长期关系有意义的东西：**发生的事、约定、对方的偏好与习惯、情绪变化、说过的要紧话、
 提到过的计划与日期、关于某个人本身的事实**。
@@ -546,6 +560,12 @@ def parse_memory_drafts(raw: str) -> list[MemoryDraft]:
                 preferred_name=str(it.get("preferred_name", "") or "").strip()[:16],
                 event_date=event_date,
                 about=str(it.get("about", "") or "").strip()[:20],
+                kind=str(it.get("kind", "event")) if str(it.get("kind", "event")) in
+                    {"event", "fact", "preference", "interaction_feedback", "topic", "open_loop", "self_interest", "assistant_statement"} else "event",
+                source_ids=[x for x in (it.get("source_ids") if isinstance(it.get("source_ids"), list) else [])
+                            if isinstance(x, int) and not isinstance(x, bool) and x > 0][:20],
+                behavior_key=str(it.get("behavior_key", "") or "")[:40],
+                status=str(it.get("status", "open")) if it.get("status", "open") in {"open", "completed", "dismissed"} else "open",
             )
         )
     return drafts
@@ -651,7 +671,7 @@ class MockLLM(BaseLLM):
             if "：" not in line:
                 continue
             who, text = line.split("：", 1)
-            who, text = who.strip(), text.strip()
+            who, text = re.sub(r"^#\d+\s+", "", who.strip()), text.strip()
             if not text or who == name:  # 她自己说的话不算"记忆素材"
                 continue
             rows.append((who, text))

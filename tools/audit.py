@@ -168,6 +168,8 @@ def collect_dataclasses(tree: ast.Module) -> dict[str, DataclassInfo]:
 # 另一类是"工具/演示"，本来就没有可断言的东西 —— 手工列在这里，
 # 而不是让审计脚本去猜"这看起来像不像测试"（猜错就会悄悄放过真正的测试脚本）。
 TOOL_SCRIPTS = {
+    "chat_quality_eval.py", # 多轮模型评测与盲评材料生成，判断由审阅者完成
+    "quality_repair.py",    # 有预览和撤销的运维工具，断言在 quality_selftest
     "check_deploy.py",      # 部署体检：打印环境/依赖状态
     "demo_life.py",         # 演示：跑一遍她的一生给人看
     "live_check.py",        # 连真模型的联调打印工具
@@ -471,6 +473,12 @@ def assert_calls(path: Path, tree: ast.Module) -> int:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and _func_name(node.func) in ("check", "add_check"):
             n += 1
+        elif isinstance(node, ast.Assert):
+            n += 1
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name) and node.func.value.id == 'self'
+              and node.func.attr.startswith('assert')):
+            n += 1
     return n
 
 
@@ -734,7 +742,7 @@ def main() -> int:
         if n_assert == 0:
             no_assert.append(_rel(path))
     check(
-        f"tools/ 下 {scanned} 个测试脚本都至少有一条 check() 断言",
+        f"tools/ 下 {scanned} 个测试脚本都至少有一条 check/assert/unittest 断言",
         not no_assert,
         "没有断言、跑完永远是绿的（要么补断言，要么按工具脚本登记进 TOOL_SCRIPTS）："
         + "、".join(no_assert),

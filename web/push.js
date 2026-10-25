@@ -36,14 +36,20 @@
   // 渲染逻辑在 app.js 里（气泡结构、旁白斜体、历史裁剪都在那儿）。在这里复刻一套
   // 一定会随 app.js 改动而失配。写进存储再让 app.js 自己渲染，是最不容易坏的接口。
   async function mergeOutreach() {
-    const KEY = 'ella.history';          // 和 app.js 的 KEY_HISTORY 一致
-    const MARK = 'ella.pushMerged';
+    const session = await api('/api/session');
+    if (!session || session.role !== 'owner' || !session.view_id) return;
+    const KEY = 'ella.history.' + session.view_id;
+    const MARK = 'ella.pushMerged.' + session.view_id;
+    // Don't reload away a draft/pending reply; a later initialization can merge this message.
+    const input = document.getElementById('input');
+    if (input && input.value.trim()) return;
+    if (localStorage.getItem('ella.pending.' + session.view_id)) return;
     const last = await api('/api/push/last');
     if (!last || !last.text || !last.ts) return;
 
     // 已经合并过这条了？直接返回（这行也是防重载循环的关键：重载后标记仍在）
     try {
-      if (localStorage.getItem(MARK) === last.ts) return;
+        if (localStorage.getItem(MARK) === (last.id || last.ts)) return;
     } catch (e) {
       return; // localStorage 不可用就别折腾了
     }
@@ -58,7 +64,7 @@
 
     // 万一 app.js 已经自己写进去了（比如刚才在网页上聊过），只打标记
     if (hist.some((m) => m && (m.text === last.text || m.content === last.text))) {
-      try { localStorage.setItem(MARK, last.ts); } catch (e) {}
+        try { localStorage.setItem(MARK, last.id || last.ts); } catch (e) {}
       return;
     }
 
@@ -74,7 +80,7 @@
 
     try {
       localStorage.setItem(KEY, JSON.stringify(hist));
-      localStorage.setItem(MARK, last.ts);
+        localStorage.setItem(MARK, last.id || last.ts);
     } catch (e) {
       return;
     }

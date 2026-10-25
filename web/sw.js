@@ -5,7 +5,7 @@
  *
  * 想更新壳的时候，改下面的 VERSION；activate 里会把不认识的缓存全删掉。
  */
-const VERSION = 'v1';
+const VERSION = 'quality-v1';
 const CACHE = 'ella-shell-' + VERSION;
 
 // 用相对路径：整个 web/ 可以挂在任意子路径下（比如 /static/ella/）

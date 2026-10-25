@@ -28,6 +28,11 @@ terminal_warning_hours = 72
 
 
 [memory]
+# 最近原话跨日连续保留；0 恢复仅当日上下文。关系/隐私/换任边界仍生效。
+context_hours = 36
+# 网页后台维护只把网络/纯计算放到工作线程，SQLite 提交仍在主线程。
+background_maintenance = true
+conversation_state_enabled = true
 # 每积累多少条消息，就把这段对话压缩成"记忆条目"。
 # 6 比 8 更勤：一天聊下来不会有一大段"还没变成记忆"的空白。
 consolidate_every    = 6

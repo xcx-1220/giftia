@@ -17,7 +17,7 @@ from .memory import Recalled
 
 RULES = """【本次对话的规则】
 - {scene_line}
-- **时间是真的在走的**。记忆和聊天记录前面都标了「什么时候」：
+- **时间是真的在走的**。记忆与历史对话的时间线索会告诉你「什么时候」：
   「刚刚」「23 分钟前」「今天 09:12」「昨天」「3 天前」。
   说事情的时候**照这个说法讲**（"你昨天说的""前几天你提过"），
   **不要**把两三天前的事说成刚发生的，也不要自己换算出错的日期。
@@ -28,7 +28,8 @@ RULES = """【本次对话的规则】
   · [需要含糊] —— 你只记得个大概。要用「好像」「我记得……大概是」「不太确定」这类说法，
     **绝不补齐细节、绝不编造**日期、地点或原话。
   · [只是隐约觉得] —— 它只是你心里的一点影子。**不要说出来**，最多影响你的语气和情绪。
-- 可以用一句很短的括号旁白描写你的小动作（例如：（把杯子往你那边推了推）），一次最多一句。
+- 默认直接说话，动作旁白只在必要时出现，避免连续几轮用动作或省略号填空。
+- 近期原话、当前场景和明确反馈优先；下方的背景心情不会改变他说的事实。
 - 不要输出 Markdown、标题、列表或编号。"""
 
 CONFIDENCE_MARK = {
@@ -45,7 +46,7 @@ ROSTER_MAX = 30
 # 规则块第一句要跟着场景变 —— 群聊里说"你在和你的搭档一对一说话"是错的，
 # 会让她在群里说得太长、太亲密。
 SCENE_LINES = {
-    "c2c": "你在和你的搭档一对一说话。一次回复 1～4 句，短一点，不要写成小作文。",
+    "c2c": "你在和你的搭档一对一说话。先接住具体内容，按需要表达自己的反应或延续话题，篇幅随内容而定。",
     "person": "你在和一个人一对一说话（他不是你的搭档）。一次回复 1～3 句，礼貌、有分寸。",
     "group": (
         "这是**群聊**，别人也都看得到。一次回复 1～2 句，越短越好；"
@@ -108,6 +109,8 @@ def build_system_prompt(
     group_chat: str = "",
     impressions: str = "",
     tool_rules: str = "",
+    conversation: str = "",
+    focus: str = "",
 ) -> str:
     """一次请求的 system 消息：人格 → 称呼 → 关系 → 心情 → 情境 → 状态 → 记忆 → 规则。
 
@@ -124,6 +127,9 @@ def build_system_prompt(
     name = (handler_name or "").strip()
     now = now or life.activated_at
     blocks: list[str] = [p.core_text(name).strip()]
+    if p.interests:
+        blocks.append('【你自己的小偏好】\n' + '\n'.join(_one_line(x) for x in p.interests[:2]) +
+                      '\n这些是偏好，不代表你今天确实去过书店或泡了茶。只有被记录的经历才当作发生过。')
 
     if p.hint_text(name).strip():
         blocks.append("【如果有人坚持说你是程序】\n" + p.hint_text(name).strip())
@@ -142,6 +148,7 @@ def build_system_prompt(
         body = f"你今天的心情：{mood.label}"
         if mood.note:
             body += "\n" + mood.note
+        body += "\n这是背景心情；对方这轮明确表达的内容优先，不因这个标签忽略语境。"
         blocks.append("【你今天的心情】\n" + body)
 
     if occasions:
@@ -181,6 +188,9 @@ def build_system_prompt(
                 "也别对他用你对搭档的那种亲近。他要是还没说过名字，你可以问一次。"
             )
 
+    if conversation.strip():
+        blocks.append("【你们还在继续的事】\n" + conversation.strip())
+
     if impressions.strip():
         blocks.append("【你对他们的印象】\n" + impressions.strip())
 
@@ -211,13 +221,17 @@ def build_system_prompt(
     blocks.append("【关于记忆】\n" + (life.stage.note or "你对自己的记忆很有把握。"))
     blocks.append("【你现在想起的事】\n" + render_memories(recalled, now))
     blocks.append(RULES.format(scene_line=_scene_line(scene, is_handler)))
+    if focus:
+        blocks.append('【这一轮留意】\n' + focus)
 
     return "\n\n".join(b for b in blocks if b.strip())
 
 
 def _scene_line(scene: str, is_handler: bool) -> str:
-    if scene in ("group", "guest"):
+    if scene == "group":
         return SCENE_LINES["group"]
+    if scene == "guest":
+        return SCENE_LINES["person"]
     return SCENE_LINES["c2c"] if is_handler else SCENE_LINES["person"]
 
 
