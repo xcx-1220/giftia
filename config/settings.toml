@@ -12,7 +12,7 @@ temperature    = 1.15                            # 陪伴对话可以高一点�
 max_tokens     = 900
 request_timeout = 60
 # DeepSeek 默认开启思考模式，而思考模式下 temperature 会被忽略、延迟也更高。
-# 陪伴型对话建议关掉：更像人、更便宜、回得更快。
+# 当前聊天基线关闭思考；自然度与 Low 的取舍需按同一人设实测，不能仅凭开关推断。
 thinking       = false
 reasoning_effort = "low"                         # 仅在 thinking = true 时有意义：low / high / max
 

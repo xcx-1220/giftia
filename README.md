@@ -989,6 +989,10 @@ docs/BACKLOG.md         借鉴清单：调研同类项目后整理的可打勾�
 docs/WEB.md             网页入口：架构、身份、接口、PWA、Cloudflare Tunnel、凭据
 docs/ANDROID.md         安卓套壳、签名与 assetlinks 维护
 docs/人设卡-v2-艾拉.md  已选定的方案 C 与实际注入边界
+
+docs/ISLA_CHARACTER_EXPRESSION_PLAN.md  人物、表达与长期相处整合总方案及进度
+docs/ISLA_CHARACTER_IMPLEMENTATION.md   B 方向本地候选、真实对照与剩余问题（尚未部署）
+docs/AI_COMPANION_REFERENCES.md         开源角色/陪伴项目调研与艾拉的借鉴建议
 tools/demo_life.py      一次看完她的一生（离线）
 adapters/qq_official.py QQ 适配器及网页启动入口；当前 --web-only 暂停 QQ
 web/                    PWA 前端（index.html / app.js / style.css / manifest.json / sw.js / icons）
