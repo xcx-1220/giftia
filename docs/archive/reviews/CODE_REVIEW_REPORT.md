@@ -1,5 +1,9 @@
 # Giftia 代码审查与测试报告
 
+> 历史资料，2026-11-04 归档。原路径：`CODE_REVIEW_REPORT.md`。正文保留当时状态、方案和实验结论，不作为当前实施指令；其中的“主入口/下一步”已被替代。
+> 当前资料见[文档导航](../../README.md)，所有未来工作以[统一未来计划](../../ROADMAP.md)为准。文中反引号路径及命令保留原语境，通常相对仓库根目录。
+
+
 **审查对象**：`D:\ai chatbot`（Giftia —— 有寿命、会遗忘的陪伴型对话内核，纯标准库 Python + SQLite）
 **审查日期**：2026-10-10
 **环境**：Windows / Python 3.14.3（`C:\Users\86173\AppData\Local\Programs\Python\Python314`）
@@ -45,14 +49,14 @@
 
 | 流 | 范围 | 报告 |
 |---|---|---|
-| A | `memory.py` / `lifespan.py` / `store.py` | [.review/findings/memory-man.md](.review/findings/memory-man.md) |
-| B | `brain.py` / `persona.py` / `trigger.py` / `agent_tools.py` | [.review/findings/brain-checker.md](.review/findings/brain-checker.md) |
-| C | `adapters/qq_official.py` / `ws.py` / `config.py` / `clock.py` / `deploy/*` | [.review/findings/protocol-auditor.md](.review/findings/protocol-auditor.md) |
-| D | `mood` / `bond` / `occasions` / `dream` / `outreach` / `recycle` / `cli` / `run.py` | [.review/findings/behavior-checker.md](.review/findings/behavior-checker.md) |
-| E | 独立 QA（端到端 / 隐私红队 / 时间纵轴 / 压力 / README 宣称核验） | [.review/findings/qa-verifier.md](.review/findings/qa-verifier.md) |
-| 0 | Lead 横切复核（含对全部 P0 的**独立二次复现**） | [.review/findings/lead-stream0.md](.review/findings/lead-stream0.md) |
+| A | `memory.py` / `lifespan.py` / `store.py` | [.review/findings/memory-man.md](../../../.review/findings/memory-man.md) |
+| B | `brain.py` / `persona.py` / `trigger.py` / `agent_tools.py` | [.review/findings/brain-checker.md](../../../.review/findings/brain-checker.md) |
+| C | `adapters/qq_official.py` / `ws.py` / `config.py` / `clock.py` / `deploy/*` | [.review/findings/protocol-auditor.md](../../../.review/findings/protocol-auditor.md) |
+| D | `mood` / `bond` / `occasions` / `dream` / `outreach` / `recycle` / `cli` / `run.py` | [.review/findings/behavior-checker.md](../../../.review/findings/behavior-checker.md) |
+| E | 独立 QA（端到端 / 隐私红队 / 时间纵轴 / 压力 / README 宣称核验） | [.review/findings/qa-verifier.md](../../../.review/findings/qa-verifier.md) |
+| 0 | Lead 横切复核（含对全部 P0 的**独立二次复现**） | [.review/findings/lead-stream0.md](../../../.review/findings/lead-stream0.md) |
 
-规则见 [.review/PROTOCOL.md](.review/PROTOCOL.md)：每条发现必须带位置、严重度、置信度、最小复现、**真实输出**；
+规则见 [.review/PROTOCOL.md](../../../.review/PROTOCOL.md)：每条发现必须带位置、严重度、置信度、最小复现、**真实输出**；
 没跑出证据的一律归入"未验证的怀疑"，不当结论。**每个 P0 都由 Lead 用与报告者不同的探针复现过。**
 
 ### 2.2 沙箱下的测试姿势（重要，否则你会以为是代码坏了）
@@ -496,13 +500,13 @@ python .review\run_tests.py .review\probes\qa_privacy.py
 | 文件 | 内容 |
 |---|---|
 | `CODE_REVIEW_REPORT.md` | 本报告 |
-| [.review/PROTOCOL.md](.review/PROTOCOL.md) | 审查协议（严重度定义、发现格式、沙箱坑） |
-| [.review/findings/memory-man.md](.review/findings/memory-man.md) | Stream A：记忆/寿命/存储（P0×2、P1×5、P2×8、P3×6） |
-| [.review/findings/brain-checker.md](.review/findings/brain-checker.md) | Stream B：编排/人格/触发/工具（P0×2、P1×4、P2×6、P3×4） |
-| [.review/findings/protocol-auditor.md](.review/findings/protocol-auditor.md) | Stream C：适配器/WS/配置/部署（P0×1、P1×4、P2×9、P3×5） |
-| [.review/findings/behavior-checker.md](.review/findings/behavior-checker.md) | Stream D：行为引擎（P0×1、P1×8、P2×6、P3×6） |
-| [.review/findings/qa-verifier.md](.review/findings/qa-verifier.md) | Stream E：独立 QA + 34 条 README 宣称核验 |
-| [.review/findings/lead-stream0.md](.review/findings/lead-stream0.md) | Lead 横切发现与 P0 独立复现 |
+| [.review/PROTOCOL.md](../../../.review/PROTOCOL.md) | 审查协议（严重度定义、发现格式、沙箱坑） |
+| [.review/findings/memory-man.md](../../../.review/findings/memory-man.md) | Stream A：记忆/寿命/存储（P0×2、P1×5、P2×8、P3×6） |
+| [.review/findings/brain-checker.md](../../../.review/findings/brain-checker.md) | Stream B：编排/人格/触发/工具（P0×2、P1×4、P2×6、P3×4） |
+| [.review/findings/protocol-auditor.md](../../../.review/findings/protocol-auditor.md) | Stream C：适配器/WS/配置/部署（P0×1、P1×4、P2×9、P3×5） |
+| [.review/findings/behavior-checker.md](../../../.review/findings/behavior-checker.md) | Stream D：行为引擎（P0×1、P1×8、P2×6、P3×6） |
+| [.review/findings/qa-verifier.md](../../../.review/findings/qa-verifier.md) | Stream E：独立 QA + 34 条 README 宣称核验 |
+| [.review/findings/lead-stream0.md](../../../.review/findings/lead-stream0.md) | Lead 横切发现与 P0 独立复现 |
 | `.review/probes/` | 40+ 个可复跑探针（Lead 4 个 + 各流） |
 | `.review/evidence/` | 自带套件的原始日志与 `summary.json` |
 | `.review/run_tests.py` / `.review/acceptance.py` | 沙箱下的测试垫片与总验收入口 |

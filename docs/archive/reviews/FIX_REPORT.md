@@ -1,5 +1,9 @@
 # 修复总结（Fix Report）
 
+> 历史资料，2026-11-04 归档。原路径：`FIX_REPORT.md`。正文保留当时状态、方案和实验结论，不作为当前实施指令；其中的“主入口/下一步”已被替代。
+> 当前资料见[文档导航](../../README.md)，所有未来工作以[统一未来计划](../../ROADMAP.md)为准。文中反引号路径及命令保留原语境，通常相对仓库根目录。
+
+
 > 基线：审查快照 `44aefb1`（`selftest` **302 项 = 299 通过 / 3 失败**）
 > 现状：`selftest` **304 项 = 304 通过 / 0 失败**；`ws` 17/0；`qq` 72/0；`audit` 10/0（+4 提示）
 > **49 个探针全部 0 FAIL / 0 Traceback / exit=0**
@@ -164,4 +168,4 @@ git checkout 44aefb1 -- giftia adapters # 只回滚某几个文件
 
 每个检查点都跑过完整验收（`python .review\acceptance.py`）；`selftest` 从 `299/3` → `304/0` 全程只升不降。
 **最终状态**：套件全绿（`304 / 17 / 72 / 10`）+ **49 个探针全部 `exit=0` 且 `0 FAIL`**，工作区无未提交改动。
-逐条修复证据：[team-store.md](.review/fix-reports/team-store.md)、[team-brain.md](.review/fix-reports/team-brain.md)、[team-recycle.md](.review/fix-reports/team-recycle.md)、[team-recycle-probes-final.md](.review/fix-reports/team-recycle-probes-final.md)，以及登记册 [FIX_REGISTER.md](.review/FIX_REGISTER.md)。
+逐条修复证据：[team-store.md](../../../.review/fix-reports/team-store.md)、[team-brain.md](../../../.review/fix-reports/team-brain.md)、[team-recycle.md](../../../.review/fix-reports/team-recycle.md)、[team-recycle-probes-final.md](../../../.review/fix-reports/team-recycle-probes-final.md)，以及登记册 [FIX_REGISTER.md](../../../.review/FIX_REGISTER.md)。

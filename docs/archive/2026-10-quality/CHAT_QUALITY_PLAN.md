@@ -1,8 +1,12 @@
 # 艾拉聊天质量与活人感改进方案
 
+> 历史资料，2026-11-04 归档。原路径：`docs/CHAT_QUALITY_PLAN.md`。正文保留当时状态、方案和实验结论，不作为当前实施指令；其中的“主入口/下一步”已被替代。
+> 当前资料见[文档导航](../../README.md)，所有未来工作以[统一未来计划](../../ROADMAP.md)为准。文中反引号路径及命令保留原语境，通常相对仓库根目录。
+
+
 状态：A～E 已实现、验证，并按用户要求于 2026-10-25 部署至腾讯云正式实例；模型保持不变，主观盲评仍待确认。结果见 [CHAT_QUALITY_RESULTS.md](CHAT_QUALITY_RESULTS.md)。
 
-后续设计：针对原作艾拉的气质、相处中形成的表达，以及 DeepSeek Off / Low 的比较，见 [人物、表达与思考模式改进方案](ISLA_CHARACTER_EXPRESSION_PLAN.md)。2026-10-26 已形成 B 方向本地候选并执行首轮真实 API 对照，尚未部署，见[实现记录](ISLA_CHARACTER_IMPLEMENTATION.md)；不改变本文件 A～E 的交付状态。
+后续设计：针对原作艾拉的气质、相处中形成的表达，以及 DeepSeek Off / Low 的比较，见 [人物、表达与思考模式改进方案](../2026-10-character/ISLA_CHARACTER_EXPRESSION_PLAN.md)。2026-10-26 已形成 B 方向本地候选并执行首轮真实 API 对照，尚未部署，见[实现记录](../2026-10-character/ISLA_CHARACTER_IMPLEMENTATION.md)；不改变本文件 A～E 的交付状态。
 
 ## 1. 目标与已确认的依据
 
