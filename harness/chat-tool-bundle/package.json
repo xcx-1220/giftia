@@ -1,0 +1,10 @@
+{
+  "name": "giftia-chat-tool-bundle",
+  "version": "0.1.0",
+  "description": "Read-only calculation and unit conversion tools for Giftia",
+  "type": "module",
+  "main": "index.js",
+  "files": ["index.js", "cordis.patch.yml"],
+  "engines": { "dsh": "0.2.2-rc.3" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

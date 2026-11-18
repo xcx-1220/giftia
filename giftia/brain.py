@@ -354,6 +354,9 @@ class Giftia:
         epoch = json.dumps([self.handler_id, self.handler_bound_at, self._int_meta("handler_bound_msg_id")]) if sc == "private" else ""
         return Conversation(self.store, self.instance_no, sc, sub, epoch)
 
+    def _context_evidence_floor(self) -> int:
+        return self._int_meta("handler_bound_msg_id") if self.memory_scope[0] == "private" else 0
+
     def context_history(self, limit=None):
         scope, subject = self.memory_scope
         if self.settings.memory.context_hours == 0:
@@ -856,7 +859,7 @@ class Giftia:
         return True
 
     # ── 主入口（平台无关）─────────────────────────────────
-    def handle(
+    def _begin_turn(
         self,
         text: str,
         user_id: str | None = None,
@@ -865,24 +868,11 @@ class Giftia:
         group_id: str = "",
         speaker_name: str = "",
         is_handler: bool | None = None,
-        log_only: bool = False,
+        allow_name_model: bool = True,
         mid: str = "",
         defer_maintenance: bool = False,
     ) -> str:
-        """平台无关入口。
-
-        scene：
-          c2c   —— 私下
-          group —— 群里（多一段隐私约束）
-          guest —— 同 group，语义上强调"不是搭档"（兼容旧调用）
-
-        group_id / speaker_name：群里分清"谁在哪个群说的"，隐私分区靠它。
-        is_handler：说话的人是不是搭档。None = 自己判断——
-                    绑过就按绑定判（`user_id == handler_id`）；
-                    没绑过时私聊会先"认主"（见 `_auto_bind`，与适配器的 auto_bind 同一开关），
-                    认主后就按搭档处理；群里一律不算（群里只有群主认主或 /bind 才算）。
-        log_only：只把这句话记进聊天记录、不回复（群里全量模式下的"旁听"）。
-        """
+        """Initialize per-turn state and choose the authorized memory view."""
         defer_maintenance = defer_maintenance and self.settings.memory.background_maintenance
         self._turn_started = time.monotonic()
         self._defer_maintenance = defer_maintenance
@@ -941,8 +931,29 @@ class Giftia:
 
         # 学名字：谁都可以自我介绍（搭档、群友、私聊来的客人）。
         # 旁听（log_only）**只走正则**：不为一句「我是来看热闹的」多花一次模型调用（P1-14）。
-        self.learn_name(text, uid, owner=self.is_handler, allow_llm=not log_only,
+        self.learn_name(text, uid, owner=self.is_handler, allow_llm=allow_name_model,
                         group_id=group_id)
+        return text
+
+    def handle(
+        self,
+        text: str,
+        user_id: str | None = None,
+        scene: str = "c2c",
+        *,
+        group_id: str = "",
+        speaker_name: str = "",
+        is_handler: bool | None = None,
+        log_only: bool = False,
+        mid: str = "",
+        defer_maintenance: bool = False,
+    ) -> str:
+        """平台无关聊天入口，`log_only` 只记录旁听。`is_handler=None` 使用当前绑定。"""
+        text = self._begin_turn(text, user_id, scene, group_id=group_id, speaker_name=speaker_name,
+                                is_handler=is_handler, allow_name_model=not log_only, mid=mid,
+                                defer_maintenance=defer_maintenance)
+        if not text:
+            return ""
 
         if log_only:
             # 旁听：记下这句话就走（不进检索、不回复、不推进任何东西）
@@ -986,7 +997,7 @@ class Giftia:
             self._note_error("这一轮", exc)
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
         try:
-            if defer_maintenance:
+            if self._defer_maintenance:
                 self.schedule_maintenance()
             elif self.is_handler:
                 self._post_turn()
@@ -1071,7 +1082,7 @@ class Giftia:
                 f"[关系] 你们的关系变成了「{self.last_bond.stage.label}」"
             )
 
-    def _prepare(self, text: str, *, mark: bool = True) -> tuple[list[dict], list[Recalled]]:
+    def _prepare(self, text: str, *, mark: bool = True, private_chat_only: bool = False) -> tuple[list[dict], list[Recalled]]:
         """组装这一轮真正会发给模型的消息。
 
         不落库、不请求模型——所以 /prompt 可以随时查看她被注入了什么。
@@ -1079,6 +1090,7 @@ class Giftia:
         """
         life = self.status()
         now = self.clock.now()
+        private_visitor = private_chat_only and not self.is_handler
         # 工作记忆也过绑定时刻遮蔽：换人之后，新搭档看不到前任留下的对话窗口（P0-3b）
         recent = self.context_history()
         query = self._recall_query(recent, text)
@@ -1120,7 +1132,7 @@ class Giftia:
         # 今天是不是特别的日子 / 有没有还没讲过的梦
         self.last_occasions = self._find_occasions(
             now=now,
-            days_known=self.current_bond(now).days_known,
+            days_known=0 if private_visitor else self.current_bond(now).days_known,
             mark=mark,
             view=self.memory_view,   # 大日子也按归属过滤，别把私事带进群里
         )
@@ -1148,11 +1160,11 @@ class Giftia:
             life,
             recalled,
             now=now,
-            bond=self.current_bond(now),
-            mood=self.current_mood(now),
-            handler_name=self.handler_name,
+            bond=None if private_visitor else self.current_bond(now),
+            mood=None if private_visitor else self.current_mood(now),
+            handler_name="" if private_visitor else self.handler_name,
             scene=self.last_scene,
-            people=self._people_for_prompt(),
+            people=[] if private_chat_only else self._people_for_prompt(),
             occasions=self.last_occasions,
             dream=self.last_dream,
             speaker_name=self.speaker_name,
@@ -1164,7 +1176,7 @@ class Giftia:
             ),
             tool_rules=agent_tools.TOOL_RULES if agent_tools.specs(self) else "",
             conversation=self.conversation_state().render(now,
-                self._int_meta("handler_bound_msg_id") if self.memory_scope[0] == "private" else 0, stage=life.stage)
+                self._context_evidence_floor(), stage=life.stage)
                 if self.settings.memory.conversation_state_enabled else "",
             focus=reply_focus(text, recent),
         )
@@ -1272,6 +1284,34 @@ class Giftia:
         except Exception:
             pass  # 记账失败不该影响对话
 
+    def _record_turn_input(self, text: str, now) -> None:
+        self.current_user_message_id = self.store.add_message(
+            self.session_id, self.instance_no, "user", text, self.clock.iso(now),
+            self.speaker_id, self.speaker_name, *self.memory_scope, self.current_mid,
+        )
+        feedback = explicit_feedback(text) if self.settings.memory.conversation_state_enabled else None
+        if feedback:
+            from .llm import MemoryDraft
+            key, summary, status = feedback
+            evidence = self.store.messages_by_ids([self.current_user_message_id])
+            self.conversation_state().update(MemoryDraft(summary=summary, kind='interaction_feedback',
+                behavior_key=key, status=status, source_ids=[self.current_user_message_id]), evidence, now)
+
+    def _record_turn_reply(self, reply: str, now) -> None:
+        self.last_reply_id = self.store.add_message(
+            self.session_id, self.instance_no, "assistant", reply, self.clock.iso(now),
+            "", "", *self.memory_scope,
+            self.current_mid + ":reply" if self.current_mid.startswith("web:") else "",
+        )
+
+    def _credit_turn_reply(self, recalled, reply: str, now) -> None:
+        self.last_cited = mark_cited(self.store, recalled, reply, self.settings.memory, self.clock.iso(now))
+        if self.last_cited:
+            self.notices.append(f"[记忆强化] 说出口了 {len(self.last_cited)} 条记忆，它们会记得更久")
+        if self.last_dream is not None and is_cited(reply, self.last_dream.content, self.settings.memory):
+            self.store.mark_dream_told(self.last_dream.id)
+            self.notices.append("[做梦] 她把那个梦讲给你听了")
+
     def _chat(self, text: str) -> str:
         """一轮对话。**从模型请求到记账，任何一步出错都不许冒穿**（P1-3）。
 
@@ -1301,25 +1341,7 @@ class Giftia:
                 self._note_error("记录被注入的记忆", exc)
 
         try:
-            self.current_user_message_id = self.store.add_message(
-                self.session_id,
-                self.instance_no,
-                "user",
-                text,
-                self.clock.iso(now),
-                self.speaker_id,
-                self.speaker_name,
-                self.memory_scope[0],
-                self.memory_scope[1],
-                self.current_mid,
-            )
-            feedback = explicit_feedback(text) if self.settings.memory.conversation_state_enabled else None
-            if feedback:
-                from .llm import MemoryDraft
-                key, summary, status = feedback
-                evidence = self.store.messages_by_ids([self.current_user_message_id])
-                self.conversation_state().update(MemoryDraft(summary=summary,kind='interaction_feedback',
-                    behavior_key=key,status=status,source_ids=[self.current_user_message_id]), evidence, now)
+            self._record_turn_input(text, now)
         except Exception as exc:
             # 你的话没记下来是遗憾，但不该让她这一轮哑掉
             self._note_error("记下你说的这句话", exc)
@@ -1352,18 +1374,7 @@ class Giftia:
             reply = FAILURE_LINES[len(self.notices) % len(FAILURE_LINES)]
             self.notices.append("[回复] 模型返回了空回复，已用兜底台词顶上")
         try:
-            self.last_reply_id = self.store.add_message(
-                self.session_id,
-                self.instance_no,
-                "assistant",
-                reply,
-                self.clock.iso(now),
-                "",
-                "",
-                self.memory_scope[0],
-                self.memory_scope[1],
-                self.current_mid + ":reply" if self.current_mid.startswith("web:") else "",
-            )
+            self._record_turn_reply(reply, now)
         except Exception as exc:
             self.last_reply_id = None
             self._note_error("记下她说的这句话", exc)
@@ -1371,20 +1382,7 @@ class Giftia:
 
         try:
             # 召回强化：她真的把哪几条说出口了，哪几条就记得更久
-            self.last_cited = mark_cited(
-                self.store, recalled, reply, self.settings.memory, self.clock.iso(now)
-            )
-            if self.last_cited:
-                self.notices.append(
-                    f"[记忆强化] 说出口了 {len(self.last_cited)} 条记忆，它们会记得更久"
-                )
-
-            # 她把梦讲出来了才算讲过（复用"被引用"的判定）
-            if self.last_dream is not None and is_cited(
-                reply, self.last_dream.content, self.settings.memory
-            ):
-                self.store.mark_dream_told(self.last_dream.id)
-                self.notices.append("[做梦] 她把那个梦讲给你听了")
+            self._credit_turn_reply(recalled, reply, now)
         except Exception as exc:
             self._note_error("回复之后的记账", exc)
         # 运行档案：这一轮她看到了什么、想了多少、提示词多大
@@ -1963,6 +1961,15 @@ class Giftia:
             reason=reason,
             extra_context=extra,
         )
+        self._reset_after_recycle(old_instance)
+        self.notices.append(
+            f"[终端服务] 实例 #{report.instance_no} 已回收，新实例 #{report.new_instance_no} 上线"
+        )
+        return "\n\n".join(
+            [report.notification(self.settings), after_recycle_line(self.settings)]
+        )
+
+    def _reset_after_recycle(self, old_instance: int) -> None:
         # 换代：新的她不认识你，关系与心情一并清零。
         # **称呼也要清**（审查 P2 / qa-verifier B4）：README 承诺"新的她不认识你"、
         # `after_recycle_line` 念的是"档案上还是空的"，但以前 handler_name 留在全局 state 里，
@@ -1978,12 +1985,6 @@ class Giftia:
             self.store.meta_set(key, "")
         self.last_bond = None
         self.last_mood = None
-        self.notices.append(
-            f"[终端服务] 实例 #{report.instance_no} 已回收，新实例 #{report.new_instance_no} 上线"
-        )
-        return "\n\n".join(
-            [report.notification(self.settings), after_recycle_line(self.settings)]
-        )
 
     # ── 给界面用的展示 ────────────────────────────────────
     def banner(self) -> str:

@@ -1,0 +1,37 @@
+[Unit]
+Description=Giftia Harness web gateway
+Wants=network-online.target
+After=network-online.target giftia-qq.service
+Conflicts=giftia-qq.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=giftia
+Group=giftia
+WorkingDirectory=/opt/giftia-harness/source
+StateDirectory=giftia-harness
+StateDirectoryMode=0700
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/giftia-harness/python:/opt/giftia-harness/source
+Environment=PATH=/opt/giftia-harness/node/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /opt/giftia-harness/source/harness/serve_release.py --root /var/lib/giftia-harness --database /opt/giftia/data/giftia.db --manifest /var/lib/giftia-harness/release.json --env-file /opt/giftia/.env --legacy-data /opt/giftia/data --gateway-port 8111
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=60s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/giftia/data
+
+[Install]
+WantedBy=multi-user.target

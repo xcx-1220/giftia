@@ -170,6 +170,7 @@ def collect_dataclasses(tree: ast.Module) -> dict[str, DataclassInfo]:
 TOOL_SCRIPTS = {
     "chat_quality_eval.py", # 多轮模型评测与盲评材料生成，判断由审阅者完成
     "quality_repair.py",    # 有预览和撤销的运维工具，断言在 quality_selftest
+    "isla_character_eval.py",  # 评测运行器，断言在 isla_eval_selftest
     "check_deploy.py",      # 部署体检：打印环境/依赖状态
     "demo_life.py",         # 演示：跑一遍她的一生给人看
     "live_check.py",        # 连真模型的联调打印工具

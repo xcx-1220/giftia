@@ -714,12 +714,15 @@ def load_settings(
     *,
     lifespan_override: float | None = None,
     force_mock: bool = False,
+    use_local: bool = True,
 ) -> Settings:
-    load_env_file()  # 让 python run.py 直接可用，不必每次手动设环境变量
+    if use_local:
+        load_env_file()  # 让 python run.py 直接可用，不必每次手动设环境变量
     # 分层：仓库的 settings.toml / persona.toml 是默认值与文档（部署会覆盖），
     # 你自己的调整写在 settings.local.toml / persona.local.toml（部署永不碰）。
-    raw = _read_toml_layered(settings_path or (CONFIG_DIR / "settings.toml"))
-    praw = _read_toml_layered(persona_path or (CONFIG_DIR / "persona.toml"))
+    read = _read_toml_layered if use_local else _read_toml
+    raw = read(settings_path or (CONFIG_DIR / "settings.toml"))
+    praw = read(persona_path or (CONFIG_DIR / "persona.toml"))
 
     model = _sub(ModelConfig, raw.get("model", {}), where="settings.toml [model]")
     if force_mock:

@@ -1,0 +1,4 @@
+- insert:
+    - id: giftia-isla
+      name: giftia-isla-harness-bundle
+      inject: [systemPrompt, tools]

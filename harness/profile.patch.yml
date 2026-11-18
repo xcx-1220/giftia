@@ -1,0 +1,43 @@
+- id: system-prompt
+  config:
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    personaPrefix: ''
+- id: llm-deepseek
+  config:
+    baseURL: !!js process.env.DEEPSEEK_BASE_URL
+    apiKeyEnv: DEEPSEEK_API_KEY
+    defaultContextWindow: 32768
+    streamIdleTimeoutMs: 5000
+    thinking: disabled
+    retryPolicy:
+      mode: normal
+      maxRetries: 0
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: terminal-bash
+  disabled: true
+- id: terminal-pwsh
+  disabled: true
+- id: compaction-basic
+  disabled: true
+- id: agent-loop
+  config:
+    agents: []
+    maxParallelToolCalls: 1
+- id: image-offload
+  disabled: true
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+    workspaceRoot: !!js process.cwd()

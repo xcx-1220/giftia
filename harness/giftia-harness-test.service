@@ -1,0 +1,27 @@
+[Unit]
+Description=Giftia Harness stage 1 synthetic loopback test
+After=network.target
+
+[Service]
+User=giftia-harness-test
+Group=giftia-harness-test
+WorkingDirectory=/opt/giftia-harness-test/state
+Environment=PATH=/opt/giftia-harness-test/toolchain/node-v24.11.1-linux-x64/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /opt/giftia-harness-test/source/harness/stage1.py --root /opt/giftia-harness-test/state serve
+KillMode=mixed
+TimeoutStopSec=12s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=/opt/giftia
+ReadWritePaths=/opt/giftia-harness-test/state
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

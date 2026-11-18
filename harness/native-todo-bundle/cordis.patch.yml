@@ -1,0 +1,8 @@
+- insert:
+    - id: tool-todo
+      name: '@deepseek-ai/dsh-tool-todo'
+      config:
+        allowParallelInProgress: false
+    - id: giftia-native-todo-access
+      name: giftia-native-todo-bundle
+      inject: [tools]

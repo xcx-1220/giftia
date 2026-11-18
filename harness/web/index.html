@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f6f6f0">
+  <title>艾拉</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/chat.css">
+  <script defer src="/chat.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div class="identity"><img class="avatar" src="/icons/icon-192.png" alt="" width="44" height="44"><div><h1>艾拉</h1><p id="identity" hidden></p></div></div>
+      <div class="header-actions">
+        <button id="open-files" class="quiet header-button mobile-only" type="button" aria-controls="attachment-dock" aria-expanded="false" hidden>资料</button>
+        <button id="open-history" class="quiet header-button" type="button" hidden>历史</button>
+        <button id="push" class="quiet header-button" type="button" hidden>通知</button>
+        <button id="logout" class="quiet header-button" type="button" hidden>退出</button>
+      </div>
+    </header>
+    <p id="connection" class="connection" role="status"></p>
+    <form id="login" class="login" hidden>
+      <img class="login-avatar" src="/icons/icon-192.png" alt="" width="68" height="68">
+      <h2>打开聊天</h2>
+      <label for="token">会话凭据</label>
+      <input id="token" type="password" autocomplete="off" required>
+      <button class="primary">进入</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+    <section id="chat" class="chat" aria-label="聊天" hidden>
+      <aside id="attachment-dock" class="attachment-dock" aria-label="会话资料">
+        <div class="dock-header"><h2>会话资料</h2><button id="close-files" class="quiet mobile-only" type="button">关闭</button></div>
+        <p id="file-empty" class="dock-empty">上传的 PDF 会出现在这里。</p>
+        <section id="files" class="files" aria-label="会话附件" hidden></section>
+      </aside>
+      <div class="conversation">
+        <section id="timeline" class="timeline" aria-label="聊天历史" tabindex="0"></section>
+        <form id="composer" class="composer">
+          <div class="composer-box">
+            <div id="selection" class="selection" hidden></div>
+            <label for="message" class="sr-only">消息</label>
+            <textarea id="message" rows="2" maxlength="4000" placeholder="发消息给艾拉…" required></textarea>
+            <div class="composer-actions">
+              <input id="pdf" type="file" accept="application/pdf,.pdf" hidden>
+              <button id="attach" class="quiet attachment-button" type="button">
+                <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5l-7.8 7.8a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.6 1.6 0 0 1-2.3-2.3l7.8-7.8"/></svg>
+                添加 PDF
+              </button>
+              <button id="upload-control" class="quiet" type="button" hidden></button>
+              <button id="send" class="primary send" type="submit">发送 <span aria-hidden="true">↑</span></button>
+            </div>
+          </div>
+          <p id="notice" class="notice" role="status"></p>
+        </form>
+      </div>
+    </section>
+  </main>
+  <dialog id="source" aria-labelledby="source-title">
+    <header><h2 id="source-title">来源</h2><form method="dialog"><button class="quiet" aria-label="关闭来源">关闭</button></form></header>
+    <pre id="source-text"></pre>
+  </dialog>
+  <dialog id="history-dialog" aria-labelledby="history-title">
+    <header><h2 id="history-title">普通聊天历史</h2><form method="dialog"><button class="quiet">关闭</button></form></header>
+    <ol id="history-items" class="history-items"></ol>
+    <p id="history-status" role="status"></p>
+    <button id="history-more" class="quiet" type="button" hidden>更早消息</button>
+    <section id="legacy-history" hidden>
+      <h3>此设备上的旧网页记录</h3>
+      <p id="legacy-status" role="status"></p>
+      <ol id="legacy-items" class="history-items"></ol>
+    </section>
+  </dialog>
+</body>
+</html>

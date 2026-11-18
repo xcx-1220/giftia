@@ -1,0 +1,12 @@
+{
+  "name": "giftia-isla-harness-bundle",
+  "version": "0.2.0",
+  "description": "Isla's native Cordis bundle for the isolated Giftia profile",
+  "type": "module",
+  "main": "index.js",
+  "files": ["index.js", "cordis.patch.yml"],
+  "peerDependencies": { "@deepseek-ai/dsh-llm": "0.2.2-rc.3" },
+  "peerDependenciesMeta": { "@deepseek-ai/dsh-llm": { "optional": true } },
+  "engines": { "dsh": "0.2.2-rc.3" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}

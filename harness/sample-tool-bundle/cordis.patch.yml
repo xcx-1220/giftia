@@ -1,0 +1,8 @@
+- insert:
+    - id: giftia-sample-tool
+      name: giftia-sample-tool-bundle
+      inject: [tools]
+      config:
+        permissions:
+          partner: false
+          guest: false

@@ -1,19 +1,19 @@
 # 腾讯云运行维护
 
-本页说明现有操作流程；最近实机核对日期是 **2026-11-04**，详见[基线记录](records/2026-11-04-baseline.md)。以下发布、重启、修复和推送命令是操作手册，不表示本次整理已执行。
+本页说明现有操作流程。当前 Harness 入口于 **2026-11-18** 切换，详见 [R2 发布记录](records/2026-11-17-harness-r2.md)。原 `giftia-qq` 网关保留为回退点。
 
 ## 当前拓扑
 
 | 项目 | 已核对配置 |
 |---|---|
 | 主机 | 腾讯云 Ubuntu 24.04，Python 3.12.3，约 2GB 内存 / 40GB 系统盘 |
-| 应用目录 / 用户 | `/opt/giftia` / `giftia`；生产目录不是 Git 工作区 |
-| 主服务 | `giftia-qq.service`，当前为网页模式 |
-| 启动命令 | `/usr/bin/python3 /opt/giftia/adapters/qq_official.py --web-port 8111 --web-only` |
+| 应用目录 / 用户 | 候选源码 `/opt/giftia-harness`，Giftia 数据和配置 `/opt/giftia`，运行用户 `giftia` |
+| 主服务 | `giftia-harness.service`，原 `giftia-qq.service` 已停用并作为回退点 |
+| 运行状态 | `/var/lib/giftia-harness`，包含 Harness profile、网页会话、附件状态和撤销账本 |
 | 外部入口 | `https://giftia.icu` → Cloudflare Tunnel → `http://localhost:8111` |
 | 源站监听 | Web 仅 `127.0.0.1:8111`；外部 SSH 使用 22；无需源站开放 80/443 |
 | Tunnel | `cloudflared.service`，令牌从 `/etc/cloudflared/token` 文件加载，不把值复制到文档 |
-| 权限 | `ProtectSystem=strict`、`ProtectHome=yes`，应用可写目录 `/opt/giftia/data` |
+| 权限 | `ProtectSystem=strict`、`ProtectHome=yes`，可写目录为 `/opt/giftia/data` 和 `/var/lib/giftia-harness` |
 | 热备 | `giftia-backup.timer`，服务器本地时间 04:00 起随机延迟最多 300 秒，保留 14 份 |
 
 QQ 自 10 月 20 日暂停，服务名保留。当前 model/persona 生效值必须合并个人覆盖后检查；不能仅凭本地文件推断线上配置。
@@ -23,13 +23,13 @@ QQ 自 10 月 20 日暂停，服务名保留。当前 model/persona 生效值必
 在服务器运行：
 
 ```bash
-systemctl is-active giftia-qq cloudflared giftia-backup.timer
-systemctl status giftia-qq --no-pager
+systemctl is-active giftia-harness cloudflared giftia-backup.timer
+systemctl status giftia-harness --no-pager
 systemctl list-timers giftia-backup.timer --all
-journalctl -u giftia-qq --no-pager -n 80
+journalctl -u giftia-harness --no-pager -n 80
 journalctl -u cloudflared --no-pager -n 40
 journalctl -u giftia-backup --no-pager -n 20
-curl http://127.0.0.1:8111/api/health
+curl -H 'Host: giftia.icu' -H 'X-Forwarded-Proto: https' http://127.0.0.1:8111/api/health
 sudo -u giftia /usr/bin/python3 /opt/giftia/deploy/backup_db.py --check
 ```
 
@@ -40,6 +40,12 @@ sudo -u giftia /usr/bin/python3 /opt/giftia/deploy/backup_db.py --check
 本机 `tools/check_sync.ps1` 可比文件哈希，但它读取 Git 已跟踪路径，原始换行也影响结果；新未跟踪文件不包含在内，归档移动与文档差异也不代表业务代码未部署。精确核对需明确基线、文件清单、LF 规范化与个人覆盖排除范围。生产无 Git 时保存发布清单，不假装存在云端 commit。
 
 ## 现有实例升级
+
+Harness 同域发布及切回使用 `/opt/giftia-harness/source/harness/r2_cutover.sh`。执行回退时提供本次发布生成的检查点。回退工具保留当前 Giftia 数据库，另行补齐已提交的旧网关回执。下列 `quality_release.py` 流程适用于旧版 Giftia 代码维护。
+
+```bash
+sudo bash /opt/giftia-harness/source/harness/r2_cutover.sh rollback /opt/giftia/data/releases/harness-r2-ejxgGywh
+```
 
 1. 准备与 `/opt/giftia` 分开的候选源码，运行适用离线检查与隔离迁移验证。核对候选包含的模型、人物、前端和运维文件范围。
 2. 比较线上有效配置、实例元数据与候选；保护 `.env`、`config/*.local.toml` 和 `data/`。准备一致性备份及必要的运行文件快照。

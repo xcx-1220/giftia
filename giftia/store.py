@@ -262,14 +262,14 @@ class Store:
             notes.pop(str(user_id), None)
         self.state_set("member_notes", json.dumps(notes, ensure_ascii=False))
 
-    def __init__(self, db_path: Path | str) -> None:
+    def __init__(self, db_path: Path | str, *, connection_factory=sqlite3.Connection) -> None:
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=True 是**现状语义的显式化**（也正好是 sqlite3 的默认值）：
         # 一个连接只在一个线程里用。适配器侧是多线程的（收消息 / 发消息 / 后台整理），
         # 跨线程复用同一个连接会 ProgrammingError —— 保持"谁开谁用"，
         # 但写明白，别让后来的人以为默认是 False 就随手跨线程传。
-        self.conn = sqlite3.connect(str(self.path), check_same_thread=True)
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=True, factory=connection_factory)
         self.conn.row_factory = sqlite3.Row
         # 多个写入口（收消息、整理记忆、后台记账）撞在一起时不要立刻抛
         # "database is locked"：等最多 5 秒再失败。没有它，一次抖动就会顺着

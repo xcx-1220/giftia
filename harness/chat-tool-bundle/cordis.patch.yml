@@ -1,0 +1,8 @@
+- insert:
+    - id: giftia-chat-tools
+      name: giftia-chat-tool-bundle
+      inject: [tools]
+      config:
+        permissions:
+          partner: false
+          guest: false
